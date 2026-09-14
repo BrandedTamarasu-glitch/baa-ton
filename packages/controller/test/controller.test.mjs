@@ -14,6 +14,7 @@ import {
   runSupervisorTick,
   validateConfig,
 } from "../controller.mjs";
+import { configureSidebar } from "../sidebar-configure.mjs";
 
 const ROOT = {
   target: "bb029-root",
@@ -22,6 +23,18 @@ const ROOT = {
   pane_id: "w-root:p1",
   workspace_id: "w-root",
 };
+test("sidebar configuration appends only Baa-ton goal rows and is idempotent", () => {
+  const config = `[ui]\n\n[ui.sidebar.agents]\nrows = [[{ token = "$title_idle" }]]\n\n[ui.sidebar.agents.rows_by_agent]\npi = [[{ token = "$title_idle" }], [{ token = "$quota_context_normal" }]] # herdr-agent-quota-provider\ncodex = [[{ token = "$title_idle" }]]\n\n[ui.sidebar.spaces]\nrows = [["workspace"]]\n`;
+  const first = configureSidebar(config);
+  assert.equal(first.changed, true);
+  assert.equal((first.text.match(/# >>> baa-ton goal rows/g) ?? []).length, 2);
+  assert.match(first.text, /\$quota_context_normal/);
+  assert.match(first.text, /\$herdr_goal_status/);
+  const second = configureSidebar(first.text);
+  assert.equal(second.changed, false);
+  assert.equal(second.text, first.text);
+});
+
 const CHILD = {
   lane_id: "lane-child",
   target: "bb029-writer",
@@ -196,23 +209,29 @@ function requestsFor(mock, method) {
 function parsePluginManifest(raw) {
   const top = {};
   const events = [];
+  const actions = [];
   let current = top;
   for (const untrimmed of raw.split(/\r?\n/)) {
     const line = untrimmed.trim();
     if (!line || line.startsWith("#")) continue;
-    if (line === "[[events]]" || line === "[[startup]]") {
+    if (["[[events]]", "[[startup]]", "[[actions]]"].includes(line)) {
       current = {};
-      (line === "[[events]]" ? events : (top.startup ??= [])).push(current);
+      (line === "[[events]]"
+        ? events
+        : line === "[[actions]]"
+          ? actions
+          : (top.startup ??= [])
+      ).push(current);
       continue;
     }
     const match =
-      /^(id|name|version|min_herdr_version|description|platforms|on|command) = (.+)$/.exec(
+      /^(id|name|version|min_herdr_version|description|platforms|on|command|title) = (.+)$/.exec(
         line,
       );
     assert.ok(match, `unsupported or malformed manifest line: ${line}`);
     current[match[1]] = JSON.parse(match[2]);
   }
-  return { top, events };
+  return { top, events, actions };
 }
 
 test("manifest has the required ID, compatible version floor, and supported event hooks", async () => {
@@ -246,6 +265,11 @@ test("manifest has the required ID, compatible version floor, and supported even
   );
   assert.match(startupScript, /volta" which node/);
   assert.match(startupScript, /exec "\$\{node_bin\}" controller\.mjs supervisor/);
+  assert.deepEqual(manifest.actions, [{
+    id: "configure-sidebar",
+    title: "Install / repair Baa-ton sidebar rows",
+    command: ["sh", "-c", "node \"$HERDR_PLUGIN_ROOT/sidebar-configure.mjs\" --apply && herdr server reload-config"],
+  }]);
   assert.deepEqual(manifest.events, [
     {
       on: "pane.agent_status_changed",
@@ -528,9 +552,14 @@ test("a new actionable lane event advances the thin parent goal once", async () 
       updatedAt: "2026-09-14T00:00:00.000Z",
     },
   });
+  const metadata = [];
   const mock = await startHerdrMock((request) => {
     if (request.method === "agent.get") return rootAgentInfo();
     if (request.method === "agent.prompt") return { result: {} };
+    if (request.method === "pane.report_metadata") {
+      metadata.push(request.params);
+      return { result: {} };
+    }
     throw new Error(`Unexpected method: ${request.method}`);
   });
   try {
@@ -541,6 +570,78 @@ test("a new actionable lane event advances the thin parent goal once", async () 
     assert.equal(goal.signals.length, 1, "duplicate hooks do not duplicate goal signals");
     assert.equal(goal.signals[0].classification, "done");
     assert.match(goal.nextAction, /Review durable done event/);
+    assert.equal(metadata.length, 1);
+    assert.equal(metadata[0].pane_id, ROOT.pane_id);
+    assert.equal(metadata[0].source, "herdr-orchestrator");
+    assert.equal(metadata[0].ttl_ms, 86_400_000);
+    assert.deepEqual(metadata[0].tokens, {
+      herdr_goal_status: "Goal: action required",
+      herdr_goal_next_1: "Next: Review durable done",
+      herdr_goal_next_2: "event",
+      herdr_goal_next_3: goal.nextAction.match(/event\s+([^\s]+)\s+for/)?.[1] ?? null,
+    });
+    assert.deepEqual(metadata[0].state_labels, {
+      idle: "Goal: action required",
+      done: "Goal: action required",
+    });
+  } finally {
+    await mock.close();
+    await fixture.cleanup();
+  }
+});
+
+test("a bootstrapped root supervises its parent manifest before any lane exists", async () => {
+  const fixture = await createFixture({
+    parentGoal: {
+      version: 1,
+      id: "parent-bootstrap",
+      objective: "Prove root bootstrap.",
+      status: "active",
+      nextAction: "Wait for a root nudge.",
+      signals: [],
+      supervisor: {
+        version: 1,
+        state: "running",
+        intervalSeconds: 5,
+        nudgeCount: 0,
+        nextNudgeAt: "2026-09-14T00:00:00.000Z",
+        createdAt: "2026-09-14T00:00:00.000Z",
+        updatedAt: "2026-09-14T00:00:00.000Z",
+      },
+      createdAt: "2026-09-14T00:00:00.000Z",
+      updatedAt: "2026-09-14T00:00:00.000Z",
+    },
+  });
+  const configPath = join(fixture.stateDir, "config.json");
+  await writeFile(configPath, `${JSON.stringify({
+    version: 2,
+    owner: "herdr-orchestrator",
+    orchestrators: [{
+      id: "bootstrap-root",
+      root: ROOT,
+      program: {
+        id: fixture.directory,
+        workspace_id: ROOT.workspace_id,
+        parent_manifest_path: fixture.manifestPath,
+      },
+      workflows: [],
+    }],
+  }, null, 2)}\n`, { mode: 0o600 });
+  const mock = await startHerdrMock((request) => {
+    if (request.method === "agent.get") return rootAgentInfo();
+    if (request.method === "agent.prompt") return { result: {} };
+    throw new Error(`Unexpected method: ${request.method}`);
+  });
+  try {
+    const result = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: client(mock),
+      timestamp: "2026-09-14T00:00:00.000Z",
+    });
+    assert.deepEqual(result.results, [
+      { manifestPath: fixture.manifestPath, status: "delivered" },
+    ]);
+    assert.equal((await fixture.manifest()).parentGoal.supervisor.nudgeCount, 1);
   } finally {
     await mock.close();
     await fixture.cleanup();

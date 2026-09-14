@@ -24,6 +24,16 @@ The Herdr-owned supervisor can issue a non-waiting root nudge only while `parent
 
 Children persist full question, confirmation, dispatch, resume, and close approval records in the workflow manifest. They return without presenting UI. The controller wakes only the root; root-only UI resolves the durable record.
 
+## Display metadata
+
+A root may publish display-only goal metadata with native Herdr `pane report-metadata`.
+The optional Baa-ton sidebar adapter renders the `herdr_goal_*` tokens in an
+expanded desktop sidebar without modifying other renderers' source. Compact and
+mobile switchers do not render custom sidebar rows, so Baa-ton also publishes a
+concise `idle`/`done` state label (for example, `Goal: waiting`). This is a
+presentation fallback only: it never changes a pane's semantic state,
+notifications, supervision, or lifecycle decisions.
+
 ## Proof requirements
 
 For every enabled adapter: controlled lane completion wakes one root turn; repeated events dedupe; unavailable roots create durable `pending`; replay delivers once; child question and confirmation remain parent-mediated; malformed capabilities fail closed. Non-enabled adapters retain normal controller notification behavior only.

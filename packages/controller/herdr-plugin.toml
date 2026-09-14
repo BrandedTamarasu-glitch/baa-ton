@@ -13,6 +13,11 @@ command = ["sh", "supervisor.sh"]
 platforms = ["windows"]
 command = ["node", "controller.mjs", "supervisor"]
 
+[[actions]]
+id = "configure-sidebar"
+title = "Install / repair Baa-ton sidebar rows"
+command = ["sh", "-c", "node \"$HERDR_PLUGIN_ROOT/sidebar-configure.mjs\" --apply && herdr server reload-config"]
+
 [[events]]
 on = "pane.agent_status_changed"
 command = ["node", "controller.mjs", "hook"]

@@ -268,18 +268,32 @@ export function validateOrchestrator(input, index) {
   const label = `config.orchestrators[${index}]`;
   const value = assertObjectShape(input, label, ["id", "root", "program", "workflows"]);
   const root = validateRoot(value.root);
-  const program = assertObjectShape(value.program, `${label}.program`, ["id", "workspace_id"]);
+  const program = assertObjectShape(value.program, `${label}.program`, ["id", "workspace_id"], ["parent_manifest_path"]);
+  assert(Array.isArray(value.workflows), `${label}.workflows must be an array.`);
   const workflows = value.workflows.map(validateWorkflowMapping);
-  assert(Array.isArray(value.workflows) && workflows.length > 0, `${label}.workflows must be a non-empty array.`);
   assertString(value.id, `${label}.id`);
   assertString(program.id, `${label}.program.id`);
   assertString(program.workspace_id, `${label}.program.workspace_id`);
+  const parentManifestPath = "parent_manifest_path" in program
+    ? assertString(program.parent_manifest_path, `${label}.program.parent_manifest_path`)
+    : undefined;
+  if (parentManifestPath)
+    assert(isAbsolute(parentManifestPath), `${label}.program.parent_manifest_path must be absolute.`);
   assert(program.workspace_id === root.workspace_id, `${label}.program.workspace_id must equal its root workspace_id.`);
   for (const workflow of workflows) for (const lane of workflow.lanes) {
     assert(lane.pane_id !== root.pane_id, `${label}.root.pane_id must differ from every child lane pane_id.`);
     assert(lane.target_kind !== root.target_kind || lane.target !== root.target, `${label}.root target must differ from every child lane target.`);
   }
-  return { id: value.id, root, program: { id: program.id, workspace_id: program.workspace_id }, workflows };
+  return {
+    id: value.id,
+    root,
+    program: {
+      id: program.id,
+      workspace_id: program.workspace_id,
+      ...(parentManifestPath ? { parent_manifest_path: resolve(parentManifestPath) } : {}),
+    },
+    workflows,
+  };
 }
 
 // v1 had one global root.  It is accepted only as an in-memory migration so a
@@ -419,6 +433,21 @@ function configuredMappings(config) {
   return config.orchestrators.flatMap((orchestrator) =>
     orchestrator.workflows.map((workflow) => ({ orchestrator, workflow })),
   );
+}
+
+function configuredParentManifests(config) {
+  return config.orchestrators.flatMap((orchestrator) => {
+    const paths = new Set(orchestrator.workflows.map((workflow) => workflow.manifest_path));
+    if (orchestrator.program.parent_manifest_path)
+      paths.add(orchestrator.program.parent_manifest_path);
+    return [...paths].map((manifestPath) => ({
+      orchestrator,
+      manifestPath,
+      workflows: orchestrator.workflows.filter(
+        (workflow) => workflow.manifest_path === manifestPath,
+      ),
+    }));
+  });
 }
 
 function locateMapping(config, event) {
@@ -877,6 +906,62 @@ function unavailable(error) {
   );
 }
 
+const GOAL_SIDEBAR_TOKEN_NAMES = [
+  "herdr_goal_status",
+  "herdr_goal_next_1",
+  "herdr_goal_next_2",
+  "herdr_goal_next_3",
+];
+
+function wrapSidebarText(text, width = 20) {
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  const lines = [];
+  let line = "";
+  for (const word of words) {
+    const candidate = line ? `${line} ${word}` : word;
+    if (candidate.length > width && line) {
+      lines.push(line);
+      line = word;
+    } else line = candidate;
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+function parentGoalSidebarTokens(goal) {
+  const next = wrapSidebarText(goal.nextAction).slice(0, 3);
+  return {
+    herdr_goal_status: `Goal: ${goal.status.replaceAll("-", " ")}`,
+    herdr_goal_next_1: next[0] ? `Next: ${next[0]}` : null,
+    herdr_goal_next_2: next[1] ?? null,
+    herdr_goal_next_3: next[2] ?? null,
+  };
+}
+
+function parentGoalMobileLabel(goal) {
+  return `Goal: ${goal.status.replaceAll("-for-event", "").replaceAll("-", " ")}`;
+}
+
+async function publishParentGoalSidebar(goal, root, herdr) {
+  // Display-only metadata is best effort: delivery or terminal failures must
+  // never change the durable controller outcome.
+  try {
+    await herdr.request("pane.report_metadata", {
+      pane_id: root.pane_id,
+      source: OWNER,
+      tokens: parentGoalSidebarTokens(goal),
+      // The compact/mobile switcher ignores sidebar rows but shows state labels.
+      state_labels: {
+        idle: parentGoalMobileLabel(goal),
+        done: parentGoalMobileLabel(goal),
+      },
+      ttl_ms: 86_400_000,
+    });
+  } catch {
+    // The root extension republishes on session start and direct goal changes.
+  }
+}
+
 function wakeText(record) {
   return [
     `[Herdr Orchestrator event] ${record.classification}: workflow ${record.workflow_id}, lane ${record.lane_id}.`,
@@ -1005,38 +1090,35 @@ export async function runSupervisorTick({
   const api = herdr ?? new JsonLineHerdrClient();
   const results = [];
   const seenManifests = new Set();
-  for (const entry of configuredMappings(config)) {
-    const { orchestrator, workflow: mapping } = entry;
-    const manifestKey = `${orchestrator.id}:${mapping.manifest_path}`;
+  for (const entry of configuredParentManifests(config)) {
+    const { orchestrator, manifestPath, workflows } = entry;
+    const manifestKey = `${orchestrator.id}:${manifestPath}`;
     if (seenManifests.has(manifestKey)) continue;
     seenManifests.add(manifestKey);
-    const release = await acquireManifestLock(mapping.manifest_path);
+    const release = await acquireManifestLock(manifestPath);
     try {
       const manifest = parseJson(
-        await readRegularFile(mapping.manifest_path, "Workflow manifest"),
-        "Workflow manifest",
+        await readRegularFile(manifestPath, "Parent manifest"),
+        "Parent manifest",
       );
       // Do not schedule against an unowned or stale registration merely because
       // it shares a manifest with a valid workflow in this orchestrator.
-      const mappings = orchestrator.workflows.filter(
-        (candidate) => candidate.manifest_path === mapping.manifest_path,
-      );
-      for (const candidate of mappings)
+      for (const candidate of workflows)
         validateMappedWorkflow(manifest, { workflow: candidate, lane: candidate.lanes[0] }, config.owner);
       if (!("parentGoal" in manifest)) {
-        results.push({ manifestPath: mapping.manifest_path, status: "no-parent-goal" });
+        results.push({ manifestPath, status: "no-parent-goal" });
         continue;
       }
       const goal = validateParentGoal(manifest.parentGoal);
       if (!("supervisor" in goal)) {
-        results.push({ manifestPath: mapping.manifest_path, status: "supervisor-stopped" });
+        results.push({ manifestPath, status: "supervisor-stopped" });
         continue;
       }
       const supervisor = goal.supervisor;
       // A supervisor is a nudge for an actively-owned next action only. It
       // must never revive waiting, paused, blocked, or completed parent goals.
       if (goal.status !== "active" || supervisor.state !== "running") {
-        results.push({ manifestPath: mapping.manifest_path, status: "not-active" });
+        results.push({ manifestPath, status: "not-active" });
         continue;
       }
       if (supervisor.lastDelivery?.status === "sending") {
@@ -1048,12 +1130,12 @@ export async function runSupervisorTick({
         supervisor.nextNudgeAt = null;
         supervisor.updatedAt = timestamp;
         goal.updatedAt = timestamp;
-        await atomicWriteJson(mapping.manifest_path, manifest);
-        results.push({ manifestPath: mapping.manifest_path, status: "uncertain" });
+        await atomicWriteJson(manifestPath, manifest);
+        results.push({ manifestPath, status: "uncertain" });
         continue;
       }
       if (!nudgeDue(supervisor, timestamp)) {
-        results.push({ manifestPath: mapping.manifest_path, status: "not-due" });
+        results.push({ manifestPath, status: "not-due" });
         continue;
       }
       const activity = await observeRootActivity(orchestrator.root, api, timestamp);
@@ -1063,8 +1145,8 @@ export async function runSupervisorTick({
         supervisor.nextNudgeAt = nextNudgeAt(timestamp, supervisor.intervalSeconds);
         supervisor.updatedAt = timestamp;
         goal.updatedAt = timestamp;
-        await atomicWriteJson(mapping.manifest_path, manifest);
-        results.push({ manifestPath: mapping.manifest_path, status: "pending" });
+        await atomicWriteJson(manifestPath, manifest);
+        results.push({ manifestPath, status: "pending" });
         continue;
       }
       supervisor.rootActivity = { status: activity.status, observedAt: activity.observedAt };
@@ -1072,8 +1154,8 @@ export async function runSupervisorTick({
         supervisor.nextNudgeAt = nextNudgeAt(timestamp, supervisor.intervalSeconds);
         supervisor.updatedAt = timestamp;
         goal.updatedAt = timestamp;
-        await atomicWriteJson(mapping.manifest_path, manifest);
-        results.push({ manifestPath: mapping.manifest_path, status: "root-not-idle" });
+        await atomicWriteJson(manifestPath, manifest);
+        results.push({ manifestPath, status: "root-not-idle" });
         continue;
       }
       const attemptedAt = timestamp;
@@ -1082,7 +1164,7 @@ export async function runSupervisorTick({
       supervisor.nextNudgeAt = nextNudgeAt(timestamp, supervisor.intervalSeconds);
       supervisor.updatedAt = timestamp;
       goal.updatedAt = timestamp;
-      await atomicWriteJson(mapping.manifest_path, manifest);
+      await atomicWriteJson(manifestPath, manifest);
       const outcome = await deliverSupervisorNudge(goal, orchestrator.root, api);
       supervisor.lastDelivery = {
         status: outcome.status,
@@ -1098,8 +1180,8 @@ export async function runSupervisorTick({
       }
       supervisor.updatedAt = now();
       goal.updatedAt = supervisor.updatedAt;
-      await atomicWriteJson(mapping.manifest_path, manifest);
-      results.push({ manifestPath: mapping.manifest_path, status: outcome.status });
+      await atomicWriteJson(manifestPath, manifest);
+      results.push({ manifestPath, status: outcome.status });
     } finally {
       await release();
     }
@@ -1142,26 +1224,23 @@ async function recordRootActivity(config, event) {
   const timestamp = now();
   const results = [];
   const seenManifests = new Set();
-  for (const entry of configuredMappings(config)) {
-    const { orchestrator, workflow: mapping } = entry;
+  for (const entry of configuredParentManifests(config)) {
+    const { orchestrator, manifestPath, workflows } = entry;
     // A root status is scoped to its own record; no cross-root activity writes.
     if (!rootEventMatches(event, orchestrator.root)) continue;
-    const manifestKey = `${orchestrator.id}:${mapping.manifest_path}`;
+    const manifestKey = `${orchestrator.id}:${manifestPath}`;
     if (seenManifests.has(manifestKey)) continue;
     seenManifests.add(manifestKey);
-    const release = await acquireManifestLock(mapping.manifest_path);
+    const release = await acquireManifestLock(manifestPath);
     try {
       const manifest = parseJson(
-        await readRegularFile(mapping.manifest_path, "Workflow manifest"),
-        "Workflow manifest",
+        await readRegularFile(manifestPath, "Parent manifest"),
+        "Parent manifest",
       );
-      const mappings = orchestrator.workflows.filter(
-        (candidate) => candidate.manifest_path === mapping.manifest_path,
-      );
-      for (const candidate of mappings)
+      for (const candidate of workflows)
         validateMappedWorkflow(manifest, { workflow: candidate, lane: candidate.lanes[0] }, config.owner);
       if (!("parentGoal" in manifest) || !("supervisor" in manifest.parentGoal)) {
-        results.push({ manifestPath: mapping.manifest_path, status: "no-supervisor" });
+        results.push({ manifestPath, status: "no-supervisor" });
         continue;
       }
       const goal = validateParentGoal(manifest.parentGoal);
@@ -1171,8 +1250,8 @@ async function recordRootActivity(config, event) {
       };
       goal.supervisor.updatedAt = timestamp;
       goal.updatedAt = timestamp;
-      await atomicWriteJson(mapping.manifest_path, manifest);
-      results.push({ manifestPath: mapping.manifest_path, status: "recorded" });
+      await atomicWriteJson(manifestPath, manifest);
+      results.push({ manifestPath, status: "recorded" });
     } finally {
       await release();
     }
@@ -1241,6 +1320,12 @@ export async function handleHook({
       ledger.events.push(record);
       signalParentGoal(manifest, record);
       await atomicWriteJson(mapping.workflow.manifest_path, manifest);
+      if ("parentGoal" in manifest)
+        await publishParentGoalSidebar(
+          validateParentGoal(manifest.parentGoal),
+          mapping.orchestrator.root,
+          api,
+        );
     }
     if (!ACTIONABLE_CLASSIFICATIONS.has(record.classification)) {
       return { accepted: true, deduplicated: !created, record };

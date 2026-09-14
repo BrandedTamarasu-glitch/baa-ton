@@ -77,10 +77,12 @@ assert.doesNotMatch(
 );
 assert.match(readme, /Partial dispatch failures/, "README documents recovery behavior");
 assert.match(defects, /agent_pane_busy/, "defect ledger records the readiness incident");
-assert.match(source, /ROOT_ORCHESTRATOR_ENV/, "root approval designation is enforced");
+assert.match(source, /verified controller-mapped root/, "verified root designation is enforced");
+assert.match(source, /herdr_bootstrap_root/, "manual root bootstrap is registered");
+assert.match(source, /current pane identity/, "manual roots use verified pane identity");
 assert.match(readme, /Non-root callers/, "README documents root mediation");
 assert.match(defects, /Child approvals/, "defect ledger records approval mediation");
-assert.match(source, /ask_user_question[\s\S]*parent-question-required/, "child questions are guarded");
+assert.match(source, /ask_user_question[\s\S]*terminate:\s*true/, "child questions terminate without transcript output");
 assert.match(source, /worktreeCwd[\s\S]*plannedCwd/, "planner validates worktree cwd");
 assert.match(readme, /Worktree workflows/, "README documents worktree ownership");
 assert.match(source, /"worktree"\s*,\s*"open"[\s\S]*?"--workspace"[\s\S]*?"--path"/, "Git flow opens from a registered parent workspace");
@@ -166,6 +168,8 @@ extension.default({
         };
       return { stdout: `${controllerConfigDir}\n`, stderr: "", code: 0 };
     }
+    if (args[0] === "pane" && args[1] === "report-metadata")
+      return response({ result: {} });
     if (args[0] === "workspace" && args[1] === "close")
       return response({ result: {} });
     if (args[0] === "workspace" && args[1] === "get") {
@@ -325,7 +329,9 @@ extension.default({
     throw new Error(`Unexpected Herdr call: ${args.join(" ")}`);
   },
 });
-assert.equal(tools.size, 8, "extension registered its workflow tools");
+assert.equal(tools.size, 10, "extension registered its workflow tools");
+assert.ok(tools.has("herdr_bootstrap_root"), "extension registers manual root bootstrap");
+assert.ok(tools.has("herdr_question_answer"), "extension registers parent question answers");
 assert.ok(tools.has("herdr_reparent"), "extension registers root handoff");
 assert.ok(tools.has("herdr_complete"), "extension registers verified completion receipts");
 assert.ok(commands.has("herdr-resume"), "extension registered /herdr-resume");
@@ -334,9 +340,11 @@ const testCwd = await mkdtemp(join(tmpdir(), "herdr-orchestrator-smoke-"));
 const previousHerdrEnv = process.env.HERDR_ENV;
 const previousRootEnv = process.env.HERDR_ORCHESTRATOR_ROOT;
 const previousPaneEnv = process.env.HERDR_PANE_ID;
+const previousPluginConfigDir = process.env.HERDR_PLUGIN_CONFIG_DIR;
 process.env.HERDR_ENV = "1";
 process.env.HERDR_PANE_ID = rootPaneId;
 controllerConfigDir = join(testCwd, "controller-config");
+process.env.HERDR_PLUGIN_CONFIG_DIR = controllerConfigDir;
 let confirmationCalls = 0;
 const notifications = [];
 const ctx = {
@@ -368,6 +376,41 @@ try {
   delete process.env.HERDR_ORCHESTRATOR_ROOT;
   await mkdir(controllerConfigDir, { mode: 0o755 });
   await chmod(controllerConfigDir, 0o755);
+  const legacyManifestPath = join(testCwd, ".pi", "herdr-orchestrator", "manifest.json");
+  await mkdir(dirname(legacyManifestPath), { recursive: true });
+  await writeFile(legacyManifestPath, `${JSON.stringify({
+    version: 2,
+    workflows: [{ id: "legacy-workflow" }],
+    questionRequests: [{ id: "legacy-question" }],
+  })}\n`);
+  await assert.rejects(
+    tools.get("herdr_bootstrap_root").execute(
+      "bootstrap-root-without-reset",
+      {},
+      undefined,
+      undefined,
+      ctx,
+    ),
+    /parent manifest has existing state/,
+    "bootstrap refuses to adopt a legacy manifest",
+  );
+  const bootstrappedRoot = await tools.get("herdr_bootstrap_root").execute(
+    "bootstrap-root",
+    { reset: true },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(bootstrappedRoot.details.root.pane_id, rootPaneId);
+  assert.equal(bootstrappedRoot.details.manifestReset, true);
+  assert.equal(confirmationCalls, 0, "manual root bootstrap is confirmation-free by default");
+  assert.deepEqual(
+    JSON.parse(await readFile(legacyManifestPath, "utf8")),
+    { version: 2, workflows: [] },
+    "explicit reset retires legacy parent state",
+  );
+  const bootstrapConfig = JSON.parse(await readFile(join(controllerConfigDir, "config.json"), "utf8"));
+  assert.equal(bootstrapConfig.orchestrators[0].root.pane_id, rootPaneId, "bootstrap persists the verified root pane");
   const worktreeCwd = join(testCwd, "bb029-writer-worktree");
   const dirtyWorktreeCwd = join(testCwd, "dirty-worktree");
   const ambiguousWorktreeCwd = join(testCwd, "ambiguous-worktree");
@@ -527,6 +570,7 @@ try {
     "registered parent evidence is durable before dispatch",
   );
   const workflowId = plan.details.workflow.id;
+  process.env.HERDR_PANE_ID = "w-child:p1";
   const childDispatch = await tools
     .get("herdr_dispatch")
     .execute(
@@ -547,7 +591,8 @@ try {
     );
   assert.equal(childDispatch.details.parentApprovalRequired, true);
   assert.equal(repeatedChildDispatch.details.parentApprovalRequired, true);
-  assert.equal(confirmationCalls, 0, "child dispatch opens no confirmation UI");
+  assert.equal(confirmationCalls, 0, "child dispatch opens no confirmation UI after root bootstrap");
+  process.env.HERDR_PANE_ID = rootPaneId;
   assert.equal(
     calls.filter((args) => args[0] === "worktree" && args[1] === "open").length,
     0,
@@ -585,15 +630,25 @@ try {
     "repeated child dispatch returns the single parent request",
   );
 
-  process.env.HERDR_ORCHESTRATOR_ROOT = "1";
   const initializedGoal = await tools.get("herdr_goal").execute(
     "goal-initialize",
     { action: "initialize", objective: "Complete BB-029 safely." },
     undefined,
     undefined,
-    headlessRootCtx,
+    ctx,
   );
   assert.equal(initializedGoal.details.goal.supervisor.state, "stopped");
+  assert.deepEqual(calls.at(-1), [
+    "pane", "report-metadata", rootPaneId,
+    "--source", "herdr-orchestrator",
+    "--token", "herdr_goal_status=Goal: active",
+    "--token", "herdr_goal_next_1=Next: Choose one",
+    "--token", "herdr_goal_next_2=dependency-ready",
+    "--token", "herdr_goal_next_3=Herdr action or wait",
+    "--state-label", "idle=Goal: active",
+    "--state-label", "done=Goal: active",
+    "--ttl-ms", "86400000",
+  ]);
   const runningGoal = await tools.get("herdr_goal").execute(
     "goal-start",
     { action: "start", nudgeIntervalSeconds: 5 },
@@ -638,7 +693,7 @@ try {
   assert.equal(
     confirmationCalls,
     0,
-    "preauthorized root dispatch succeeds in headless mode without UI",
+    "preauthorized root dispatch succeeds in headless mode without extra UI",
   );
   manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   workflow = manifest.workflows[0];
@@ -830,7 +885,7 @@ try {
   assert.equal(
     confirmationCalls,
     0,
-    "preauthorized retry continues headlessly without UI",
+    "preauthorized retry continues headlessly without extra UI",
   );
   assert.ok(
     recovered.evidence.some(
@@ -883,6 +938,7 @@ try {
   assert.equal(goalResumePromptCount, 0, "dry-run sends no resume command");
 
   delete process.env.HERDR_ORCHESTRATOR_ROOT;
+  process.env.HERDR_PANE_ID = "w-child:p1";
   const childResume = await tools
     .get("herdr_resume")
     .execute(
@@ -893,7 +949,7 @@ try {
       ctx,
     );
   assert.equal(childResume.details.parentApprovalRequired, true);
-  assert.equal(confirmationCalls, 0, "child resume opens no confirmation UI");
+  assert.equal(confirmationCalls, 0, "child resume opens no confirmation UI after root bootstrap");
   assert.equal(
     goalResumePromptCount,
     0,
@@ -920,6 +976,7 @@ try {
   );
 
   process.env.HERDR_ORCHESTRATOR_ROOT = "1";
+  process.env.HERDR_PANE_ID = rootPaneId;
   const resumedGoal = await tools
     .get("herdr_resume")
     .execute(
@@ -938,7 +995,7 @@ try {
   assert.equal(
     confirmationCalls,
     0,
-    "preauthorized paused-goal recovery continues headlessly without UI",
+    "preauthorized paused-goal recovery continues headlessly without extra UI",
   );
   manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   workflow = manifest.workflows.find((item) => item.id === workflowId);
@@ -976,6 +1033,7 @@ try {
   assert.match(blockedPush.reason, /never authorized by the local policy/);
 
   delete process.env.HERDR_ORCHESTRATOR_ROOT;
+  process.env.HERDR_PANE_ID = workflow.lanes[0].paneId;
   const questionInput = {
     questions: [
       {
@@ -995,14 +1053,17 @@ try {
     ctx,
   );
   assert.equal(childQuestion.block, true);
-  assert.match(childQuestion.reason, /parent-question-required/);
+  assert.equal(childQuestion.terminate, true, "child question terminates without transcript output");
+  assert.equal("reason" in childQuestion, false, "child question exposes no routing protocol");
   assert.equal(repeatedChildQuestion.block, true);
-  assert.equal(confirmationCalls, 0, "child question opens no confirmation UI");
+  assert.equal(repeatedChildQuestion.terminate, true);
+  assert.equal(confirmationCalls, 0, "child question opens no confirmation UI after root bootstrap");
   assert.equal(
     calls.length,
-    callsBeforeQuestion,
-    "child question creates no Herdr resource",
+    callsBeforeQuestion + 2,
+    "new child question reads controller mapping then wakes exactly one parent",
   );
+  assert.deepEqual(calls.at(-1).slice(0, 3), ["agent", "prompt", rootPaneId]);
   manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   const questionedWorkflow = manifest.workflows.find(
     (item) => item.id === workflowId,
@@ -1021,7 +1082,31 @@ try {
     /May this child continue/,
   );
 
+  process.env.HERDR_PANE_ID = rootPaneId;
+  const answeredQuestion = await tools.get("herdr_question_answer").execute(
+    "answer-child-question",
+    { requestId: questionedWorkflow.questionRequests[0].id, answer: "Continue with the native pane footer." },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(answeredQuestion.details.question.status, "answered");
+  assert.equal(answeredQuestion.details.question.answer, "Continue with the native pane footer.");
+  assert.match(calls.at(-1).at(-3), /Herdr parent answer to your question/);
+
+  process.env.HERDR_PANE_ID = "w-manual:p1";
+  const manualQuestion = await eventHandlers.get("tool_call")(
+    { toolName: "ask_user_question", input: questionInput },
+    ctx,
+  );
+  assert.equal(
+    manualQuestion,
+    undefined,
+    "an unmanaged manually started pane may ask Zach directly",
+  );
+
   process.env.HERDR_ORCHESTRATOR_ROOT = "1";
+  process.env.HERDR_PANE_ID = rootPaneId;
   agentStartAcknowledgment = "non-json";
   const stalePlan = await tools.get("herdr_plan").execute(
     "stale-workspace-plan",
@@ -1272,6 +1357,7 @@ try {
     "recovered registration adds only its deferred workflow mapping",
   );
   delete process.env.HERDR_ORCHESTRATOR_ROOT;
+  process.env.HERDR_PANE_ID = "w-child:p1";
 
   const closeWorkflowId = genericWorkflowId;
   manifest = JSON.parse(await readFile(manifestPath, "utf8"));
@@ -1301,7 +1387,7 @@ try {
     );
   assert.equal(childClose.details.parentApprovalRequired, true);
   assert.equal(repeatedChildClose.details.parentApprovalRequired, true);
-  assert.equal(confirmationCalls, 0, "child close opens no confirmation UI");
+  assert.equal(confirmationCalls, 0, "child close opens no confirmation UI after root bootstrap");
   manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   const requestedClose = manifest.workflows.find(
     (item) => item.id === closeWorkflowId,
@@ -1321,6 +1407,7 @@ try {
     "child close does not close a workspace",
   );
   process.env.HERDR_ORCHESTRATOR_ROOT = "1";
+  process.env.HERDR_PANE_ID = rootPaneId;
   const rootClose = await tools
     .get("herdr_close")
     .execute(
@@ -1368,6 +1455,8 @@ try {
   else process.env.HERDR_ORCHESTRATOR_ROOT = previousRootEnv;
   if (previousPaneEnv === undefined) delete process.env.HERDR_PANE_ID;
   else process.env.HERDR_PANE_ID = previousPaneEnv;
+  if (previousPluginConfigDir === undefined) delete process.env.HERDR_PLUGIN_CONFIG_DIR;
+  else process.env.HERDR_PLUGIN_CONFIG_DIR = previousPluginConfigDir;
   await rm(testCwd, { recursive: true, force: true });
 }
 
