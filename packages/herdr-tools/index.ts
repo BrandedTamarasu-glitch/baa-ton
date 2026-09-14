@@ -1,0 +1,3307 @@
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readFile,
+  readFileSync,
+  realpath,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { homedir } from "node:os";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+
+const MANIFEST_DIR = ".pi/herdr-orchestrator";
+const MANIFEST_NAME = "manifest.json";
+const OWNER = "herdr-orchestrator";
+const BB029_AUTHORIZATION_SCOPE = "BB-029";
+// Exact installed Herdr `agent start --kind` compatibility set (2026-09-13).
+const SUPPORTED_AGENT_KINDS = [
+  "pi",
+  "claude",
+  "codex",
+  "gemini",
+  "cursor",
+  "devin",
+  "agy",
+  "cline",
+  "omp",
+  "mastracode",
+  "opencode",
+  "copilot",
+  "kimi",
+  "kiro",
+  "droid",
+  "amp",
+  "grok",
+  "hermes",
+  "kilo",
+  "qodercli",
+  "qwen",
+  "maki",
+  "muse",
+] as const;
+type AgentKind = (typeof SUPPORTED_AGENT_KINDS)[number];
+const AUTHORIZATION_CAPABILITIES = [
+  "local-herdr-topology",
+  "clean-local-worktrees",
+  "foreground-tests",
+  "observe-retry-review",
+  "durable-ledger",
+  "paused-goal-recovery",
+] as const;
+type AuthorizationCapability = (typeof AUTHORIZATION_CAPABILITIES)[number];
+type AutonomousOperation = "dispatch" | "retry" | "resume";
+type AuthorizationPolicy = {
+  version: 1;
+  scope: { workflow: typeof BB029_AUTHORIZATION_SCOPE; localOnly: true };
+  capabilities: AuthorizationCapability[];
+};
+type AuthorizationDecision = {
+  allowed: boolean;
+  operation: AutonomousOperation;
+  reason: string;
+  policy?: AuthorizationPolicy;
+};
+
+type ReadinessCheck = {
+  source: "herdr agent start --timeout";
+  checkedAt: string;
+  initialShellForeground: boolean;
+  agentStartTimeoutMs: number;
+};
+type RetryState = {
+  state: "dispatching" | "retryable";
+  attempt: number;
+  retryCommand: string;
+  resumedAt?: string;
+  failedAt?: string;
+  failedLaneId?: string;
+  failedStage?: string;
+  error?: string;
+};
+type ApprovalRequest = {
+  id: string;
+  action: "dispatch" | "close" | "resume";
+  status: "parent-approval-required" | "approved" | "cancelled";
+  requestedAt: string;
+  resolvedAt?: string;
+  request: string;
+};
+type ParentQuestionRequest = {
+  id: string;
+  kind: "question";
+  status: "parent-question-required";
+  requestedAt: string;
+  workflowId?: string;
+  paneId?: string;
+  question: string;
+};
+type GoalPauseRecord = {
+  status: "goal-paused";
+  goalIds: string[];
+  detectedAt: string;
+  source: "herdr agent read recent-unwrapped";
+  output: string;
+};
+type GoalResumeReceipt = {
+  command: "/goal-resume";
+  requestedAt: string;
+  receipt: string;
+};
+type ControllerTargetKind = "name" | "pane_id";
+type ControllerRootMapping = {
+  target: string;
+  target_kind: ControllerTargetKind;
+  pane_id: string;
+  workspace_id: string;
+  agent_kind?: string;
+};
+type ControllerLaneMapping = {
+  lane_id: string;
+  target: string;
+  target_kind: ControllerTargetKind;
+  pane_id: string;
+  workspace_id: string;
+  relationship_id?: string;
+};
+type ControllerWorkflowMapping = {
+  workflow_id: string;
+  manifest_path: string;
+  pi_goal_pause_detection?: boolean;
+  lanes: ControllerLaneMapping[];
+};
+type ControllerOrchestrator = {
+  id: string;
+  root: ControllerRootMapping;
+  program: { id: string; workspace_id: string };
+  workflows: ControllerWorkflowMapping[];
+};
+type ControllerConfig = {
+  version: 2;
+  owner: typeof OWNER;
+  orchestrators: ControllerOrchestrator[];
+};
+type EventControllerRegistration = {
+  version: 1;
+  status: "pending" | "registered" | "cleanup-pending" | "removed";
+  updatedAt: string;
+  reason?: string;
+  configPath?: string;
+  root?: ControllerRootMapping;
+  workflow?: ControllerWorkflowMapping;
+};
+type Lane = {
+  id: string;
+  objective: string;
+  readOnly: boolean;
+  agentKind: AgentKind;
+  status: string;
+  agentName?: string;
+  relationshipId?: string;
+  tabId?: string;
+  paneId?: string;
+  resourceCreatedAt?: string;
+  tabRenamedAt?: string;
+  readiness?: ReadinessCheck;
+  agentStartedAt?: string;
+  promptAttemptedAt?: string;
+  promptedAt?: string;
+  agentSessionPath?: string;
+  agentSessionId?: string;
+  // Retained for Pi manifests written before agentKind.
+  piSessionPath?: string;
+  piSessionId?: string;
+  herdrState?: string;
+  goalPaused?: GoalPauseRecord;
+  goalResumeReceipts?: GoalResumeReceipt[];
+};
+type WorktreeBinding = {
+  checkoutPath: string;
+  repoParent: {
+    workspaceId: string;
+    checkoutPath: string;
+    repoKey: string;
+    repoRoot: string;
+  };
+  workspaceId?: string;
+  openResult?: unknown;
+};
+type LaneInput =
+  | string
+  | { objective: string; readOnly?: boolean; agentKind?: AgentKind };
+type Workflow = {
+  id: string;
+  objective: string;
+  outcome: "planned" | "running" | "completed" | "closed" | "unknown";
+  status: string;
+  lanes: Lane[];
+  herdr: {
+    workspaceId?: string;
+    tabId?: string;
+    paneId?: string;
+    testPaneId?: string;
+    agentName?: string;
+  };
+  agent: { sessionPath?: string; sessionId?: string };
+  // Retained only for compatibility with manifests written before agentKind.
+  pi?: { sessionPath?: string; sessionId?: string };
+  agentKind: AgentKind;
+  cwd: string;
+  worktree: string | null;
+  worktreeBinding?: WorktreeBinding;
+  evidence: Array<{ at: string; kind: string; text: string }>;
+  ownership: {
+    createdBy: typeof OWNER;
+    workspaceId?: string;
+    // The workflow that originally created this durable workspace. Later
+    // same-cwd workflows use new tabs/panes in it rather than creating a
+    // workspace per trivial lane.
+    workspaceOwnerWorkflowId?: string;
+    tabIds?: string[];
+    paneIds: string[];
+  };
+  retry?: RetryState;
+  authorizationPolicy?: AuthorizationPolicy;
+  approvalRequests?: ApprovalRequest[];
+  questionRequests?: ParentQuestionRequest[];
+  eventControllerRegistration?: EventControllerRegistration;
+  createdAt: string;
+  updatedAt: string;
+  dispatchedAt?: string;
+  observedAt?: string;
+  closeRequestedAt?: string;
+  closedAt?: string;
+};
+type ParentGoalStatus = "active" | "waiting-for-event" | "action-required" | "blocked" | "completed" | "paused";
+type ParentGoalSignal = {
+  identity: string;
+  workflowId: string;
+  laneId: string;
+  classification: "done" | "blocked" | "goal-paused";
+  receivedAt: string;
+};
+type ParentGoalSupervisorState = "running" | "stopped" | "paused";
+type ParentGoalSupervisor = {
+  version: 1;
+  state: ParentGoalSupervisorState;
+  intervalSeconds: number;
+  nudgeCount: number;
+  nextNudgeAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  pauseReason?: string;
+  lastNudgeAt?: string;
+  lastAttemptAt?: string;
+  lastDelivery?: {
+    status: "sending" | "delivered" | "pending" | "uncertain";
+    attemptedAt: string;
+    deliveredAt?: string;
+    reason?: string;
+  };
+  rootActivity?: {
+    status: "idle" | "working" | "blocked" | "done" | "unknown";
+    observedAt: string;
+  };
+};
+type ParentGoal = {
+  version: 1;
+  id: string;
+  objective: string;
+  status: ParentGoalStatus;
+  nextAction: string;
+  signals: ParentGoalSignal[];
+  supervisor?: ParentGoalSupervisor;
+  createdAt: string;
+  updatedAt: string;
+};
+type Manifest = {
+  version: 2;
+  workflows: Workflow[];
+  parentGoal?: ParentGoal;
+  questionRequests?: ParentQuestionRequest[];
+};
+type ExecResult = {
+  stdout: string;
+  stderr: string;
+  code: number | null;
+  killed?: boolean;
+};
+
+const AGENT_START_TIMEOUT_MS = 60_000;
+const HERDR_COMMAND_TIMEOUT_MS = 35_000;
+const RECENT_AGENT_OUTPUT_LINES = 120;
+const GOAL_PAUSE_OUTPUT_LIMIT = 6000;
+const ROOT_ORCHESTRATOR_ENV = "HERDR_ORCHESTRATOR_ROOT";
+const HERDR_PANE_ID_ENV = "HERDR_PANE_ID";
+const CONTROLLER_PLUGIN_ID = "herdr-orchestrator-controller";
+const CONTROLLER_CONFIG_NAME = "config.json";
+const now = () => new Date().toISOString();
+const manifestPath = (cwd: string) => join(cwd, MANIFEST_DIR, MANIFEST_NAME);
+const jsonText = (value: unknown) => JSON.stringify(value, null, 2);
+const clip = (text: string, limit = 6000) =>
+  text.length > limit ? `${text.slice(0, limit)}\n[truncated]` : text;
+
+async function rootBootstrapPrompt(cwd: string): Promise<string> {
+  if (process.env[ROOT_ORCHESTRATOR_ENV] !== "1") return "";
+  const manifest = await loadManifest(cwd);
+  const goal = manifest.parentGoal;
+  const rootGoal = goal
+    ? `${goal.status}: ${clip(goal.objective, 4000)} Next: ${clip(goal.nextAction, 1000)}`
+    : "No registered parent goal.";
+  const active = manifest.workflows
+    .filter((workflow) => workflow.status !== "closed")
+    .map((workflow) => ({ id: workflow.id, status: workflow.status, lanes: workflow.lanes.length }));
+  return `\n\nHerdr parent-root bootstrap: you are the sole parent executor. Registered parent goal: ${rootGoal}. Herdr's durable manifest at ${manifestPath(cwd)} is authoritative; current workflows: ${jsonText(active)}. You may use herdr_plan, herdr_dispatch, herdr_observe, herdr_resume, and herdr_close only through their documented parent/root paths. Treat controller-delivered lane lifecycle, parent-question-required, parent-approval-required, and blocker records as one-turn work signals: read the durable record, take one allowed parent action or persist the next decision, then stop. Never ask the user to operate a child pane or Pi goal UI; children persist requests and Herdr wakes you. Do not poll or create detached agents. Do not push, merge, create PRs, deploy, mutate production, or close resources without explicit user approval.`;
+}
+
+function pausedGoalIds(output: string): string[] {
+  const goalIds = new Set<string>();
+  for (const line of clip(output, GOAL_PAUSE_OUTPUT_LIMIT).split(/\r?\n/)) {
+    if (!/\bpaus(?:e|ed|ing)\b/i.test(line)) continue;
+    for (const match of line.matchAll(/\bpi-goal-[a-z0-9][a-z0-9_-]*\b/gi))
+      goalIds.add(match[0].toLowerCase());
+  }
+  return [...goalIds].sort((left, right) => left.localeCompare(right));
+}
+
+async function loadManifest(cwd: string): Promise<Manifest> {
+  try {
+    const parsed = JSON.parse(await readFile(manifestPath(cwd), "utf8")) as {
+      version?: unknown;
+      workflows?: unknown;
+      parentGoal?: ParentGoal;
+      questionRequests?: ParentQuestionRequest[];
+    };
+    if (
+      (parsed.version === 1 || parsed.version === 2) &&
+      Array.isArray(parsed.workflows)
+    )
+      return {
+        version: 2,
+        workflows: parsed.workflows as Workflow[],
+        parentGoal: parsed.parentGoal,
+        questionRequests: parsed.questionRequests,
+      };
+    return { version: 2, workflows: [] };
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT")
+      return { version: 2, workflows: [] };
+    throw new Error(`Cannot read Herdr manifest: ${(error as Error).message}`);
+  }
+}
+
+async function saveManifest(cwd: string, manifest: Manifest): Promise<void> {
+  const path = manifestPath(cwd);
+  await mkdir(dirname(path), { recursive: true });
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, `${jsonText(manifest)}\n`, { mode: 0o600 });
+  await rename(temporary, path);
+}
+
+async function acquireManifestLock(cwd: string): Promise<() => Promise<void>> {
+  const path = manifestPath(cwd);
+  const lockPath = join(
+    dirname(path),
+    `.${MANIFEST_NAME}.herdr-orchestrator.lock`,
+  );
+  try {
+    await mkdir(lockPath, { mode: 0o700 });
+    await writeFile(
+      join(lockPath, "owner.json"),
+      `${jsonText({ pid: process.pid, createdAt: now() })}\n`,
+      { mode: 0o600 },
+    );
+    return async () => rm(lockPath, { recursive: true, force: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST")
+      throw new Error(
+        `Herdr manifest is busy: ${path}. Wait for the active controller operation, then retry.`,
+      );
+    throw error;
+  }
+}
+
+const PARENT_GOAL_STATUSES = new Set<ParentGoalStatus>([
+  "active", "waiting-for-event", "action-required", "blocked", "completed", "paused",
+]);
+const MIN_PARENT_GOAL_NUDGE_INTERVAL_SECONDS = 5;
+const MAX_PARENT_GOAL_NUDGE_INTERVAL_SECONDS = 86_400;
+
+function parentGoalNudgeInterval(value: number | undefined): number {
+  const interval = value ?? MIN_PARENT_GOAL_NUDGE_INTERVAL_SECONDS;
+  if (
+    !Number.isSafeInteger(interval) ||
+    interval < MIN_PARENT_GOAL_NUDGE_INTERVAL_SECONDS ||
+    interval > MAX_PARENT_GOAL_NUDGE_INTERVAL_SECONDS
+  )
+    throw new Error(
+      `nudgeIntervalSeconds must be an integer from ${MIN_PARENT_GOAL_NUDGE_INTERVAL_SECONDS} to ${MAX_PARENT_GOAL_NUDGE_INTERVAL_SECONDS}.`,
+    );
+  return interval;
+}
+
+function requireRootGoalExecutor(): void {
+  requireHerdr();
+  if (!isRootOrchestrator())
+    throw new Error("Only HERDR_ORCHESTRATOR_ROOT=1 may create or update the parent goal.");
+}
+
+async function parentGoal(
+  cwd: string,
+  action: "initialize" | "set-state" | "status" | "start" | "stop" | "pause",
+  objective?: string,
+  status?: string,
+  nextAction?: string,
+  nudgeIntervalSeconds?: number,
+  pauseReason?: string,
+): Promise<ParentGoal> {
+  requireRootGoalExecutor();
+  const release = await acquireManifestLock(cwd);
+  try {
+  const manifest = await loadManifest(cwd);
+  if (action === "status") {
+    if (!manifest.parentGoal) throw new Error("No parent goal is registered.");
+    return manifest.parentGoal;
+  }
+  if (action === "initialize") {
+    if (manifest.parentGoal) throw new Error("A parent goal is already registered; use set-state.");
+    if (!objective?.trim()) throw new Error("objective is required to initialize a parent goal.");
+    const timestamp = now();
+    manifest.parentGoal = {
+      version: 1,
+      id: `parent-goal-${randomUUID().slice(0, 12)}`,
+      objective: objective.trim(),
+      status: "active",
+      nextAction: nextAction?.trim() || "Choose one dependency-ready Herdr action or wait for a durable event.",
+      signals: [],
+      supervisor: {
+        version: 1,
+        state: "stopped",
+        intervalSeconds: parentGoalNudgeInterval(nudgeIntervalSeconds),
+        nudgeCount: 0,
+        nextNudgeAt: null,
+        rootActivity: { status: "unknown", observedAt: timestamp },
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      },
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+  } else {
+    const goal = manifest.parentGoal;
+    if (!goal) throw new Error("No parent goal is registered; initialize one first.");
+    const timestamp = now();
+    const supervisor = () =>
+      (goal.supervisor ??= {
+        version: 1,
+        state: "stopped",
+        intervalSeconds: parentGoalNudgeInterval(undefined),
+        nudgeCount: 0,
+        nextNudgeAt: null,
+        rootActivity: { status: "unknown", observedAt: timestamp },
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+    if (action === "set-state") {
+      if (!status || !PARENT_GOAL_STATUSES.has(status as ParentGoalStatus))
+        throw new Error(`status must be one of: ${[...PARENT_GOAL_STATUSES].join(", ")}.`);
+      if (status === "paused")
+        throw new Error("Use action=pause with a non-empty pauseReason.");
+      goal.status = status as ParentGoalStatus;
+      if (objective?.trim()) goal.objective = objective.trim();
+      if (nextAction?.trim()) goal.nextAction = nextAction.trim();
+      if (status === "completed" || status === "blocked") {
+        const control = supervisor();
+        control.state = "stopped";
+        control.nextNudgeAt = null;
+        control.updatedAt = timestamp;
+      }
+    } else if (action === "start") {
+      if (goal.status === "completed" || goal.status === "blocked")
+        throw new Error("A completed or blocked parent goal cannot be started.");
+      const control = supervisor();
+      control.state = "running";
+      control.intervalSeconds = parentGoalNudgeInterval(nudgeIntervalSeconds ?? control.intervalSeconds);
+      control.nextNudgeAt = timestamp;
+      delete control.pauseReason;
+      delete control.lastDelivery;
+      control.updatedAt = timestamp;
+      if (goal.status === "paused") goal.status = "active";
+      if (nextAction?.trim()) goal.nextAction = nextAction.trim();
+    } else if (action === "stop") {
+      const control = supervisor();
+      control.state = "stopped";
+      control.nextNudgeAt = null;
+      control.updatedAt = timestamp;
+    } else if (action === "pause") {
+      if (!pauseReason?.trim())
+        throw new Error("pauseReason is required when action=pause.");
+      const control = supervisor();
+      control.state = "paused";
+      control.pauseReason = pauseReason.trim();
+      control.nextNudgeAt = null;
+      control.updatedAt = timestamp;
+      goal.status = "paused";
+    }
+    goal.updatedAt = timestamp;
+  }
+  await saveManifest(cwd, manifest);
+  return manifest.parentGoal!;
+  } finally {
+    await release();
+  }
+}
+
+async function plannedCwd(
+  callerCwd: string,
+  worktreeCwd?: string,
+): Promise<{ cwd: string; worktree: string | null }> {
+  if (!worktreeCwd) return { cwd: resolve(callerCwd), worktree: null };
+  if (!isAbsolute(worktreeCwd))
+    throw new Error("worktreeCwd must be an absolute existing directory.");
+  let details: Awaited<ReturnType<typeof stat>>;
+  try {
+    details = await stat(worktreeCwd);
+  } catch {
+    throw new Error(`worktreeCwd does not exist: ${worktreeCwd}`);
+  }
+  if (!details.isDirectory())
+    throw new Error(`worktreeCwd is not a directory: ${worktreeCwd}`);
+  // Canonicalize only an existing checkout; never create or modify a Git worktree.
+  const cwd = await realpath(worktreeCwd);
+  return { cwd, worktree: cwd };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function samePath(left: string, right: string): boolean {
+  return resolve(left) === resolve(right);
+}
+
+function validateAgentKind(value: unknown, label = "agentKind"): AgentKind {
+  if (
+    typeof value === "string" &&
+    SUPPORTED_AGENT_KINDS.includes(value as AgentKind)
+  )
+    return value as AgentKind;
+  throw new Error(
+    `${label} must be one of ${SUPPORTED_AGENT_KINDS.join(", ")}.`,
+  );
+}
+
+function laneAgentKind(workflow: Workflow, lane: Lane): AgentKind {
+  // Manifests written before agentKind are Pi workflows by definition.
+  return validateAgentKind(lane.agentKind ?? workflow.agentKind ?? "pi");
+}
+
+function normalizedLanes(
+  objective: string,
+  inputs: LaneInput[],
+  defaultAgentKind: AgentKind,
+): Lane[] {
+  const values = inputs.length ? inputs : [objective];
+  return values.map((input, index) => {
+    if (typeof input === "string")
+      return {
+        id: `lane-${index + 1}`,
+        objective: input,
+        readOnly: false,
+        agentKind: defaultAgentKind,
+        status: "planned",
+      };
+    if (!input || typeof input.objective !== "string" || !input.objective)
+      throw new Error("Each lane object needs a non-empty objective.");
+    return {
+      id: `lane-${index + 1}`,
+      objective: input.objective,
+      readOnly: input.readOnly === true,
+      agentKind: validateAgentKind(input.agentKind ?? defaultAgentKind),
+      status: "planned",
+    };
+  });
+}
+
+function exactKeys(value: Record<string, unknown>, keys: string[]): boolean {
+  const actual = Object.keys(value).sort();
+  return (
+    actual.length === keys.length &&
+    actual.every((key, index) => key === keys.slice().sort()[index])
+  );
+}
+
+function controllerString(value: unknown, label: string): string {
+  if (typeof value !== "string" || !value)
+    throw new Error(`${label} must be a non-empty string.`);
+  return value;
+}
+
+function controllerObject(
+  value: unknown,
+  label: string,
+  required: string[],
+  optional: string[] = [],
+): Record<string, unknown> {
+  if (!isRecord(value)) throw new Error(`${label} must be an object.`);
+  const allowed = new Set([...required, ...optional]);
+  for (const key of Object.keys(value))
+    if (!allowed.has(key)) throw new Error(`${label}.${key} is not allowed.`);
+  for (const key of required)
+    if (!(key in value)) throw new Error(`${label}.${key} is required.`);
+  return value;
+}
+
+function validateControllerTarget(
+  value: Record<string, unknown>,
+  label: string,
+  paneId: string,
+): Pick<ControllerRootMapping, "target" | "target_kind"> {
+  const target = controllerString(value.target, `${label}.target`);
+  const targetKind = controllerString(
+    value.target_kind,
+    `${label}.target_kind`,
+  );
+  if (targetKind !== "name" && targetKind !== "pane_id")
+    throw new Error(`${label}.target_kind must be name or pane_id.`);
+  if (targetKind === "pane_id" && target !== paneId)
+    throw new Error(`${label}.target must equal ${label}.pane_id.`);
+  return { target, target_kind: targetKind };
+}
+
+function validateControllerRoot(input: unknown): ControllerRootMapping {
+  const value = controllerObject(
+    input,
+    "controller config.root",
+    ["target", "target_kind", "pane_id", "workspace_id"],
+    ["agent_kind"],
+  );
+  const paneId = controllerString(
+    value.pane_id,
+    "controller config.root.pane_id",
+  );
+  const root: ControllerRootMapping = {
+    ...validateControllerTarget(value, "controller config.root", paneId),
+    pane_id: paneId,
+    workspace_id: controllerString(
+      value.workspace_id,
+      "controller config.root.workspace_id",
+    ),
+  };
+  if ("agent_kind" in value)
+    root.agent_kind = controllerString(
+      value.agent_kind,
+      "controller config.root.agent_kind",
+    );
+  return root;
+}
+
+function validateControllerLane(
+  input: unknown,
+  label: string,
+): ControllerLaneMapping {
+  const value = controllerObject(input, label, [
+    "lane_id",
+    "target",
+    "target_kind",
+    "pane_id",
+    "workspace_id",
+  ], ["relationship_id"]);
+  const paneId = controllerString(value.pane_id, `${label}.pane_id`);
+  return {
+    lane_id: controllerString(value.lane_id, `${label}.lane_id`),
+    ...validateControllerTarget(value, label, paneId),
+    pane_id: paneId,
+    workspace_id: controllerString(value.workspace_id, `${label}.workspace_id`),
+    ...(typeof value.relationship_id === "string"
+      ? { relationship_id: controllerString(value.relationship_id, `${label}.relationship_id`) }
+      : {}),
+  };
+}
+
+function validateControllerWorkflow(
+  input: unknown,
+  label: string,
+): ControllerWorkflowMapping {
+  const value = controllerObject(
+    input,
+    label,
+    ["workflow_id", "manifest_path", "lanes"],
+    ["pi_goal_pause_detection"],
+  );
+  const manifest = controllerString(
+    value.manifest_path,
+    `${label}.manifest_path`,
+  );
+  if (!isAbsolute(manifest))
+    throw new Error(`${label}.manifest_path must be absolute.`);
+  if (!Array.isArray(value.lanes) || value.lanes.length === 0)
+    throw new Error(`${label}.lanes must be a non-empty array.`);
+  if (
+    "pi_goal_pause_detection" in value &&
+    typeof value.pi_goal_pause_detection !== "boolean"
+  )
+    throw new Error(`${label}.pi_goal_pause_detection must be a boolean.`);
+  const lanes = value.lanes.map((lane, index) =>
+    validateControllerLane(lane, `${label}.lanes[${index}]`),
+  );
+  if (new Set(lanes.map((lane) => lane.lane_id)).size !== lanes.length)
+    throw new Error(`${label}.lanes cannot repeat lane_id values.`);
+  if (new Set(lanes.map((lane) => lane.pane_id)).size !== lanes.length)
+    throw new Error(`${label}.lanes cannot repeat pane_id values.`);
+  if (
+    new Set(lanes.map((lane) => `${lane.target_kind}:${lane.target}`)).size !==
+    lanes.length
+  )
+    throw new Error(`${label}.lanes cannot repeat targets.`);
+  return {
+    workflow_id: controllerString(value.workflow_id, `${label}.workflow_id`),
+    manifest_path: resolve(manifest),
+    ...(typeof value.pi_goal_pause_detection === "boolean"
+      ? { pi_goal_pause_detection: value.pi_goal_pause_detection }
+      : {}),
+    lanes,
+  };
+}
+
+function validateControllerConfig(input: unknown): ControllerConfig {
+  if (!isRecord(input) || input.owner !== OWNER)
+    throw new Error(`controller config.owner must be ${OWNER}.`);
+  // Read v1 as one isolated legacy record. The next registration writes v2.
+  if (input.version === 1) {
+    const legacy = controllerObject(input, "controller config", ["version", "owner", "root", "workflows"]);
+    const root = validateControllerRoot(legacy.root);
+    if (!Array.isArray(legacy.workflows) || legacy.workflows.length === 0)
+      throw new Error("controller config.workflows must be a non-empty array.");
+    return { version: 2, owner: OWNER, orchestrators: [{
+      id: `legacy:${root.workspace_id}:${root.pane_id}`,
+      root,
+      program: { id: "legacy-global", workspace_id: root.workspace_id },
+      workflows: legacy.workflows.map((item, index) => validateControllerWorkflow(item, `controller config.workflows[${index}]`)),
+    }] };
+  }
+  const value = controllerObject(input, "controller config", ["version", "owner", "orchestrators"]);
+  if (value.version !== 2) throw new Error("controller config.version must be 1 or 2.");
+  if (!Array.isArray(value.orchestrators) || value.orchestrators.length === 0)
+    throw new Error("controller config.orchestrators must be a non-empty array.");
+  const orchestrators = value.orchestrators.map((item, index) => {
+    const record = controllerObject(item, `controller config.orchestrators[${index}]`, ["id", "root", "program", "workflows"]);
+    const root = validateControllerRoot(record.root);
+    const program = controllerObject(record.program, `controller config.orchestrators[${index}].program`, ["id", "workspace_id"]);
+    if (!Array.isArray(record.workflows) || record.workflows.length === 0) throw new Error("controller orchestrator needs workflows.");
+    const programId = controllerString(program.id, "controller program.id");
+    const workspaceId = controllerString(program.workspace_id, "controller program.workspace_id");
+    if (workspaceId !== root.workspace_id) throw new Error("controller program workspace must match root workspace.");
+    return { id: controllerString(record.id, "controller orchestrator.id"), root, program: { id: programId, workspace_id: workspaceId }, workflows: record.workflows.map((workflow, workflowIndex) => validateControllerWorkflow(workflow, `controller config.orchestrators[${index}].workflows[${workflowIndex}]`)) };
+  });
+  if (new Set(orchestrators.map((item) => item.id)).size !== orchestrators.length) throw new Error("controller config cannot repeat orchestrator IDs.");
+  const workflowIds = orchestrators.flatMap((item) => item.workflows.map((workflow) => workflow.workflow_id));
+  if (new Set(workflowIds).size !== workflowIds.length) throw new Error("controller config cannot repeat workflow IDs across orchestrators.");
+  return { version: 2, owner: OWNER, orchestrators };
+}
+
+function controllerRecordId(root: ControllerRootMapping, cwd: string): string {
+  return `orchestrator:${root.workspace_id}:${root.pane_id}:${resolve(cwd)}`;
+}
+
+function findControllerRecord(config: ControllerConfig, root: ControllerRootMapping, cwd: string): ControllerOrchestrator | undefined {
+  const id = controllerRecordId(root, cwd);
+  return config.orchestrators.find((record) => record.id === id);
+}
+
+function recordForRegistration(config: ControllerConfig, registration: EventControllerRegistration): ControllerOrchestrator | undefined {
+  if (!registration.root || !registration.workflow) return undefined;
+  return config.orchestrators.find((record) =>
+    sameControllerRoot(record.root, registration.root!) &&
+    record.workflows.some((workflow) => sameControllerWorkflow(workflow, registration.workflow!)),
+  );
+}
+
+function sameControllerRoot(
+  left: ControllerRootMapping,
+  right: ControllerRootMapping,
+): boolean {
+  return (
+    left.target === right.target &&
+    left.target_kind === right.target_kind &&
+    left.pane_id === right.pane_id &&
+    left.workspace_id === right.workspace_id &&
+    left.agent_kind === right.agent_kind
+  );
+}
+
+function sameControllerWorkflow(
+  left: ControllerWorkflowMapping,
+  right: ControllerWorkflowMapping,
+): boolean {
+  return (
+    left.workflow_id === right.workflow_id &&
+    samePath(left.manifest_path, right.manifest_path) &&
+    (left.pi_goal_pause_detection ?? false) ===
+      (right.pi_goal_pause_detection ?? false) &&
+    left.lanes.length === right.lanes.length &&
+    left.lanes.every((lane) => {
+      const other = right.lanes.find(
+        (candidate) => candidate.lane_id === lane.lane_id,
+      );
+      return (
+        lane.target === other?.target &&
+        lane.target_kind === other.target_kind &&
+        lane.pane_id === other.pane_id &&
+        lane.workspace_id === other.workspace_id
+      );
+    })
+  );
+}
+
+async function secureControllerConfigDirectory(path: string): Promise<string> {
+  if (!isAbsolute(path))
+    throw new Error("Herdr controller config directory must be absolute.");
+  const directory = resolve(path);
+  let details: Awaited<ReturnType<typeof lstat>>;
+  try {
+    details = await lstat(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    details = await lstat(directory);
+  }
+  if (!details.isDirectory() || details.isSymbolicLink())
+    throw new Error(
+      "Herdr controller config directory must be a real directory.",
+    );
+  const identity = { dev: details.dev, ino: details.ino };
+  await chmod(directory, 0o700);
+  details = await lstat(directory);
+  if (
+    !details.isDirectory() ||
+    details.isSymbolicLink() ||
+    details.dev !== identity.dev ||
+    details.ino !== identity.ino ||
+    (details.mode & 0o077) !== 0
+  )
+    throw new Error(
+      "Herdr controller config directory could not be securely repaired to private mode (0700).",
+    );
+  return directory;
+}
+
+async function loadControllerConfig(
+  path: string,
+): Promise<ControllerConfig | undefined> {
+  let details: Awaited<ReturnType<typeof lstat>>;
+  try {
+    details = await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  if (!details.isFile() || details.isSymbolicLink())
+    throw new Error("Herdr controller config must be a regular file.");
+  if ((details.mode & 0o022) !== 0)
+    throw new Error(
+      "Herdr controller config must not be group- or world-writable.",
+    );
+  try {
+    return validateControllerConfig(JSON.parse(await readFile(path, "utf8")));
+  } catch (error) {
+    throw new Error(
+      `Herdr controller config is invalid: ${(error as Error).message}`,
+    );
+  }
+}
+
+async function saveControllerConfig(
+  configPath: string,
+  config: ControllerConfig,
+): Promise<void> {
+  const temporary = join(
+    dirname(configPath),
+    `.${CONTROLLER_CONFIG_NAME}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    await writeFile(temporary, `${jsonText(config)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    await rename(temporary, configPath);
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function removeControllerConfig(configPath: string): Promise<void> {
+  const temporary = join(
+    dirname(configPath),
+    `.${CONTROLLER_CONFIG_NAME}.removed.${process.pid}.${randomUUID()}.tmp`,
+  );
+  await rename(configPath, temporary);
+  await rm(temporary, { force: true });
+}
+
+function validateAuthorizationPolicy(input: unknown): AuthorizationPolicy {
+  if (
+    !isRecord(input) ||
+    !exactKeys(input, ["version", "scope", "capabilities"])
+  )
+    throw new Error(
+      "authorizationPolicy must contain only version, scope, and capabilities.",
+    );
+  if (input.version !== 1)
+    throw new Error("authorizationPolicy.version must be 1.");
+  if (
+    !isRecord(input.scope) ||
+    !exactKeys(input.scope, ["workflow", "localOnly"])
+  )
+    throw new Error(
+      "authorizationPolicy.scope must contain only workflow and localOnly.",
+    );
+  if (
+    input.scope.workflow !== BB029_AUTHORIZATION_SCOPE ||
+    input.scope.localOnly !== true
+  )
+    throw new Error(
+      `authorizationPolicy is restricted to ${BB029_AUTHORIZATION_SCOPE} local-only work.`,
+    );
+  if (!Array.isArray(input.capabilities) || input.capabilities.length === 0)
+    throw new Error(
+      "authorizationPolicy.capabilities must be a non-empty array.",
+    );
+  const capabilities = input.capabilities.map((capability) => {
+    if (
+      typeof capability !== "string" ||
+      !AUTHORIZATION_CAPABILITIES.includes(
+        capability as AuthorizationCapability,
+      )
+    )
+      throw new Error(
+        `authorizationPolicy cannot authorize ${String(capability)}.`,
+      );
+    return capability as AuthorizationCapability;
+  });
+  if (new Set(capabilities).size !== capabilities.length)
+    throw new Error(
+      "authorizationPolicy.capabilities must not contain duplicates.",
+    );
+  return {
+    version: 1,
+    scope: { workflow: BB029_AUTHORIZATION_SCOPE, localOnly: true },
+    capabilities,
+  };
+}
+
+function authorizationDecision(
+  workflow: Workflow,
+  operation: AutonomousOperation,
+): AuthorizationDecision {
+  if (!workflow.authorizationPolicy)
+    return {
+      allowed: false,
+      operation,
+      reason:
+        "no authorizationPolicy is recorded; explicit root approval is required",
+    };
+  let policy: AuthorizationPolicy;
+  try {
+    policy = validateAuthorizationPolicy(workflow.authorizationPolicy);
+  } catch (error) {
+    return {
+      allowed: false,
+      operation,
+      reason: `recorded authorizationPolicy is invalid: ${(error as Error).message}`,
+    };
+  }
+  if (
+    !new RegExp(`\\b${BB029_AUTHORIZATION_SCOPE}\\b`, "i").test(
+      workflow.objective,
+    )
+  )
+    return {
+      allowed: false,
+      operation,
+      reason: `workflow objective is not bound to ${BB029_AUTHORIZATION_SCOPE}`,
+      policy,
+    };
+  const required: Record<AutonomousOperation, AuthorizationCapability[]> = {
+    dispatch: ["local-herdr-topology", "foreground-tests", "durable-ledger"],
+    retry: [
+      "local-herdr-topology",
+      "foreground-tests",
+      "observe-retry-review",
+      "durable-ledger",
+    ],
+    resume: ["observe-retry-review", "durable-ledger", "paused-goal-recovery"],
+  };
+  if (workflow.worktree) required[operation].push("clean-local-worktrees");
+  const missing = required[operation].filter(
+    (capability) => !policy.capabilities.includes(capability),
+  );
+  return missing.length === 0
+    ? {
+        allowed: true,
+        operation,
+        reason: "preauthorized local operation",
+        policy,
+      }
+    : {
+        allowed: false,
+        operation,
+        reason: `authorizationPolicy lacks ${missing.join(", ")}`,
+        policy,
+      };
+}
+
+function auditAuthorization(
+  workflow: Workflow,
+  decision: AuthorizationDecision,
+): void {
+  workflow.evidence.push({
+    at: now(),
+    kind: decision.allowed
+      ? "authorization-policy-granted"
+      : "authorization-policy-denied",
+    text: `Autonomous ${decision.operation}: ${decision.reason}${
+      decision.policy
+        ? `; scope=${decision.policy.scope.workflow}; capabilities=${decision.policy.capabilities.join(",")}`
+        : ""
+    }`,
+  });
+}
+
+function workflowFor(manifest: Manifest, id: string): Workflow {
+  const workflow = manifest.workflows.find((item) => item.id === id);
+  if (!workflow) throw new Error(`Unknown Herdr workflow: ${id}`);
+  return workflow;
+}
+
+function parseJson(stdout: string): any {
+  try {
+    return JSON.parse(stdout);
+  } catch {
+    throw new Error(`Herdr returned non-JSON output: ${clip(stdout, 1000)}`);
+  }
+}
+
+function deepString(value: unknown, keys: string[]): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const object = value as Record<string, unknown>;
+  for (const key of keys)
+    if (typeof object[key] === "string" && object[key])
+      return object[key] as string;
+  for (const child of Object.values(object)) {
+    const found = deepString(child, keys);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function deepState(value: unknown): string | undefined {
+  return deepString(value, ["agent_status", "state", "agent_state", "status"]);
+}
+
+function deepNumber(value: unknown, keys: string[]): number | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const object = value as Record<string, unknown>;
+  for (const key of keys)
+    if (typeof object[key] === "number" && Number.isFinite(object[key]))
+      return object[key] as number;
+  for (const child of Object.values(object)) {
+    const found = deepNumber(child, keys);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+function deepBoolean(value: unknown, keys: string[]): boolean | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const object = value as Record<string, unknown>;
+  for (const key of keys)
+    if (typeof object[key] === "boolean") return object[key] as boolean;
+  for (const child of Object.values(object)) {
+    const found = deepBoolean(child, keys);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+function shellIsForeground(processInfo: unknown): boolean {
+  const shellPid = deepNumber(processInfo, ["shell_pid"]);
+  const foregroundProcessGroupId = deepNumber(processInfo, [
+    "foreground_process_group_id",
+  ]);
+  return shellPid !== undefined && shellPid === foregroundProcessGroupId;
+}
+
+function recordLaneResources(
+  workflow: Workflow,
+  index: number,
+  tabId: string,
+  paneId: string,
+): Lane {
+  const lane = workflow.lanes[index];
+  const recorded = {
+    ...lane,
+    status: lane.status === "planned" ? "resources-created" : lane.status,
+    tabId,
+    paneId,
+    resourceCreatedAt: now(),
+  };
+  workflow.lanes[index] = recorded;
+  workflow.ownership.tabIds ??= [];
+  if (!workflow.ownership.tabIds.includes(tabId))
+    workflow.ownership.tabIds.push(tabId);
+  if (!workflow.ownership.paneIds.includes(paneId))
+    workflow.ownership.paneIds.push(paneId);
+  if (index === 0)
+    workflow.herdr = {
+      ...workflow.herdr,
+      workspaceId: workflow.ownership.workspaceId,
+      tabId,
+      paneId,
+    };
+  return recorded;
+}
+
+function contract(workflow: Workflow, lane: Lane): string {
+  const agentKind = laneAgentKind(workflow, lane);
+  return [
+    "You are a delegated coding-agent session managed exclusively by Herdr.",
+    `Agent kind: ${agentKind}`,
+    `Workflow: ${workflow.id}`,
+    `Objective: ${lane.objective}`,
+    `Lane: ${lane.id}`,
+    `Parent-child relationship: ${lane.relationshipId ?? "pending"}`,
+    lane.readOnly
+      ? "This lane is declared read-only: do not modify files, Git state, or external systems."
+      : "Contract: work only in the assigned cwd; report concise progress, commands, tests, evidence, and blockers.",
+    "Do not create subagents, background jobs, detached tasks, or another agent session.",
+    "Run tests synchronously in this pane, or ask the caller to create an explicit Herdr test pane.",
+    "A recorded local authorization policy applies only to the designated root's dispatch, retry, and Pi paused-goal recovery; it grants this child no approval authority.",
+    "Never push, merge, deploy, create a PR, mutate production or external services, or close Herdr resources.",
+    `Before ending, you MUST call herdr_complete({ workflowId: "${workflow.id}", summary: "<outcome, evidence, blockers>" }) exactly once after verifying the work. A chat-only outcome is insufficient and does not complete this lane.`,
+    "Then state the same outcome/evidence clearly. Generic Herdr done events are fallback-only; the durable herdr_complete receipt is required for normal completion.",
+  ].join("\n");
+}
+
+function requireHerdr(): void {
+  if (process.env.HERDR_ENV !== "1")
+    throw new Error(
+      "HERDR_ENV=1 is required; dispatch and close are unavailable outside a Herdr pane.",
+    );
+}
+
+function isRootOrchestrator(): boolean {
+  if (process.env[ROOT_ORCHESTRATOR_ENV] === "1") return true;
+  const paneId = process.env[HERDR_PANE_ID_ENV];
+  if (!paneId) return false;
+  try {
+    const config = JSON.parse(readFileSync(
+      join(homedir(), ".config", "herdr", "plugins", "config", CONTROLLER_PLUGIN_ID, CONTROLLER_CONFIG_NAME),
+      "utf8",
+    )) as ControllerConfig;
+    return config.orchestrators?.some((record) => record.root?.pane_id === paneId) ?? false;
+  } catch {
+    return false;
+  }
+}
+
+function requestParentApproval(
+  workflow: Workflow,
+  action: ApprovalRequest["action"],
+): ApprovalRequest {
+  workflow.approvalRequests ??= [];
+  const existing = workflow.approvalRequests.find(
+    (request) =>
+      request.action === action &&
+      request.status === "parent-approval-required",
+  );
+  if (existing) return existing;
+  const request: ApprovalRequest = {
+    id: `approval-${randomUUID().slice(0, 8)}`,
+    action,
+    status: "parent-approval-required",
+    requestedAt: now(),
+    request:
+      `Parent approval required for ${action} of ${workflow.id}. ` +
+      `Observe the requesting child through Herdr, then run from the designated root (${ROOT_ORCHESTRATOR_ENV}=1).`,
+  };
+  workflow.approvalRequests.push(request);
+  workflow.evidence.push({
+    at: now(),
+    kind: "parent-approval-required",
+    text: request.request,
+  });
+  return request;
+}
+
+function resolveParentApproval(
+  workflow: Workflow,
+  action: ApprovalRequest["action"],
+  status: "approved" | "cancelled",
+): void {
+  const request = workflow.approvalRequests
+    ?.slice()
+    .reverse()
+    .find(
+      (item) =>
+        item.action === action && item.status === "parent-approval-required",
+    );
+  if (!request) return;
+  request.status = status;
+  request.resolvedAt = now();
+}
+
+function workflowForQuestionRequest(manifest: Manifest): Workflow | undefined {
+  const paneId = process.env.HERDR_PANE_ID;
+  if (paneId) {
+    const paneWorkflow = manifest.workflows.find((workflow) =>
+      workflow.lanes.some((lane) => lane.paneId === paneId),
+    );
+    if (paneWorkflow) return paneWorkflow;
+  }
+  const active = manifest.workflows.filter((workflow) =>
+    [
+      "starting",
+      "running",
+      "dispatch-failed",
+      "goal-paused",
+      "goal-resume-requested",
+      "goal-resume-failed",
+    ].includes(workflow.status),
+  );
+  return active.length === 1 ? active[0] : undefined;
+}
+
+async function persistParentQuestion(
+  cwd: string,
+  input: unknown,
+): Promise<ParentQuestionRequest> {
+  const manifest = await loadManifest(cwd);
+  const workflow = workflowForQuestionRequest(manifest);
+  const question = clip(jsonText(input), 6000);
+  const paneId = process.env.HERDR_PANE_ID;
+  const requests = workflow
+    ? (workflow.questionRequests ??= [])
+    : (manifest.questionRequests ??= []);
+  const existing = requests.find(
+    (request) =>
+      request.status === "parent-question-required" &&
+      request.question === question &&
+      request.paneId === paneId,
+  );
+  if (existing) return existing;
+  const request: ParentQuestionRequest = {
+    id: `question-${randomUUID().slice(0, 8)}`,
+    kind: "question",
+    status: "parent-question-required",
+    requestedAt: now(),
+    workflowId: workflow?.id,
+    paneId,
+    question,
+  };
+  requests.push(request);
+  if (workflow)
+    workflow.evidence.push({
+      at: now(),
+      kind: "parent-question-required",
+      text: `Question ${request.id} was withheld from child UI and persisted for parent observation.`,
+    });
+  await saveManifest(cwd, manifest);
+  return request;
+}
+
+async function confirmExecution(
+  ctx: ExtensionContext,
+  label: string,
+): Promise<boolean> {
+  if (!isRootOrchestrator())
+    throw new Error(
+      `Only the designated root orchestrator (${ROOT_ORCHESTRATOR_ENV}=1) may request direct approval.`,
+    );
+  if (ctx.mode !== "tui" || !ctx.hasUI)
+    throw new Error(
+      `${label} requires TUI confirmation from the designated root orchestrator.`,
+    );
+  return ctx.ui.confirm(
+    "Herdr orchestrator",
+    `${label}? Only extension-owned resources will be changed.`,
+  );
+}
+
+export default function herdrOrchestrator(pi: ExtensionAPI) {
+  async function runHerdrRaw(
+    args: string[],
+    signal?: AbortSignal,
+    timeoutMs = HERDR_COMMAND_TIMEOUT_MS,
+  ): Promise<string> {
+    const result = (await pi.exec("herdr", args, {
+      signal,
+      timeout: timeoutMs,
+    })) as ExecResult;
+    if (result.code !== 0)
+      throw new Error(
+        `herdr ${args.join(" ")} failed: ${clip(result.stderr || result.stdout, 2000)}`,
+      );
+    return result.stdout;
+  }
+
+  async function runHerdr(
+    args: string[],
+    signal?: AbortSignal,
+    timeoutMs?: number,
+  ): Promise<any> {
+    return parseJson(await runHerdrRaw(args, signal, timeoutMs));
+  }
+
+  async function findAgent(
+    name: string,
+    signal?: AbortSignal,
+  ): Promise<unknown | undefined> {
+    const result = (await pi.exec("herdr", ["agent", "get", name], {
+      signal,
+      timeout: HERDR_COMMAND_TIMEOUT_MS,
+    })) as ExecResult;
+    if (result.code === 0) return parseJson(result.stdout);
+    const message = result.stderr || result.stdout;
+    if (/\bagent_not_found\b/.test(message)) return undefined;
+    throw new Error(`herdr agent get ${name} failed: ${clip(message, 2000)}`);
+  }
+
+  async function assertCleanLocalWorktree(
+    cwd: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const root = (await pi.exec(
+      "git",
+      ["-C", cwd, "rev-parse", "--show-toplevel"],
+      { signal, timeout: HERDR_COMMAND_TIMEOUT_MS },
+    )) as ExecResult;
+    if (root.code !== 0 || !root.stdout.trim())
+      throw new Error(
+        `worktreeCwd must be an existing local Git worktree: ${clip(root.stderr || root.stdout, 1000)}`,
+      );
+    const checkoutPath = resolve(root.stdout.trim());
+    if (!samePath(cwd, checkoutPath))
+      throw new Error(
+        "worktreeCwd must name the Git worktree root, not a subdirectory.",
+      );
+    const result = (await pi.exec(
+      "git",
+      ["-C", checkoutPath, "status", "--porcelain", "--untracked-files=all"],
+      { signal, timeout: HERDR_COMMAND_TIMEOUT_MS },
+    )) as ExecResult;
+    if (result.code !== 0)
+      throw new Error(
+        `worktreeCwd must be an existing local Git worktree: ${clip(result.stderr || result.stdout, 1000)}`,
+      );
+    if (result.stdout.trim())
+      throw new Error("worktreeCwd must be clean before Herdr dispatch.");
+    return checkoutPath;
+  }
+
+  function responseRecord(
+    value: unknown,
+    label: string,
+  ): Record<string, unknown> {
+    const candidate =
+      isRecord(value) && isRecord(value.result) ? value.result : value;
+    if (!isRecord(candidate))
+      throw new Error(
+        `Herdr ${label} response did not contain an object result.`,
+      );
+    return candidate;
+  }
+
+  function requiredString(
+    value: Record<string, unknown>,
+    key: string,
+    label: string,
+  ): string {
+    if (typeof value[key] !== "string" || !value[key])
+      throw new Error(`Herdr ${label} response is missing ${key}.`);
+    return value[key] as string;
+  }
+
+  function controllerConfigDirectoryFrom(stdout: string): string {
+    const text = stdout.trim();
+    if (!text)
+      throw new Error("Herdr returned an empty controller config directory.");
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      if (typeof parsed === "string") return parsed;
+      const result = responseRecord(parsed, "plugin config-dir");
+      return requiredString(result, "config_dir", "plugin config-dir");
+    } catch (error) {
+      if (text.startsWith("{") || text.startsWith("[")) throw error;
+      return text;
+    }
+  }
+
+  async function controllerConfigPath(signal?: AbortSignal): Promise<string> {
+    const directory = await secureControllerConfigDirectory(
+      controllerConfigDirectoryFrom(
+        await runHerdrRaw(
+          ["plugin", "config-dir", CONTROLLER_PLUGIN_ID],
+          signal,
+        ),
+      ),
+    );
+    return join(directory, CONTROLLER_CONFIG_NAME);
+  }
+
+  type LiveAgentIdentity = {
+    name?: string;
+    kind: AgentKind;
+    paneId: string;
+    workspaceId: string;
+  };
+
+  function liveAgentIdentity(value: unknown, label: string): LiveAgentIdentity {
+    const result = responseRecord(value, label);
+    if (result.type !== "agent_info" || !isRecord(result.agent))
+      throw new Error(`Herdr ${label} response is not an agent_info record.`);
+    const agent = result.agent;
+    const name = agent.name;
+    if (
+      name !== null &&
+      name !== undefined &&
+      (typeof name !== "string" || !name)
+    )
+      throw new Error(`Herdr ${label} response has an invalid agent name.`);
+    return {
+      ...(typeof name === "string" ? { name } : {}),
+      kind: validateAgentKind(agent.agent, `Herdr ${label} agent kind`),
+      paneId: requiredString(agent, "pane_id", label),
+      workspaceId: requiredString(agent, "workspace_id", label),
+    };
+  }
+
+  async function discoverControllerRoot(
+    signal?: AbortSignal,
+  ): Promise<ControllerRootMapping> {
+    if (!isRootOrchestrator())
+      throw new Error(
+        "Only the designated root may register the event controller.",
+      );
+    const paneId = process.env[HERDR_PANE_ID_ENV];
+    if (!paneId)
+      throw new Error(
+        `${HERDR_PANE_ID_ENV} is required to discover the root pane target.`,
+      );
+    const agent = liveAgentIdentity(
+      await runHerdr(["agent", "get", paneId], signal),
+      "root agent get",
+    );
+    if (agent.paneId !== paneId)
+      throw new Error(
+        "Herdr root agent identity does not match the current pane target.",
+      );
+    return {
+      target: paneId,
+      target_kind: "pane_id",
+      agent_kind: agent.kind,
+      pane_id: agent.paneId,
+      workspace_id: agent.workspaceId,
+    };
+  }
+
+  async function controllerWorkflowMapping(
+    cwd: string,
+    workflow: Workflow,
+    signal?: AbortSignal,
+  ): Promise<ControllerWorkflowMapping> {
+    const workspaceId = workflow.ownership.workspaceId;
+    if (!workspaceId)
+      throw new Error(
+        "Workflow has no recorded Herdr workspace for controller registration.",
+      );
+    const lanes: ControllerLaneMapping[] = [];
+    for (const lane of workflow.lanes) {
+      if (!lane.agentName || !lane.paneId)
+        throw new Error(
+          `Lane ${lane.id} has no recorded agent or pane for controller registration.`,
+        );
+      const agent = liveAgentIdentity(
+        await runHerdr(["agent", "get", lane.agentName], signal),
+        `lane ${lane.id} agent get`,
+      );
+      if (
+        agent.name !== lane.agentName ||
+        agent.kind !== laneAgentKind(workflow, lane) ||
+        agent.paneId !== lane.paneId ||
+        agent.workspaceId !== workspaceId
+      )
+        throw new Error(
+          `Lane ${lane.id} Herdr identity does not match its recorded agent, kind, pane, and workspace.`,
+        );
+      lanes.push({
+        lane_id: lane.id,
+        target: agent.name,
+        target_kind: "name",
+        pane_id: agent.paneId,
+        workspace_id: agent.workspaceId,
+        ...(lane.relationshipId ? { relationship_id: lane.relationshipId } : {}),
+      });
+    }
+    return {
+      workflow_id: workflow.id,
+      manifest_path: resolve(manifestPath(cwd)),
+      // This controller integration is agent-neutral; Pi-only output probing
+      // remains opt-in and is never enabled by automatic registration.
+      pi_goal_pause_detection: false,
+      lanes,
+    };
+  }
+
+  function recordControllerRegistration(
+    workflow: Workflow,
+    registration: EventControllerRegistration,
+  ): void {
+    const previous = workflow.eventControllerRegistration;
+    workflow.eventControllerRegistration = registration;
+    if (
+      previous?.status === registration.status &&
+      previous.reason === registration.reason &&
+      previous.configPath === registration.configPath
+    )
+      return;
+    workflow.evidence.push({
+      at: now(),
+      kind:
+        registration.status === "registered"
+          ? "event-controller-registered"
+          : registration.status === "removed"
+            ? "event-controller-removed"
+            : "event-controller-registration-pending",
+      text: registration.reason ?? registration.status,
+    });
+  }
+
+  async function registerEventController(
+    cwd: string,
+    manifest: Manifest,
+    workflow: Workflow,
+    signal?: AbortSignal,
+  ): Promise<EventControllerRegistration> {
+    try {
+      const [configPath, root] = await Promise.all([
+        controllerConfigPath(signal),
+        discoverControllerRoot(signal),
+      ]);
+      const mapping = await controllerWorkflowMapping(cwd, workflow, signal);
+      const config = await loadControllerConfig(configPath);
+      // A sole v1-derived record is promoted in place on the first matching
+      // registration. This avoids leaving a legacy global record beside its
+      // v2 replacement and therefore avoids duplicate wakes.
+      const legacy = config?.orchestrators.length === 1 &&
+        config.orchestrators[0].id.startsWith("legacy:") &&
+        sameControllerRoot(config.orchestrators[0].root, root)
+        ? config.orchestrators[0] : undefined;
+      const record = config ? (findControllerRecord(config, root, cwd) ?? legacy) : undefined;
+      if (record) {
+        const sameId = record.workflows.filter((candidate) => candidate.workflow_id === mapping.workflow_id);
+        if (sameId.length > 0 && !sameControllerWorkflow(sameId[0], mapping))
+          throw new Error("Linked controller config has a stale or mismatched workflow mapping; refusing to replace it.");
+        const promoted = record.id.startsWith("legacy:")
+          ? { ...record, id: controllerRecordId(root, cwd), program: { id: resolve(cwd), workspace_id: root.workspace_id } }
+          : record;
+        if (sameId.length === 0 || promoted !== record)
+          await saveControllerConfig(configPath, { ...config!, orchestrators: config!.orchestrators.map((candidate) => candidate.id === record.id ? { ...promoted, workflows: sameId.length === 0 ? [...promoted.workflows, mapping] : promoted.workflows } : candidate) });
+      } else {
+        const next: ControllerOrchestrator = {
+          id: controllerRecordId(root, cwd), root,
+          program: { id: resolve(cwd), workspace_id: root.workspace_id },
+          workflows: [mapping],
+        };
+        await saveControllerConfig(configPath, config
+          ? { ...config, orchestrators: [...config.orchestrators, next] }
+          : { version: 2, owner: OWNER, orchestrators: [next] });
+      }
+      const registration: EventControllerRegistration = {
+        version: 1,
+        status: "registered",
+        updatedAt: now(),
+        configPath,
+        root,
+        workflow: mapping,
+      };
+      recordControllerRegistration(workflow, registration);
+      workflow.updatedAt = now();
+      await saveManifest(cwd, manifest);
+      return registration;
+    } catch (error) {
+      const registration: EventControllerRegistration = {
+        version: 1,
+        status: "pending",
+        updatedAt: now(),
+        reason: clip((error as Error).message, 1200),
+      };
+      recordControllerRegistration(workflow, registration);
+      workflow.updatedAt = now();
+      await saveManifest(cwd, manifest);
+      return registration;
+    }
+  }
+
+  function registeredControllerRegistration(
+    cwd: string,
+    workflow: Workflow,
+  ): EventControllerRegistration {
+    const registration = workflow.eventControllerRegistration;
+    if (
+      !registration ||
+      registration.version !== 1 ||
+      registration.status !== "registered" ||
+      !registration.configPath ||
+      !registration.root ||
+      !registration.workflow
+    )
+      throw new Error(
+        "Workflow has no complete registered controller mapping.",
+      );
+    const root = validateControllerRoot(registration.root);
+    const mapping = validateControllerWorkflow(
+      registration.workflow,
+      "workflow.eventControllerRegistration.workflow",
+    );
+    if (
+      mapping.workflow_id !== workflow.id ||
+      !samePath(mapping.manifest_path, manifestPath(cwd)) ||
+      mapping.lanes.length !== workflow.lanes.length ||
+      mapping.lanes.some((lane) => {
+        const current = workflow.lanes.find((item) => item.id === lane.lane_id);
+        return (
+          !current ||
+          current.agentName !== lane.target ||
+          current.relationshipId !== lane.relationship_id ||
+          current.paneId !== lane.pane_id ||
+          workflow.ownership.workspaceId !== lane.workspace_id
+        );
+      })
+    )
+      throw new Error("Controller registration record is stale or mismatched.");
+    return {
+      ...registration,
+      configPath: resolve(registration.configPath),
+      root,
+      workflow: mapping,
+    };
+  }
+
+  async function linkedControllerConfig(
+    registration: EventControllerRegistration,
+    signal?: AbortSignal,
+  ): Promise<ControllerConfig> {
+    const configPath = await controllerConfigPath(signal);
+    if (
+      !registration.configPath ||
+      !samePath(configPath, registration.configPath)
+    )
+      throw new Error(
+        "Linked controller config directory changed since registration.",
+      );
+    const config = await loadControllerConfig(configPath);
+    if (!config) throw new Error("Linked controller config is missing.");
+    const record = recordForRegistration(config, registration);
+    if (!record)
+      throw new Error("Linked controller config root, program, or workflow mapping is stale or mismatched.");
+    return config;
+  }
+
+  async function unregisterEventController(
+    cwd: string,
+    workflow: Workflow,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const registration = registeredControllerRegistration(cwd, workflow);
+    const config = await linkedControllerConfig(registration, signal);
+    const record = recordForRegistration(config, registration);
+    if (!record) throw new Error("Linked controller config no longer contains this workflow mapping.");
+    const remaining = record.workflows.filter((candidate) => candidate.workflow_id !== registration.workflow!.workflow_id);
+    if (remaining.length === record.workflows.length) throw new Error("Linked controller config no longer contains this workflow mapping.");
+    const orchestrators = remaining.length === 0
+      ? config.orchestrators.filter((candidate) => candidate.id !== record.id)
+      : config.orchestrators.map((candidate) => candidate.id === record.id ? { ...candidate, workflows: remaining } : candidate);
+    if (orchestrators.length === 0) await removeControllerConfig(registration.configPath!);
+    else await saveControllerConfig(registration.configPath!, { ...config, orchestrators });
+    recordControllerRegistration(workflow, {
+      ...registration,
+      status: "removed",
+      updatedAt: now(),
+      reason: "Removed this workflow mapping after successful Herdr close.",
+    });
+  }
+
+  async function inspectWorktreeForWorkspace(
+    cwd: string,
+    expectedWorkspaceId?: string,
+    signal?: AbortSignal,
+  ): Promise<WorktreeBinding> {
+    const checkoutPath = await assertCleanLocalWorktree(cwd, signal);
+    const worktreeList = responseRecord(
+      await runHerdr(["worktree", "list", "--cwd", checkoutPath], signal),
+      "worktree list",
+    );
+    const source = worktreeList.source;
+    const worktrees = worktreeList.worktrees;
+    if (!isRecord(source) || !Array.isArray(worktrees))
+      throw new Error(
+        "Herdr worktree list returned no registered repository source.",
+      );
+    const sourceWorkspaceId = requiredString(
+      source,
+      "source_workspace_id",
+      "worktree list",
+    );
+    const parentCheckoutPath = requiredString(
+      source,
+      "source_checkout_path",
+      "worktree list",
+    );
+    const repoKey = requiredString(source, "repo_key", "worktree list");
+    const repoRoot = requiredString(source, "repo_root", "worktree list");
+    const targetMatches = worktrees.filter(
+      (item): item is Record<string, unknown> =>
+        isRecord(item) &&
+        typeof item.path === "string" &&
+        samePath(item.path, checkoutPath),
+    );
+    if (targetMatches.length !== 1)
+      throw new Error(
+        `Herdr must register ${checkoutPath} exactly once as a Git worktree; found ${targetMatches.length}.`,
+      );
+    const targetWorkspaceId = targetMatches[0].open_workspace_id;
+    if (expectedWorkspaceId) {
+      if (targetWorkspaceId !== expectedWorkspaceId)
+        throw new Error(
+          `Git worktree ${checkoutPath} is not open in recorded workspace ${expectedWorkspaceId}.`,
+        );
+    } else if (typeof targetWorkspaceId === "string" && targetWorkspaceId) {
+      throw new Error(
+        `Git worktree ${checkoutPath} is already open in workspace ${targetWorkspaceId}; this workflow must not reuse it.`,
+      );
+    }
+    if (samePath(parentCheckoutPath, checkoutPath))
+      throw new Error(
+        "worktreeCwd resolves to the registered parent checkout and would reuse its workspace.",
+      );
+
+    const workspaceList = responseRecord(
+      await runHerdr(["workspace", "list"], signal),
+      "workspace list",
+    );
+    if (!Array.isArray(workspaceList.workspaces))
+      throw new Error(
+        "Herdr workspace list returned no registered parent workspaces.",
+      );
+    const parentCandidates = workspaceList.workspaces.filter(
+      (item): item is Record<string, unknown> => {
+        if (!isRecord(item) || item.workspace_id !== sourceWorkspaceId)
+          return false;
+        // A generic parent has no workspace.worktree metadata. When present,
+        // validate it against the worktree-list source rather than requiring it.
+        if (!isRecord(item.worktree)) return true;
+        const worktree = item.worktree;
+        return (
+          worktree.repo_key === repoKey &&
+          typeof worktree.checkout_path === "string" &&
+          samePath(worktree.checkout_path, parentCheckoutPath)
+        );
+      },
+    );
+    if (parentCandidates.length === 0)
+      throw new Error(
+        `Herdr has no registered parent workspace for ${parentCheckoutPath}.`,
+      );
+    if (parentCandidates.length !== 1)
+      throw new Error(
+        `Herdr found ${parentCandidates.length} registered parent workspaces for ${parentCheckoutPath}; refusing ambiguous worktree dispatch.`,
+      );
+    const parent = parentCandidates[0];
+    const parentWorkspaceId = requiredString(
+      parent,
+      "workspace_id",
+      "workspace list",
+    );
+    if (parentWorkspaceId !== sourceWorkspaceId)
+      throw new Error(
+        `Herdr worktree source ${sourceWorkspaceId} does not match its sole registered parent ${parentWorkspaceId}.`,
+      );
+    return {
+      checkoutPath,
+      repoParent: {
+        workspaceId: parentWorkspaceId,
+        checkoutPath: resolve(parentCheckoutPath),
+        repoKey,
+        repoRoot: resolve(repoRoot),
+      },
+    };
+  }
+
+  async function validateWorktreeForDispatch(
+    workflow: Workflow,
+    expectedWorkspaceId: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<WorktreeBinding> {
+    if (!workflow.worktree)
+      throw new Error(
+        "Internal error: worktree validation requested for generic workflow.",
+      );
+    const planned = workflow.worktreeBinding;
+    if (!planned)
+      throw new Error(
+        "Worktree workflow has no durable parent binding; refusing generic workspace fallback.",
+      );
+    if (expectedWorkspaceId && planned.workspaceId !== expectedWorkspaceId)
+      throw new Error(
+        "Recorded worktree workspace ID does not match the workflow workspace ownership.",
+      );
+    if (!expectedWorkspaceId && planned.workspaceId)
+      throw new Error(
+        "Planned worktree workflow already records a workspace; retry its recorded dispatch instead.",
+      );
+    const inspected = await inspectWorktreeForWorkspace(
+      workflow.worktree,
+      expectedWorkspaceId,
+      signal,
+    );
+    if (
+      !samePath(planned.checkoutPath, inspected.checkoutPath) ||
+      planned.repoParent.workspaceId !== inspected.repoParent.workspaceId ||
+      !samePath(
+        planned.repoParent.checkoutPath,
+        inspected.repoParent.checkoutPath,
+      ) ||
+      planned.repoParent.repoKey !== inspected.repoParent.repoKey
+    )
+      throw new Error(
+        "Registered worktree parent changed since planning; refusing workspace reuse.",
+      );
+    return { ...planned, ...inspected };
+  }
+
+  async function plan(
+    cwd: string,
+    objective: string,
+    laneObjectives: LaneInput[],
+    worktreeCwd?: string,
+    authorizationPolicyInput?: unknown,
+    agentKindInput?: unknown,
+  ): Promise<Workflow> {
+    const agentKind = validateAgentKind(agentKindInput ?? "pi");
+    const authorizationPolicy =
+      authorizationPolicyInput === undefined
+        ? undefined
+        : validateAuthorizationPolicy(authorizationPolicyInput);
+    if (
+      authorizationPolicy &&
+      !new RegExp(`\\b${BB029_AUTHORIZATION_SCOPE}\\b`, "i").test(objective)
+    )
+      throw new Error(
+        `authorizationPolicy.scope.workflow requires an objective containing ${BB029_AUTHORIZATION_SCOPE}.`,
+      );
+    const target = await plannedCwd(cwd, worktreeCwd);
+    const lanes = normalizedLanes(objective, laneObjectives, agentKind);
+    if (
+      target.worktree &&
+      lanes.length > 1 &&
+      lanes.some((lane) => !lane.readOnly)
+    )
+      throw new Error(
+        "A worktree workflow may use multiple lanes only when every lane declares readOnly: true.",
+      );
+    const worktreeBinding = target.worktree
+      ? await inspectWorktreeForWorkspace(target.worktree)
+      : undefined;
+    const manifest = await loadManifest(cwd);
+    const stamp = now();
+    const id = `herdr-${randomUUID().slice(0, 8)}`;
+    const workflow: Workflow = {
+      id,
+      objective,
+      outcome: "planned",
+      status: "planned",
+      lanes,
+      herdr: {},
+      agent: {},
+      agentKind,
+      cwd: target.cwd,
+      worktree: target.worktree,
+      worktreeBinding,
+      evidence: [],
+      ownership: { createdBy: OWNER, tabIds: [], paneIds: [] },
+      authorizationPolicy,
+      approvalRequests: [],
+      questionRequests: [],
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    if (authorizationPolicy)
+      workflow.evidence.push({
+        at: now(),
+        kind: "authorization-policy-installed",
+        text: `Validated ${authorizationPolicy.scope.workflow} local-only policy: ${authorizationPolicy.capabilities.join(",")}`,
+      });
+    if (worktreeBinding)
+      workflow.evidence.push({
+        at: now(),
+        kind: "worktree-parent-resolved",
+        text: jsonText(worktreeBinding),
+      });
+    manifest.workflows.push(workflow);
+    await saveManifest(cwd, manifest);
+    return workflow;
+  }
+
+  async function dispatch(
+    cwd: string,
+    id: string,
+    execute: boolean,
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+  ) {
+    const manifest = await loadManifest(cwd);
+    const workflow = workflowFor(manifest, id);
+    let workspaceId = workflow.ownership.workspaceId;
+    let reusableWorkspace =
+      !workspaceId && !workflow.worktree
+        ? manifest.workflows.find(
+            (candidate) =>
+              candidate.id !== workflow.id &&
+              candidate.ownership.createdBy === OWNER &&
+              Boolean(candidate.ownership.workspaceId) &&
+              !candidate.worktree &&
+              candidate.outcome !== "closed" &&
+              samePath(candidate.cwd, workflow.cwd),
+          )
+        : undefined;
+    let resuming = Boolean(workspaceId);
+    if (workflow.worktree && !workflow.worktreeBinding)
+      throw new Error(
+        "Worktree workflow has no durable parent binding; refusing generic workspace fallback.",
+      );
+    if (!execute)
+      return {
+        dryRun: true,
+        mode: resuming ? "resume" : "create",
+        workflow,
+        commands: [
+          resuming
+            ? "reuse recorded workspace and lane resources; do not create or close a workspace"
+            : reusableWorkspace
+              ? `reuse durable workspace ${reusableWorkspace.ownership.workspaceId}; create a new tab for each lane`
+              : workflow.worktree
+                ? "herdr worktree open --workspace <registered-parent> --path <worktree.checkoutPath> --label <workflow.id> --no-focus"
+                : "herdr workspace create --cwd <workflow.cwd> --label <workflow.id> --no-focus",
+          "herdr tab create --workspace <workspace> --label <lane> --no-focus",
+          "herdr pane process-info --pane <new-tab-root-pane>",
+          `herdr agent start <name> --kind pi --pane <new-tab-root-pane> --timeout ${AGENT_START_TIMEOUT_MS}`,
+        ],
+      };
+    requireHerdr();
+    if (
+      workflow.status === "running" ||
+      workflow.outcome === "completed" ||
+      workflow.outcome === "closed"
+    )
+      throw new Error(
+        `Workflow ${id} cannot be dispatched from ${workflow.status}.`,
+      );
+    if (resuming && !["starting", "dispatch-failed"].includes(workflow.status))
+      throw new Error(
+        `Workflow ${id} has a recorded workspace but is not in a recoverable dispatch state.`,
+      );
+    const action = resuming
+      ? `Resume dispatch ${id}`
+      : `Create and dispatch ${id}`;
+    if (!isRootOrchestrator()) {
+      const approvalRequest = requestParentApproval(workflow, "dispatch");
+      workflow.updatedAt = now();
+      await saveManifest(cwd, manifest);
+      return { parentApprovalRequired: true, approvalRequest, workflow };
+    }
+    const decision = authorizationDecision(
+      workflow,
+      resuming ? "retry" : "dispatch",
+    );
+    let worktreeBinding: WorktreeBinding | undefined;
+    if (decision.allowed) {
+      try {
+        if (workflow.worktree)
+          worktreeBinding = await validateWorktreeForDispatch(
+            workflow,
+            workspaceId,
+            signal,
+          );
+      } catch (error) {
+        const denied: AuthorizationDecision = {
+          ...decision,
+          allowed: false,
+          reason: `preauthorization denied: ${(error as Error).message}`,
+        };
+        auditAuthorization(workflow, denied);
+        workflow.evidence.push({
+          at: now(),
+          kind: "worktree-validation-denied",
+          text: (error as Error).message,
+        });
+        workflow.updatedAt = now();
+        await saveManifest(cwd, manifest);
+        throw error;
+      }
+      auditAuthorization(workflow, decision);
+      resolveParentApproval(workflow, "dispatch", "approved");
+      workflow.updatedAt = now();
+      await saveManifest(cwd, manifest);
+    } else {
+      auditAuthorization(workflow, decision);
+      workflow.updatedAt = now();
+      await saveManifest(cwd, manifest);
+      const approved = await confirmExecution(ctx, action);
+      resolveParentApproval(
+        workflow,
+        "dispatch",
+        approved ? "approved" : "cancelled",
+      );
+      workflow.updatedAt = now();
+      await saveManifest(cwd, manifest);
+      if (!approved) return { cancelled: true, workflow };
+      try {
+        if (workflow.worktree)
+          worktreeBinding = await validateWorktreeForDispatch(
+            workflow,
+            workspaceId,
+            signal,
+          );
+      } catch (error) {
+        workflow.evidence.push({
+          at: now(),
+          kind: "worktree-validation-denied",
+          text: (error as Error).message,
+        });
+        workflow.updatedAt = now();
+        await saveManifest(cwd, manifest);
+        throw error;
+      }
+    }
+
+    // A durable manifest can outlive a manually removed/failed Herdr
+    // workspace. Repair every persisted reference to a missing shared
+    // workspace only after proving none of its recorded lane agents is live.
+    // This runs before lane/tab handling, so a retry cannot reach tab create
+    // with an obsolete workspace ID.
+    if (workspaceId && !workflow.worktree) {
+      try {
+        await runHerdr(["workspace", "get", workspaceId], signal);
+      } catch (error) {
+        if (!/workspace_not_found/.test((error as Error).message)) throw error;
+        const sharedWorkflows = manifest.workflows.filter(
+          (candidate) => candidate.ownership.workspaceId === workspaceId,
+        );
+        const liveAgents = [];
+        for (const candidate of sharedWorkflows)
+          for (const lane of candidate.lanes) {
+            if (!lane.agentName) continue;
+            if (await findAgent(lane.agentName, signal))
+              liveAgents.push(`${candidate.id}/${lane.agentName}`);
+          }
+        if (liveAgents.length > 0)
+          throw new Error(
+            `Recorded workspace ${workspaceId} is missing but still has live agents (${liveAgents.join(", ")}); refusing to clear ambiguous ownership.`,
+          );
+        for (const candidate of sharedWorkflows) {
+          candidate.evidence.push({
+            at: now(),
+            kind: "stale-workspace-binding-recovered",
+            text: `Workspace ${workspaceId} was not found and no recorded shared lane agent is live; cleared the persisted binding before retrying ${workflow.id}.`,
+          });
+          delete candidate.ownership.workspaceId;
+          delete candidate.ownership.workspaceOwnerWorkflowId;
+          candidate.herdr = {};
+          candidate.agent = {};
+          delete candidate.pi;
+          candidate.lanes = candidate.lanes.map((lane) => ({
+            ...lane,
+            status: "planned",
+            agentName: undefined,
+            tabId: undefined,
+            paneId: undefined,
+            resourceCreatedAt: undefined,
+            tabRenamedAt: undefined,
+            readiness: undefined,
+            agentStartedAt: undefined,
+            promptAttemptedAt: undefined,
+            promptedAt: undefined,
+            agentSessionPath: undefined,
+            agentSessionId: undefined,
+            piSessionPath: undefined,
+            piSessionId: undefined,
+            herdrState: undefined,
+          }));
+          candidate.updatedAt = now();
+        }
+        workspaceId = undefined;
+        resuming = false;
+        await saveManifest(cwd, manifest);
+      }
+    }
+    // Also verify a planner-selected candidate before reuse; never turn a
+    // stale workspace ID into a failed tab-create for a new workflow.
+    if (reusableWorkspace?.ownership.workspaceId) {
+      const candidateWorkspaceId = reusableWorkspace.ownership.workspaceId;
+      try {
+        await runHerdr(["workspace", "get", candidateWorkspaceId], signal);
+      } catch (error) {
+        if (!/workspace_not_found/.test((error as Error).message)) throw error;
+        const liveAgents = [];
+        for (const lane of reusableWorkspace.lanes) {
+          if (!lane.agentName) continue;
+          const agent = await findAgent(lane.agentName, signal);
+          if (agent) liveAgents.push(lane.agentName);
+        }
+        if (liveAgents.length > 0)
+          throw new Error(
+            `Recorded workspace ${candidateWorkspaceId} is missing but ${reusableWorkspace.id} still has live agents (${liveAgents.join(", ")}); refusing to clear ambiguous ownership.`,
+          );
+        reusableWorkspace.evidence.push({
+          at: now(),
+          kind: "stale-workspace-binding-recovered",
+          text: `Workspace ${candidateWorkspaceId} was not found and no recorded lane agent is live; cleared its reusable binding before dispatching ${workflow.id}.`,
+        });
+        delete reusableWorkspace.ownership.workspaceId;
+        delete reusableWorkspace.ownership.workspaceOwnerWorkflowId;
+        reusableWorkspace.updatedAt = now();
+        reusableWorkspace = undefined;
+        await saveManifest(cwd, manifest);
+      }
+    }
+
+    const attempt = (workflow.retry?.attempt ?? 0) + 1;
+    let currentLaneId: string | undefined;
+    let stage = resuming
+      ? "resume"
+      : workflow.worktree
+        ? "worktree-open"
+        : "workspace-create";
+    let createdWorkspace: unknown | undefined;
+    workflow.status = "starting";
+    workflow.updatedAt = now();
+    workflow.retry = {
+      state: "dispatching",
+      attempt,
+      retryCommand: `herdr_dispatch ${id} execute=true`,
+      resumedAt: now(),
+    };
+    await saveManifest(cwd, manifest);
+
+    try {
+      let recordedWorkspaceId = workspaceId;
+      if (!recordedWorkspaceId) {
+        if (reusableWorkspace?.ownership.workspaceId) {
+          recordedWorkspaceId = reusableWorkspace.ownership.workspaceId;
+          workflow.ownership = {
+            ...workflow.ownership,
+            workspaceId: recordedWorkspaceId,
+            workspaceOwnerWorkflowId:
+              reusableWorkspace.ownership.workspaceOwnerWorkflowId ?? reusableWorkspace.id,
+          };
+          workflow.evidence.push({
+            at: now(),
+            kind: "workspace-reused-for-tabs",
+            text: `Reused durable workspace ${recordedWorkspaceId} from ${reusableWorkspace.id}; this workflow owns only its new tabs/panes.`,
+          });
+        } else if (workflow.worktree) {
+          const binding = worktreeBinding;
+          if (!binding)
+            throw new Error(
+              "Worktree validation did not produce a parent binding; refusing generic workspace fallback.",
+            );
+          createdWorkspace = await runHerdr(
+            [
+              "worktree",
+              "open",
+              "--workspace",
+              binding.repoParent.workspaceId,
+              "--path",
+              binding.checkoutPath,
+              "--label",
+              workflow.id,
+              "--no-focus",
+            ],
+            signal,
+          );
+          if (deepBoolean(createdWorkspace, ["already_open"]) === true)
+            throw new Error(
+              "Herdr reported the Git worktree was already open; refusing to reuse a workspace outside this workflow contract.",
+            );
+          recordedWorkspaceId = deepString(createdWorkspace, ["workspace_id"]);
+          if (!recordedWorkspaceId)
+            throw new Error(
+              "Herdr worktree open did not return a workspace ID.",
+            );
+          workflow.worktreeBinding = {
+            ...binding,
+            workspaceId: recordedWorkspaceId,
+            openResult: createdWorkspace,
+          };
+          workflow.evidence.push({
+            at: now(),
+            kind: "worktree-opened",
+            text: jsonText({
+              repoParent: binding.repoParent,
+              checkoutPath: binding.checkoutPath,
+              workspaceId: recordedWorkspaceId,
+              openResult: createdWorkspace,
+            }),
+          });
+        } else {
+          createdWorkspace = await runHerdr(
+            [
+              "workspace",
+              "create",
+              "--cwd",
+              workflow.cwd,
+              "--label",
+              workflow.id,
+              "--no-focus",
+            ],
+            signal,
+          );
+          recordedWorkspaceId = deepString(createdWorkspace, ["workspace_id"]);
+          if (!recordedWorkspaceId)
+            throw new Error(
+              "Herdr workspace creation did not return a workspace ID.",
+            );
+        }
+        // Persist the owned workspace before handling its root tab/pane or starting an agent.
+        workflow.ownership = {
+          ...workflow.ownership,
+          createdBy: OWNER,
+          workspaceId: recordedWorkspaceId,
+          workspaceOwnerWorkflowId:
+            workflow.ownership.workspaceOwnerWorkflowId ?? workflow.id,
+          tabIds: workflow.ownership.tabIds ?? [],
+          paneIds: workflow.ownership.paneIds ?? [],
+        };
+        workflow.updatedAt = now();
+        await saveManifest(cwd, manifest);
+      }
+
+      for (const [index, initialLane] of workflow.lanes.entries()) {
+        currentLaneId = initialLane.id;
+        let lane = workflow.lanes[index];
+        if (lane.status === "running" && lane.agentName) continue;
+
+        if (!lane.tabId || !lane.paneId) {
+          stage = index === 0 ? "record-workspace-root" : "tab-create";
+          const createdTab =
+            index === 0 && createdWorkspace
+              ? createdWorkspace
+              : await runHerdr(
+                  [
+                    "tab",
+                    "create",
+                    "--workspace",
+                    recordedWorkspaceId,
+                    "--cwd",
+                    workflow.cwd,
+                    "--label",
+                    `${id}-${lane.id}`,
+                    "--no-focus",
+                  ],
+                  signal,
+                );
+          if (!createdTab)
+            throw new Error(
+              `Cannot safely resume ${lane.id}: its workspace root tab was not recorded. ` +
+                "No replacement tab was created; inspect the recorded workspace before retrying.",
+            );
+          const tabId = deepString(createdTab, ["tab_id"]);
+          const paneId = deepString(createdTab, ["pane_id", "root_pane_id"]);
+          if (!tabId || !paneId)
+            throw new Error(
+              `Herdr did not return a tab and root pane for ${lane.id}.`,
+            );
+          lane = recordLaneResources(workflow, index, tabId, paneId);
+          workflow.updatedAt = now();
+          await saveManifest(cwd, manifest);
+        }
+
+        const tabId = lane.tabId;
+        const paneId = lane.paneId;
+        if (!tabId || !paneId)
+          throw new Error(`Missing recorded tab or pane for ${lane.id}.`);
+
+        if (index === 0 && !lane.tabRenamedAt) {
+          stage = "tab-rename";
+          await runHerdr(["tab", "rename", tabId, `${id}-${lane.id}`], signal);
+          lane = { ...lane, tabRenamedAt: now() };
+          workflow.lanes[index] = lane;
+          workflow.updatedAt = now();
+          await saveManifest(cwd, manifest);
+        }
+
+        const agentKind = laneAgentKind(workflow, lane);
+        const agentName =
+          lane.agentName ??
+          `agent_${agentKind}_${id
+            .replace(/[^a-z0-9]/gi, "")
+            .toLowerCase()
+            .slice(-12)}_${index + 1}`;
+        if (!lane.agentName || lane.agentKind !== agentKind) {
+          lane = {
+            ...lane,
+            agentKind,
+            status: lane.agentName ? lane.status : "waiting-ready",
+            agentName,
+            relationshipId: lane.relationshipId ?? `herdr-rel-${randomUUID().slice(0, 12)}`,
+          };
+          workflow.lanes[index] = lane;
+          workflow.updatedAt = now();
+          await saveManifest(cwd, manifest);
+        }
+
+        // `agent start --timeout` is Herdr's native interactive-shell
+        // readiness gate. Do not infer readiness from a snapshot or ask a
+        // parent to retry a newly-created tab.
+        if (!lane.agentStartedAt) {
+          const reconcileLiveAgent = async (): Promise<string | undefined> => {
+            const result = await findAgent(agentName, signal);
+            if (!result) return undefined;
+            const live = liveAgentIdentity(result, `agent ${agentName} get`);
+            if (
+              live.name !== agentName ||
+              live.kind !== agentKind ||
+              live.paneId !== paneId ||
+              live.workspaceId !== recordedWorkspaceId
+            )
+              throw new Error(
+                `Live agent ${agentName} does not match its recorded kind, pane, and workspace.`,
+              );
+            return deepState(result) ?? "unknown";
+          };
+          let startedFromNonJsonAcknowledgment = false;
+          const existingAgentState = await reconcileLiveAgent();
+          if (existingAgentState !== undefined) {
+            if (existingAgentState !== "idle" && existingAgentState !== "done")
+              throw new Error(
+                `Recorded agent ${agentName} is ${existingAgentState}; inspect it with herdr_observe before retrying.`,
+              );
+          } else {
+            stage = "agent-start";
+            const startArgs = [
+              "agent", "start", agentName, "--kind", agentKind,
+              "--pane", paneId, "--timeout", String(AGENT_START_TIMEOUT_MS),
+            ];
+            for (let readinessAttempt = 1; readinessAttempt <= 3; readinessAttempt += 1) {
+              try {
+                await runHerdr(startArgs, signal, AGENT_START_TIMEOUT_MS + 5_000);
+                break;
+              } catch (error) {
+                if ((await reconcileLiveAgent()) !== undefined) {
+                  startedFromNonJsonAcknowledgment = true;
+                  break;
+                }
+                if (!/agent_pane_busy/.test((error as Error).message) || readinessAttempt === 3)
+                  throw error;
+                lane = {
+                  ...lane,
+                  status: "waiting-ready",
+                  readiness: {
+                    source: "herdr agent start --timeout",
+                    checkedAt: now(),
+                    initialShellForeground: false,
+                    agentStartTimeoutMs: AGENT_START_TIMEOUT_MS,
+                  },
+                };
+                workflow.lanes[index] = lane;
+                workflow.evidence.push({ at: now(), kind: "agent-readiness-retrying", text: `Herdr native readiness gate reported agent_pane_busy for ${agentName}; retrying within this dispatch (${readinessAttempt + 1}/3).` });
+                workflow.updatedAt = now();
+                await saveManifest(cwd, manifest);
+              }
+            }
+            // A parseable acknowledgement is not identity proof. Reconcile it
+            // too, so no agent-start path can record failure before checking
+            // the live name, kind, pane, and workspace.
+            if ((await reconcileLiveAgent()) === undefined)
+              throw new Error(
+                `Herdr agent start for ${agentName} returned without a live matching agent.`,
+              );
+          }
+          lane = {
+            ...lane,
+            status: "agent-ready",
+            agentName,
+            agentStartedAt: now(),
+          };
+          workflow.lanes[index] = lane;
+          if (startedFromNonJsonAcknowledgment)
+            workflow.evidence.push({
+              at: now(),
+              kind: "agent-start-ack-reconciled",
+              text: `Live ${agentKind} agent ${agentName} matched pane ${paneId} after an unparseable agent-start acknowledgement.`,
+            });
+          if (index === 0) workflow.herdr = { ...workflow.herdr, agentName };
+          workflow.updatedAt = now();
+          await saveManifest(cwd, manifest);
+        }
+
+        if (lane.promptAttemptedAt && !lane.promptedAt)
+          throw new Error(
+            `Prompt delivery for ${agentName} is uncertain; inspect with herdr_observe before retrying so it is not submitted twice.`,
+          );
+        stage = "agent-prompt";
+        lane = { ...lane, status: "prompting", promptAttemptedAt: now() };
+        workflow.lanes[index] = lane;
+        workflow.updatedAt = now();
+        await saveManifest(cwd, manifest);
+        await runHerdr(
+          ["agent", "prompt", agentName, contract(workflow, lane)],
+          signal,
+        );
+        lane = { ...lane, status: "running", promptedAt: now() };
+        workflow.lanes[index] = lane;
+        workflow.updatedAt = now();
+        await saveManifest(cwd, manifest);
+      }
+      workflow.status = "running";
+      workflow.outcome = "running";
+      workflow.retry = undefined;
+      workflow.dispatchedAt = now();
+      workflow.updatedAt = now();
+      await saveManifest(cwd, manifest);
+      // Registration is best-effort by design: an unlinked or unavailable
+      // controller leaves a durable pending record but never undoes dispatch.
+      await registerEventController(cwd, manifest, workflow, signal);
+      return { dispatched: true, workflow };
+    } catch (error) {
+      const message = (error as Error).message;
+      workflow.status = "dispatch-failed";
+      workflow.outcome = "unknown";
+      workflow.updatedAt = now();
+      workflow.retry = {
+        state: "retryable",
+        attempt,
+        retryCommand: `herdr_dispatch ${id} execute=true`,
+        failedAt: now(),
+        failedLaneId: currentLaneId,
+        failedStage: stage,
+        error: message,
+      };
+      workflow.evidence.push({
+        at: now(),
+        kind: "dispatch-error",
+        text: message,
+      });
+      // Never close resources here: the manifest now contains every resource
+      // successfully returned by Herdr plus enough state for an explicit retry.
+      await saveManifest(cwd, manifest);
+      throw error;
+    }
+  }
+
+  async function observe(cwd: string, id: string, signal?: AbortSignal) {
+    const manifest = await loadManifest(cwd);
+    const workflow = workflowFor(manifest, id);
+    if (!workflow.lanes.some((lane) => lane.agentName))
+      throw new Error(`Workflow ${id} has no recorded Herdr agents.`);
+    requireHerdr();
+
+    const observations: Array<{
+      lane: string;
+      state: string;
+      agent: unknown;
+      output: string;
+      pausedGoalIds: string[];
+    }> = [];
+    for (const [index, lane] of workflow.lanes.entries()) {
+      if (!lane.agentName) continue;
+      const agent = await runHerdr(["agent", "get", lane.agentName], signal);
+      const output = clip(
+        await runHerdrRaw(
+          [
+            "agent",
+            "read",
+            lane.agentName,
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            String(RECENT_AGENT_OUTPUT_LINES),
+          ],
+          signal,
+        ),
+        GOAL_PAUSE_OUTPUT_LIMIT,
+      );
+      const state = deepState(agent) ?? "unknown";
+      const agentKind = laneAgentKind(workflow, lane);
+      const agentSessionPath = deepString(agent, [
+        "agent_session_path",
+        "session_path",
+        "value",
+      ]);
+      const agentSessionId = deepString(agent, [
+        "agent_session_id",
+        "session_id",
+      ]);
+      // /goal-resume is a Pi protocol, not a generic agent command.
+      const detectedGoalIds = agentKind === "pi" ? pausedGoalIds(output) : [];
+      const previousPause = lane.goalPaused;
+      const unchangedPause =
+        previousPause &&
+        JSON.stringify(previousPause.goalIds) ===
+          JSON.stringify(detectedGoalIds) &&
+        previousPause.output === output;
+      const goalPaused = detectedGoalIds.length
+        ? unchangedPause
+          ? previousPause
+          : {
+              status: "goal-paused" as const,
+              goalIds: detectedGoalIds,
+              detectedAt: now(),
+              source: "herdr agent read recent-unwrapped" as const,
+              output,
+            }
+        : undefined;
+      const observedLane: Lane = {
+        ...lane,
+        agentKind,
+        status: goalPaused ? "goal-paused" : state,
+        herdrState: state,
+        agentSessionPath,
+        agentSessionId,
+        ...(agentKind === "pi"
+          ? { piSessionPath: agentSessionPath, piSessionId: agentSessionId }
+          : {}),
+      };
+      if (goalPaused) observedLane.goalPaused = goalPaused;
+      workflow.lanes[index] = observedLane;
+      if (goalPaused && !unchangedPause)
+        workflow.evidence.push({
+          at: now(),
+          kind: "goal-paused",
+          text: `Lane ${lane.id} (${lane.agentName}) paused ${goalPaused.goalIds.join(", ")} from bounded recent agent output:\n${output}`,
+        });
+      if (index === 0) {
+        workflow.agent = {
+          sessionPath: agentSessionPath,
+          sessionId: agentSessionId,
+        };
+        if (agentKind === "pi")
+          workflow.pi = {
+            sessionPath: agentSessionPath,
+            sessionId: agentSessionId,
+          };
+      }
+      observations.push({
+        lane: lane.id,
+        state,
+        agent,
+        output,
+        pausedGoalIds: detectedGoalIds,
+      });
+    }
+
+    const states = observations.map((item) => item.state);
+    const hasPausedGoal = observations.some(
+      (item) => item.pausedGoalIds.length > 0,
+    );
+    const completed =
+      states.length > 0 && states.every((state) => state === "done");
+    workflow.status = hasPausedGoal
+      ? "goal-paused"
+      : completed
+        ? "completed"
+        : states.includes("blocked")
+          ? "blocked"
+          : states.includes("working")
+            ? "running"
+            : "unknown";
+    workflow.outcome =
+      completed && !hasPausedGoal
+        ? "completed"
+        : workflow.status === "running"
+          ? "running"
+          : "unknown";
+    workflow.observedAt = now();
+    workflow.updatedAt = now();
+    workflow.evidence.push({
+      at: now(),
+      kind: "agent-observation",
+      text: clip(jsonText(observations), 6000),
+    });
+    await saveManifest(cwd, manifest);
+    // Explicit root observation is the bounded recovery path for a completed
+    // dispatch whose controller registration was deferred before the plugin
+    // config became available. It never dispatches or enables a plugin.
+    if (
+      isRootOrchestrator() &&
+      workflow.eventControllerRegistration?.status === "pending"
+    )
+      await registerEventController(cwd, manifest, workflow, signal);
+    return { workflow, state: workflow.status, observations };
+  }
+
+  async function resume(
+    cwd: string,
+    id: string,
+    execute: boolean,
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+  ) {
+    const manifest = await loadManifest(cwd);
+    const workflow = workflowFor(manifest, id);
+    const pausedLanes = workflow.lanes
+      .map((lane, index) => ({ lane, index }))
+      .filter(
+        ({ lane }) =>
+          laneAgentKind(workflow, lane) === "pi" &&
+          lane.status === "goal-paused" &&
+          Boolean(lane.agentName),
+      );
+    if (!execute)
+      return {
+        dryRun: true,
+        workflow,
+        pausedLanes: pausedLanes.map(({ lane }) => ({
+          laneId: lane.id,
+          agentName: lane.agentName,
+          goalIds: lane.goalPaused?.goalIds ?? [],
+        })),
+        commands: pausedLanes.map(
+          ({ lane }) => `herdr agent prompt ${lane.agentName} /goal-resume`,
+        ),
+      };
+    requireHerdr();
+    if (!isRootOrchestrator()) {
+      const approvalRequest = requestParentApproval(workflow, "resume");
+      workflow.updatedAt = now();
+      await saveManifest(cwd, manifest);
+      return { parentApprovalRequired: true, approvalRequest, workflow };
+    }
+    if (pausedLanes.length === 0)
+      throw new Error(
+        `Workflow ${id} has no currently observed paused goals; run herdr_observe before herdr_resume.`,
+      );
+    const decision = authorizationDecision(workflow, "resume");
+    if (decision.allowed) {
+      try {
+        if (workflow.worktree)
+          await assertCleanLocalWorktree(workflow.worktree, signal);
+      } catch (error) {
+        const denied: AuthorizationDecision = {
+          ...decision,
+          allowed: false,
+          reason: `preauthorization denied: ${(error as Error).message}`,
+        };
+        auditAuthorization(workflow, denied);
+        workflow.updatedAt = now();
+        await saveManifest(cwd, manifest);
+        throw error;
+      }
+      auditAuthorization(workflow, decision);
+      resolveParentApproval(workflow, "resume", "approved");
+      workflow.updatedAt = now();
+      await saveManifest(cwd, manifest);
+    } else {
+      auditAuthorization(workflow, decision);
+      workflow.updatedAt = now();
+      await saveManifest(cwd, manifest);
+      const approved = await confirmExecution(
+        ctx,
+        `Resume paused Pi goals for ${id}`,
+      );
+      resolveParentApproval(
+        workflow,
+        "resume",
+        approved ? "approved" : "cancelled",
+      );
+      workflow.updatedAt = now();
+      await saveManifest(cwd, manifest);
+      if (!approved) return { cancelled: true, workflow };
+    }
+
+    const receipts: Array<{
+      laneId: string;
+      agentName: string;
+      receipt: string;
+    }> = [];
+    try {
+      for (const { lane, index } of pausedLanes) {
+        const agentName = lane.agentName;
+        if (!agentName) continue;
+        const receipt = clip(
+          jsonText(
+            await runHerdr(
+              ["agent", "prompt", agentName, "/goal-resume"],
+              signal,
+            ),
+          ),
+          6000,
+        );
+        const record: GoalResumeReceipt = {
+          command: "/goal-resume",
+          requestedAt: now(),
+          receipt,
+        };
+        workflow.lanes[index] = {
+          ...lane,
+          status: "goal-resume-requested",
+          goalResumeReceipts: [...(lane.goalResumeReceipts ?? []), record],
+        };
+        workflow.status = "goal-resume-requested";
+        workflow.outcome = "unknown";
+        workflow.updatedAt = now();
+        workflow.evidence.push({
+          at: now(),
+          kind: "goal-resume-receipt",
+          text: `Lane ${lane.id} (${agentName}) accepted /goal-resume:\n${receipt}`,
+        });
+        await saveManifest(cwd, manifest);
+        receipts.push({ laneId: lane.id, agentName, receipt });
+      }
+    } catch (error) {
+      const message = (error as Error).message;
+      workflow.status = "goal-resume-failed";
+      workflow.outcome = "unknown";
+      workflow.updatedAt = now();
+      workflow.evidence.push({
+        at: now(),
+        kind: "goal-resume-error",
+        text: message,
+      });
+      await saveManifest(cwd, manifest);
+      throw error;
+    }
+    return { resumed: true, receipts, workflow };
+  }
+
+  async function complete(cwd: string, id: string, summary: string, signal?: AbortSignal) {
+    requireHerdr();
+    const manifest = await loadManifest(cwd);
+    const workflow = workflowFor(manifest, id);
+    const paneId = process.env[HERDR_PANE_ID_ENV];
+    const lane = workflow.lanes.find((item) => item.paneId === paneId);
+    if (!paneId || !lane?.agentName || !lane.relationshipId)
+      throw new Error("Completion receipt requires this lane's recorded pane, agent, and relationship ID.");
+    const configPath = await controllerConfigPath(signal);
+    const config = await loadControllerConfig(configPath);
+    const record = config?.orchestrators.find((item) => item.workflows.some((workflow) => workflow.workflow_id === id));
+    const mapping = record?.workflows.find((item) => item.workflow_id === id);
+    const controllerLane = mapping?.lanes.find((item) => item.lane_id === lane.id);
+    if (!config || !record || !mapping || !controllerLane || controllerLane.pane_id !== paneId || controllerLane.target !== lane.agentName || controllerLane.relationship_id !== lane.relationshipId)
+      throw new Error("Completion receipt has no matching controller parent-child mapping.");
+    const child = liveAgentIdentity(await runHerdr(["agent", "get", paneId], signal), "completion child identity");
+    if (child.name !== lane.agentName || child.paneId !== paneId)
+      throw new Error("Live child identity differs from its recorded completion receipt.");
+    const root = liveAgentIdentity(await runHerdr(["agent", "get", record.root.target], signal), "completion root identity");
+    if (root.paneId !== record.root.pane_id || root.workspaceId !== record.root.workspace_id)
+      throw new Error("Live controller root differs from the registered parent.");
+    workflow.evidence.push({ at: now(), kind: "child-completion-receipt", text: `${lane.relationshipId}: ${clip(summary, 2000)}` });
+    lane.status = "completion-reported";
+    workflow.status = "completion-reported";
+    workflow.outcome = "unknown";
+    workflow.updatedAt = now();
+    await saveManifest(cwd, manifest);
+    await runHerdr(["agent", "prompt", record.root.target, `[Herdr completion receipt] ${lane.relationshipId}: ${id}/${lane.id} reports complete. ${clip(summary, 2000)}`], signal);
+    return { delivered: true, workflow, relationshipId: lane.relationshipId };
+  }
+
+  async function reparent(cwd: string, id: string, execute: boolean, ctx: ExtensionContext, signal?: AbortSignal) {
+    const manifest = await loadManifest(cwd);
+    const workflow = workflowFor(manifest, id);
+    const registration = registeredControllerRegistration(cwd, workflow);
+    const config = await linkedControllerConfig(registration, signal);
+    const record = recordForRegistration(config, registration);
+    if (!record || record.workflows.length !== 1 || !sameControllerWorkflow(record.workflows[0], registration.workflow!))
+      throw new Error("Controller root handoff requires an isolated one-workflow orchestrator record.");
+    const nextRoot = await discoverControllerRoot(signal);
+    if (!execute) return { dryRun: true, workflow, previousRoot: registration.root, nextRoot };
+    requireHerdr();
+    if (!isRootOrchestrator()) throw new Error("Only the designated root may reparent a controller workflow.");
+    if (sameControllerRoot(registration.root!, nextRoot)) return { reparented: false, unchanged: true, workflow };
+    if (!(await confirmExecution(ctx, `Reparent controller root for ${id}`))) return { cancelled: true, workflow };
+    await saveControllerConfig(registration.configPath!, { ...config, orchestrators: config.orchestrators.map((candidate) => candidate.id === record.id ? { ...candidate, id: controllerRecordId(nextRoot, workflow.cwd), root: nextRoot, program: { ...candidate.program, workspace_id: nextRoot.workspace_id } } : candidate) });
+    recordControllerRegistration(workflow, {
+      ...registration, status: "registered", updatedAt: now(), root: nextRoot,
+      reason: `Controller root handed off from ${registration.root!.pane_id} to ${nextRoot.pane_id}.`,
+    });
+    workflow.evidence.push({ at: now(), kind: "controller-root-reparented", text: `Verified live root handoff: ${registration.root!.pane_id} -> ${nextRoot.pane_id}.` });
+    workflow.updatedAt = now();
+    await saveManifest(cwd, manifest);
+    return { reparented: true, workflow, previousRoot: registration.root, nextRoot };
+  }
+
+  async function close(
+    cwd: string,
+    id: string,
+    evidence: string[],
+    execute: boolean,
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+  ) {
+    const manifest = await loadManifest(cwd);
+    const workflow = workflowFor(manifest, id);
+    const sharedWorkspace = Boolean(
+      workflow.ownership.workspaceId &&
+        manifest.workflows.some(
+          (candidate) =>
+            candidate.id !== workflow.id &&
+            candidate.ownership.workspaceId === workflow.ownership.workspaceId &&
+            candidate.outcome !== "closed",
+        ),
+    );
+    if (evidence.filter(Boolean).length === 0)
+      throw new Error("Close requires at least one evidence item.");
+    if (workflow.outcome !== "completed")
+      throw new Error(
+        "Close requires a completed Herdr observation; blocked, idle, failed, and unknown workflows stay open.",
+      );
+    if (!execute)
+      return {
+        dryRun: true,
+        workflow,
+        commands:
+          workflow.ownership.workspaceId && !sharedWorkspace
+            ? [`herdr workspace close ${workflow.ownership.workspaceId}`]
+            : [],
+        workspaceRetained: sharedWorkspace,
+      };
+    requireHerdr();
+    if (!isRootOrchestrator()) {
+      const approvalRequest = requestParentApproval(workflow, "close");
+      workflow.updatedAt = now();
+      await saveManifest(cwd, manifest);
+      return { parentApprovalRequired: true, approvalRequest, workflow };
+    }
+    const approved = await confirmExecution(ctx, `Close ${id}`);
+    resolveParentApproval(
+      workflow,
+      "close",
+      approved ? "approved" : "cancelled",
+    );
+    workflow.updatedAt = now();
+    await saveManifest(cwd, manifest);
+    if (!approved) return { cancelled: true, workflow };
+    if (
+      workflow.ownership.createdBy !== OWNER ||
+      !workflow.ownership.workspaceId
+    )
+      throw new Error(
+        "Refusing to close: no extension-owned workspace is recorded.",
+      );
+
+    // Validate the recorded controller link before closing a workspace. A
+    // stale record cannot redirect cleanup to another workflow or root.
+    let registration: EventControllerRegistration | undefined;
+    if (workflow.eventControllerRegistration?.status === "registered") {
+      try {
+        registration = registeredControllerRegistration(cwd, workflow);
+        const root = await discoverControllerRoot(signal);
+        if (!registration.root || !sameControllerRoot(registration.root, root))
+          throw new Error(
+            "Current root identity differs from the registered controller root.",
+          );
+        await linkedControllerConfig(registration, signal);
+      } catch (error) {
+        workflow.evidence.push({
+          at: now(),
+          kind: "event-controller-registration-pending",
+          text: `Close refused before workspace mutation: ${clip((error as Error).message, 1200)}`,
+        });
+        workflow.updatedAt = now();
+        await saveManifest(cwd, manifest);
+        throw error;
+      }
+    }
+
+    workflow.closeRequestedAt = now();
+    workflow.evidence.push(
+      ...evidence
+        .filter(Boolean)
+        .map((text) => ({ at: now(), kind: "closeout", text })),
+    );
+    // A durable workspace can carry multiple goal/lane tabs. Never close it
+    // while another non-closed workflow still references it; this workflow
+    // only owns its tabs/panes and close has no tab/pane mutation path.
+    if (!sharedWorkspace) {
+      await runHerdr(
+        ["workspace", "close", workflow.ownership.workspaceId],
+        signal,
+      );
+    } else {
+      workflow.evidence.push({
+        at: now(),
+        kind: "workspace-retained-for-other-workflows",
+        text: `Retained durable workspace ${workflow.ownership.workspaceId}; another open workflow still references it.`,
+      });
+    }
+    if (registration) {
+      try {
+        await unregisterEventController(cwd, workflow, signal);
+      } catch (error) {
+        recordControllerRegistration(workflow, {
+          ...registration,
+          status: "cleanup-pending",
+          updatedAt: now(),
+          reason: `Controller cleanup awaits recovery after workflow close: ${clip((error as Error).message, 1000)}`,
+        });
+        workflow.status = "close-cleanup-pending";
+        workflow.outcome = "unknown";
+        workflow.updatedAt = now();
+        await saveManifest(cwd, manifest);
+        throw new Error(
+          `Workspace closed but controller cleanup is pending: ${(error as Error).message}`,
+        );
+      }
+    }
+    workflow.status = "closed";
+    workflow.outcome = "closed";
+    workflow.closedAt = now();
+    workflow.updatedAt = now();
+    await saveManifest(cwd, manifest);
+    return { closed: true, workflow };
+  }
+
+  pi.on("tool_call", async (event, ctx) => {
+    // SAFETY: Pi's event union requires a runtime tool-name guard before bash input is available.
+    const call = event as unknown as {
+      toolName?: string;
+      input?: { command?: unknown };
+    };
+    if (
+      call.toolName === "ask_user_question" &&
+      process.env.HERDR_ENV === "1" &&
+      !isRootOrchestrator()
+    ) {
+      try {
+        const request = await persistParentQuestion(ctx.cwd, call.input ?? {});
+        return {
+          block: true,
+          reason: `parent-question-required (${request.id}): the question was persisted for parent Herdr observation; do not present it directly to Zach.`,
+        };
+      } catch (error) {
+        return {
+          block: true,
+          reason: `parent-question-required: unable to persist the question, so child UI remains blocked (${(error as Error).message}).`,
+        };
+      }
+    }
+    const command = call.input?.command;
+    if (call.toolName !== "bash" || typeof command !== "string") return;
+    const nonAutonomousMutation =
+      /(?:^|[;&|]\s*)(?:git(?:\s+\S+)*\s+(?:push|merge)\b|gh\s+pr\s+create\b|glab\s+mr\s+create\b|hub\s+pull-request\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:deploy|publish|release)\b|(?:wrangler|vercel|netlify|flyctl|kubectl)\s+(?:deploy|publish|apply)\b|herdr\s+(?:workspace|tab|pane)\s+close\b)/im;
+    if (process.env.HERDR_ENV === "1" && nonAutonomousMutation.test(command)) {
+      return {
+        block: true,
+        reason:
+          "Push, merge, PR creation, deploy/external mutation, and Herdr resource closure require explicit parent approval and are never authorized by the local policy.",
+      };
+    }
+    if (
+      /^\s*pi(?:\s|$)/m.test(command) ||
+      /(?:^|[;&|]\s*)pi-(?:subagents|background-tasks)(?:\s|$)/m.test(
+        command,
+      ) ||
+      /(?:^|[;&]\s*)(?:nohup|disown)\b/m.test(command)
+    ) {
+      return {
+        block: true,
+        reason:
+          "Delegated Pi sessions and detached child jobs must be created only through Herdr dispatch.",
+      };
+    }
+  });
+
+  pi.on("before_agent_start", async (event, ctx) => {
+    if (process.env.HERDR_ENV !== "1") return {};
+    return {
+      systemPrompt: `${event.systemPrompt}\n\nHerdr controller active. Use available Herdr tools only as permitted by role; do not poll or auto-continue. Herdr delegation policy: delegate only via herdr_plan then herdr_dispatch. Every child must be a new Herdr-created session using its declared agentKind from the installed Herdr compatibility set. Never use Pi subagents, Pi background tasks, detached/background child jobs, or direct Pi child-session launches. Use herdr_observe for completion and herdr_close with evidence for extension-owned resources only.${await rootBootstrapPrompt(ctx.cwd)}`,
+    };
+  });
+
+  pi.registerTool({
+    name: "herdr_goal",
+    label: "Herdr Goal",
+    description: "Create or update the controller-owned thin parent goal record; it never polls or resumes Pi goals.",
+    promptSnippet: "Manage the durable Herdr parent goal from the designated root.",
+    promptGuidelines: [
+      "Use only from HERDR_ORCHESTRATOR_ROOT=1. Initialize only for an explicit user objective. A durable controller signal changes the goal to action-required; after one parent decision, set waiting-for-event or another truthful state, then stop.",
+    ],
+    parameters: Type.Object({
+      action: Type.Union([Type.Literal("initialize"), Type.Literal("set-state"), Type.Literal("status"), Type.Literal("start"), Type.Literal("stop"), Type.Literal("pause")]),
+      objective: Type.Optional(Type.String()),
+      status: Type.Optional(Type.String()),
+      nextAction: Type.Optional(Type.String()),
+      nudgeIntervalSeconds: Type.Optional(Type.Integer({ minimum: MIN_PARENT_GOAL_NUDGE_INTERVAL_SECONDS, maximum: MAX_PARENT_GOAL_NUDGE_INTERVAL_SECONDS })),
+      pauseReason: Type.Optional(Type.String()),
+    }, { additionalProperties: false }),
+    async execute(_id, params, _signal, _update, ctx) {
+      const goal = await parentGoal(ctx.cwd, params.action, params.objective, params.status, params.nextAction, params.nudgeIntervalSeconds, params.pauseReason);
+      return {
+        content: [{ type: "text", text: `Parent goal ${goal.id}: ${goal.status}` }],
+        details: { goal },
+      };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_complete",
+    label: "Herdr Complete",
+    description: "Deliver one verified child completion receipt to the registered controller root.",
+    promptSnippet: "Report a completed mapped child lane to its Herdr parent.",
+    parameters: Type.Object({ workflowId: Type.String(), summary: Type.String() }),
+    async execute(_id, params, signal, _update, ctx) {
+      const result = await complete(ctx.cwd, params.workflowId, params.summary, signal);
+      return { content: [{ type: "text", text: `Delivered completion receipt ${result.relationshipId}` }], details: result };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_reparent",
+    label: "Herdr Reparent",
+    description: "Preview or root-confirm a controller-root handoff for one isolated registered workflow.",
+    promptSnippet: "Reparent an isolated Herdr controller workflow to the verified current root.",
+    parameters: Type.Object({ workflowId: Type.String(), execute: Type.Optional(Type.Boolean()) }),
+    async execute(_id, params, signal, _update, ctx) {
+      const result = await reparent(ctx.cwd, params.workflowId, params.execute ?? false, ctx, signal);
+      return { content: [{ type: "text", text: result.dryRun ? `Dry-run reparent for ${params.workflowId}` : result.cancelled ? "Reparent cancelled" : result.unchanged ? "Controller root is already current" : `Reparented ${params.workflowId}` }], details: result };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_plan",
+    label: "Herdr Plan",
+    description:
+      "Create a durable local plan manifest for Herdr-managed agent lanes.",
+    promptSnippet: "Plan a Herdr-only delegated agent workflow.",
+    promptGuidelines: [
+      "Use herdr_plan before herdr_dispatch; select any documented Herdr agentKind when needed. Supply authorizationPolicy only for the narrowly validated BB-029 local-only scope.",
+    ],
+    parameters: Type.Object(
+      {
+        objective: Type.String(),
+        lanes: Type.Optional(
+          Type.Array(
+            Type.Union([
+              Type.String(),
+              Type.Object(
+                {
+                  objective: Type.String(),
+                  readOnly: Type.Optional(Type.Boolean()),
+                  agentKind: Type.Optional(Type.String()),
+                },
+                { additionalProperties: false },
+              ),
+            ]),
+          ),
+        ),
+        worktreeCwd: Type.Optional(Type.String()),
+        agentKind: Type.Optional(Type.String()),
+        authorizationPolicy: Type.Optional(
+          Type.Object(
+            {
+              version: Type.Integer({ minimum: 1, maximum: 1 }),
+              scope: Type.Object({
+                workflow: Type.String(),
+                localOnly: Type.Boolean(),
+              }),
+              capabilities: Type.Array(Type.String(), {
+                minItems: 1,
+                maxItems: AUTHORIZATION_CAPABILITIES.length,
+              }),
+            },
+            { additionalProperties: false },
+          ),
+        ),
+      },
+      { additionalProperties: false },
+    ),
+    async execute(_id, params, _signal, _update, ctx) {
+      const workflow = await plan(
+        ctx.cwd,
+        params.objective,
+        params.lanes ?? [],
+        params.worktreeCwd,
+        params.authorizationPolicy,
+        params.agentKind,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Planned ${workflow.id} in ${manifestPath(ctx.cwd)}`,
+          },
+        ],
+        details: { workflow },
+      };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_dispatch",
+    label: "Herdr Dispatch",
+    description:
+      "Preview or explicitly dispatch a planned workflow into a new Herdr workspace and selected-agent pane.",
+    promptSnippet:
+      "Dispatch only a planned Herdr workflow; dry-run by default.",
+    promptGuidelines: [
+      "Use herdr_dispatch with execute=true only after explicit user intent. A root bypasses UI only when the workflow's validated local authorizationPolicy grants dispatch or retry; children remain UI-free and return parentApprovalRequired.",
+    ],
+    parameters: Type.Object({
+      workflowId: Type.String(),
+      execute: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_id, params, signal, _update, ctx) {
+      const result = await dispatch(
+        ctx.cwd,
+        params.workflowId,
+        params.execute ?? false,
+        ctx,
+        signal,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: result.dryRun
+              ? `Dry-run dispatch for ${params.workflowId}`
+              : result.parentApprovalRequired
+                ? `Parent approval required for ${params.workflowId}; observe the child through Herdr and approve from the designated root.`
+                : result.cancelled
+                  ? "Dispatch cancelled"
+                  : `Dispatched ${params.workflowId}`,
+          },
+          {},
+        ],
+        details: result,
+      };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_observe",
+    label: "Herdr Observe",
+    description:
+      "Read a Herdr lane agent's live state and recent output, then update its manifest.",
+    promptSnippet: "Observe a dispatched Herdr workflow.",
+    parameters: Type.Object({ workflowId: Type.String() }),
+    async execute(_id, params, signal, _update, ctx) {
+      const result = await observe(ctx.cwd, params.workflowId, signal);
+      return {
+        content: [
+          { type: "text", text: `${params.workflowId}: ${result.state}` },
+        ],
+        details: result,
+      };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_resume",
+    label: "Herdr Resume",
+    description:
+      "Preview or explicitly send /goal-resume through Herdr to lanes with a recorded paused Pi goal.",
+    promptSnippet:
+      "Resume observed paused Pi goals through their recorded Herdr lane agents; dry-run by default.",
+    promptGuidelines: [
+      "Use herdr_resume only after herdr_observe records a goal-paused workflow. A root bypasses UI only when the workflow's validated local authorizationPolicy grants paused-goal recovery; children remain UI-free and return parentApprovalRequired.",
+    ],
+    parameters: Type.Object({
+      workflowId: Type.String(),
+      execute: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_id, params, signal, _update, ctx) {
+      const result = await resume(
+        ctx.cwd,
+        params.workflowId,
+        params.execute ?? false,
+        ctx,
+        signal,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: result.dryRun
+              ? `Dry-run resume for ${params.workflowId}`
+              : result.parentApprovalRequired
+                ? `Parent approval required for ${params.workflowId}; the designated root must resume the observed goal through Herdr.`
+                : result.cancelled
+                  ? "Goal resume cancelled"
+                  : `Sent /goal-resume to ${result.receipts?.length ?? 0} lane agent(s) for ${params.workflowId}`,
+          },
+        ],
+        details: result,
+      };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_close",
+    label: "Herdr Close",
+    description:
+      "Preview or explicitly close only a recorded extension-owned Herdr workspace; evidence is mandatory.",
+    promptSnippet:
+      "Close a Herdr workflow only with evidence; dry-run by default.",
+    promptGuidelines: [
+      "Use herdr_close only after recording concrete evidence and explicit user intent. Child sessions receive a parent-approval-required result; only HERDR_ORCHESTRATOR_ROOT=1 may show the confirmation.",
+    ],
+    parameters: Type.Object({
+      workflowId: Type.String(),
+      evidence: Type.Array(Type.String(), { minItems: 1 }),
+      execute: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_id, params, signal, _update, ctx) {
+      const result = await close(
+        ctx.cwd,
+        params.workflowId,
+        params.evidence,
+        params.execute ?? false,
+        ctx,
+        signal,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: result.dryRun
+              ? `Dry-run close for ${params.workflowId}`
+              : result.parentApprovalRequired
+                ? `Parent approval required for ${params.workflowId}; observe the child through Herdr and approve from the designated root.`
+                : result.cancelled
+                  ? "Close cancelled"
+                  : `Closed ${params.workflowId}`,
+          },
+          {},
+        ],
+        details: result,
+      };
+    },
+  });
+
+  pi.registerCommand("herdr-plan", {
+    description: "Create a Herdr workflow plan: /herdr-plan <objective>",
+    handler: async (args, ctx) => {
+      if (!args.trim()) throw new Error("Usage: /herdr-plan <objective>");
+      const workflow = await plan(ctx.cwd, args.trim(), []);
+      ctx.ui.notify(`Planned ${workflow.id}`, "info");
+    },
+  });
+  pi.registerCommand("herdr-dispatch", {
+    description: "Preview or dispatch: /herdr-dispatch <id> [--execute]",
+    handler: async (args, ctx) => {
+      const [id, flag] = args.trim().split(/\s+/);
+      if (!id) throw new Error("Usage: /herdr-dispatch <id> [--execute]");
+      const result = await dispatch(ctx.cwd, id, flag === "--execute", ctx);
+      let message = `Dispatched ${id}`;
+      if (result.dryRun) message = `Dry-run: ${id}`;
+      else if (result.parentApprovalRequired)
+        message = `Parent approval required for ${id}; observe the child through Herdr and approve from the designated root.`;
+      else if (result.cancelled) message = "Dispatch cancelled";
+      ctx.ui.notify(message, "info");
+    },
+  });
+  pi.registerCommand("herdr-observe", {
+    description: "Observe a workflow: /herdr-observe <id>",
+    handler: async (args, ctx) => {
+      if (!args.trim()) throw new Error("Usage: /herdr-observe <id>");
+      const result = await observe(ctx.cwd, args.trim());
+      ctx.ui.notify(`${args.trim()}: ${result.state}`, "info");
+    },
+  });
+  pi.registerCommand("herdr-resume", {
+    description:
+      "Preview or resume paused goals: /herdr-resume <id> [--execute]",
+    handler: async (args, ctx) => {
+      const [id, flag] = args.trim().split(/\s+/);
+      if (!id) throw new Error("Usage: /herdr-resume <id> [--execute]");
+      const result = await resume(ctx.cwd, id, flag === "--execute", ctx);
+      let message = `Sent /goal-resume for ${id}`;
+      if (result.dryRun) message = `Dry-run: ${id}`;
+      if (result.parentApprovalRequired) return;
+      if (result.cancelled) message = "Goal resume cancelled";
+      ctx.ui.notify(message, "info");
+    },
+  });
+  pi.registerCommand("herdr-close", {
+    description: "Preview or close: /herdr-close <id> <evidence> [--execute]",
+    handler: async (args, ctx) => {
+      const execute = args.includes("--execute");
+      const [id, ...rest] = args.replace("--execute", "").trim().split(/\s+/);
+      const evidence = rest.join(" ");
+      if (!id || !evidence)
+        throw new Error("Usage: /herdr-close <id> <evidence> [--execute]");
+      const result = await close(ctx.cwd, id, [evidence], execute, ctx);
+      let message = `Closed ${id}`;
+      if (result.dryRun) message = `Dry-run: ${id}`;
+      else if (result.parentApprovalRequired)
+        message = `Parent approval required for ${id}; observe the child through Herdr and approve from the designated root.`;
+      else if (result.cancelled) message = "Close cancelled";
+      ctx.ui.notify(message, "info");
+    },
+  });
+}

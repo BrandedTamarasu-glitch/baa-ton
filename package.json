@@ -1,0 +1,18 @@
+{
+  "name": "baa-ton",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "npm run test:extension && npm run test:controller",
+    "test:extension": "node packages/herdr-tools/smoke-check.mjs",
+    "test:controller": "npm --prefix packages/controller test"
+  },
+  "dependencies": {
+    "jiti": "^2.7.0",
+    "typebox": "^1.3.7"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

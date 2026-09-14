@@ -1,29 +1,42 @@
 # Baa-ton
 
-Local foundation for a Herdr orchestration project.
-
-This repository starts with documentation and layout only. It does **not** package,
-link, enable, or modify the installed Herdr controller or Pi extension.
+Canonical source repository for local Herdr orchestration tooling.
 
 ## Layout
 
-- `docs/` — architecture notes and implementation decisions.
-- `src/` — future implementation source.
-- `test/` — future foreground tests.
+- `packages/herdr-tools/` — durable workflow manifest operations, local MCP bridge, and deterministic smoke check.
+- `packages/controller/` — the Herdr event-controller plugin and its Node test suite.
+- `docs/` — architecture and ownership decisions.
 
-## Current reference implementation
+The runtime is local-only. It does not push, deploy, or create remote resources.
 
-The existing global implementation was inspected as a design reference:
+## Validate
 
-- Pi extension: `~/.pi/agent/extensions/herdr-orchestrator/`
-- Herdr event controller plugin:
-  `~/.pi/agent/plugins/herdr-orchestrator-controller/`
+```sh
+npm install
+npm test
+```
 
-Baa-ton should preserve its core safety boundaries: durable local records,
-explicit ownership, root-only approval, synchronous tests, and no implicit remote
-or production actions. See [Architecture](docs/ARCHITECTURE.md).
+Requires Node 20+.
 
-## Status
+## Use from any Herdr-compatible harness
 
-Scaffold only. No executable runtime, dependencies, or deployment configuration
-are present yet.
+Configure the harness's local stdio MCP client to run:
+
+```sh
+node /Users/zchristmas/baa-ton/packages/herdr-tools/mcp-server.mjs
+```
+
+Inside a Herdr session, this exposes the `herdr_*` workflow tools. The MCP bridge uses repository dependencies only; it has no platform-specific runtime dependency.
+
+## Install the event controller
+
+Review these commands before running them. They make only local Herdr registration changes. Linking remains disabled; enabling is a separate explicit parent-reviewed action.
+
+```sh
+herdr plugin unlink herdr-orchestrator-controller
+herdr plugin link /Users/zchristmas/baa-ton/packages/controller --disabled
+herdr plugin list --plugin herdr-orchestrator-controller --json
+```
+
+See the package READMEs for configuration and safety boundaries.

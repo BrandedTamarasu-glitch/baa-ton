@@ -1,0 +1,18 @@
+id = "herdr-orchestrator-controller"
+name = "herdr-orchestrator-controller"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Durable, root-only event controller for Herdr Orchestrator workflows."
+platforms = ["linux", "macos", "windows"]
+
+[[startup]]
+platforms = ["linux", "macos"]
+command = ["sh", "supervisor.sh"]
+
+[[startup]]
+platforms = ["windows"]
+command = ["node", "controller.mjs", "supervisor"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["node", "controller.mjs", "hook"]

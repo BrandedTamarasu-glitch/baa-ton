@@ -1,9 +1,9 @@
 # Decisions
 
-## 2026-09-14 — Start as a documentation-only scaffold
+## 2026-09-14 — Migrate the global runtime into Baa-ton
 
-- The repository begins without a runtime, package manager, or deployment setup.
-- Existing global Herdr controller and Pi extension sources are reference material,
-  not a dependency to be managed from this repository.
-- Future implementation must make authority, ownership, and durability boundaries
-  explicit before adding automation.
+- `packages/herdr-tools` is the canonical source for workflow operations and the MCP bridge.
+- `packages/controller` is the canonical source for the Herdr event-controller plugin.
+- The MCP bridge is the harness-neutral entrypoint; it depends only on repository dependencies and Herdr session context.
+- Root `npm test` runs both the mocked workflow smoke check and the controller's foreground Node suite.
+- The controller installation remains disabled after linking; enabling remains an explicit parent-reviewed action.
