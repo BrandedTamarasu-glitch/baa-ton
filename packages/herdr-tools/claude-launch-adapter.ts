@@ -10,6 +10,8 @@ import {
 } from "./harness-adapter.js";
 
 export const CLAUDE_PROVIDER = "claude-code";
+export const CLAUDE_PERMISSION_PROMPT_TOOL =
+  "mcp__herdr-orchestrator__herdr_permission_prompt";
 
 export type ClaudeAdapterPaths = {
   /** Absolute path to the shared stdio MCP bridge. */
@@ -18,6 +20,11 @@ export type ClaudeAdapterPaths = {
   attestHelper: string;
   /** Writable directory for generated launch configuration files. */
   scratchDirectory: string;
+  /**
+   * Optional Claude permission broker tool. Omitted by default so ordinary
+   * Claude launches keep their native permission flow.
+   */
+  permissionPromptTool?: string | false;
 };
 
 function claudeBinaryAvailable(): boolean {
@@ -132,7 +139,7 @@ export function claudeLaunchAdapter(
       };
       writeFileSync(settingsPath, JSON.stringify(settings), { mode: 0o600 });
       writeFileSync(mcpConfigPath, JSON.stringify(mcpConfig), { mode: 0o600 });
-      return [
+      const args = [
         "--model",
         profile.model,
         "--effort",
@@ -143,6 +150,26 @@ export function claudeLaunchAdapter(
         mcpConfigPath,
         "--strict-mcp-config",
       ];
+      const permissionPromptTool =
+        paths.permissionPromptTool === undefined
+          ? process.env.BAA_CLAUDE_PERMISSION_PROMPT_TOOL === "1"
+            ? CLAUDE_PERMISSION_PROMPT_TOOL
+            : undefined
+          : paths.permissionPromptTool;
+      if (
+        permissionPromptTool !== undefined &&
+        permissionPromptTool !== false
+      ) {
+        if (
+          typeof permissionPromptTool !== "string" ||
+          permissionPromptTool.trim() === ""
+        )
+          throw new Error(
+            "permissionPromptTool must be a non-empty string when enabled.",
+          );
+        args.push("--permission-prompt-tool", permissionPromptTool);
+      }
+      return args;
     },
     verifyStartup(nativeAgent: unknown, attestation: unknown): StartupProof {
       const agent = nativeAgent as {

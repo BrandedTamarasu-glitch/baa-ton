@@ -17,6 +17,13 @@ import {
 } from "node:fs/promises";
 import net from "node:net";
 import { handleActivation } from "./activation.mjs";
+import {
+  enqueueWakeHint,
+  makeEnvelope,
+  markDelivery,
+  putMessage,
+  storePath,
+} from "../herdr-tools/inbox/index.mjs";
 import { fileURLToPath } from "node:url";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -1256,6 +1263,53 @@ function nextNudgeAt(timestamp, intervalSeconds) {
   return new Date(Date.parse(timestamp) + intervalSeconds * 1000).toISOString();
 }
 
+function inboxIdentity(workspaceId, paneId, agent) {
+  return {
+    workspace_id: workspaceId,
+    pane_id: paneId,
+    ...(agent ? { agent } : {}),
+  };
+}
+
+async function persistControllerMessage(stateDir, {
+  logicalKey,
+  occurrenceId,
+  kind,
+  from,
+  to,
+  payload,
+  wake = false,
+}) {
+  // Older diagnostic fixtures and pre-task registrations may describe a
+  // cross-workspace child. They remain supported by the controller's legacy
+  // ledger, but are not eligible for herdr-link/1 delivery until a
+  // workspace-scoped mapping is registered.
+  if (from.workspace_id !== to.workspace_id) return undefined;
+  const path = storePath({ stateDir });
+  const stored = await putMessage(path, {
+    envelope: makeEnvelope({
+      logicalKey,
+      occurrenceId,
+      kind,
+      from,
+      to,
+      payload,
+    }),
+    dedupe: "occurrence",
+  });
+  if (wake)
+    await enqueueWakeHint(path, {
+      recipient: to,
+      occurrenceId: stored.message.occurrence_id,
+    });
+  return { path, message: stored.message };
+}
+
+async function finishControllerMessage(stored, status, details = {}) {
+  if (!stored) return;
+  await markDelivery(stored.path, stored.message.occurrence_id, status, details);
+}
+
 async function observeRootActivity(root, herdr, timestamp) {
   try {
     const result = await herdr.request("agent.get", { target: root.target });
@@ -1340,8 +1394,37 @@ export async function runSupervisorTick({
               : 1,
             updated_at: timestamp,
           };
+          const inboxMessage = await persistControllerMessage(configDir, {
+            logicalKey: `lane-event:${record.workflow_id}/${record.lane_id}/${record.classification}`,
+            occurrenceId: record.identity,
+            kind: "lifecycle-event",
+            from: inboxIdentity(
+              record.workspace_id,
+              record.pane_id,
+              record.source?.agent,
+            ),
+            to: inboxIdentity(
+              orchestrator.root.workspace_id,
+              orchestrator.root.pane_id,
+              orchestrator.root.agent_kind,
+            ),
+            payload: record,
+            wake: true,
+          });
+          if (inboxMessage)
+            await markDelivery(
+              inboxMessage.path,
+              inboxMessage.message.occurrence_id,
+              "sending",
+              { attempts: record.wake.attempts },
+            );
           const outcome = await deliverWake(record, orchestrator.root, api);
           record.wake = { ...record.wake, ...outcome, updated_at: timestamp };
+          await finishControllerMessage(
+            inboxMessage,
+            outcome.status,
+            { attempts: record.wake.attempts, reason: outcome.reason },
+          );
           pendingChanged = true;
           pendingWakes.push({
             manifestPath,
@@ -1451,6 +1534,36 @@ export async function runSupervisorTick({
       supervisor.updatedAt = timestamp;
       goal.updatedAt = timestamp;
       await atomicWriteJson(manifestPath, manifest);
+      const inboxMessage = await persistControllerMessage(configDir, {
+        logicalKey: `supervisor-wake:${goal.id}`,
+        occurrenceId: sha256(
+          canonicalJson({
+            goal: goal.id,
+            nextAction: goal.nextAction,
+            attemptedAt,
+          }),
+        ),
+        kind: "supervisor-wake",
+        from: inboxIdentity(
+          orchestrator.root.workspace_id,
+          orchestrator.root.pane_id,
+          orchestrator.root.agent_kind,
+        ),
+        to: inboxIdentity(
+          orchestrator.root.workspace_id,
+          orchestrator.root.pane_id,
+          orchestrator.root.agent_kind,
+        ),
+        payload: { goalId: goal.id, objective: goal.objective, nextAction: goal.nextAction },
+        wake: true,
+      });
+      if (inboxMessage)
+        await markDelivery(
+          inboxMessage.path,
+          inboxMessage.message.occurrence_id,
+          "sending",
+          { attempts: 1 },
+        );
       const outcome = await deliverSupervisorNudge(
         goal,
         orchestrator.root,
@@ -1475,6 +1588,11 @@ export async function runSupervisorTick({
       supervisor.updatedAt = timestamp;
       goal.updatedAt = supervisor.updatedAt;
       await atomicWriteJson(manifestPath, manifest);
+      await finishControllerMessage(
+        inboxMessage,
+        outcome.status,
+        { attempts: 1, reason: outcome.reason },
+      );
       results.push({ manifestPath, status: outcome.status });
     } finally {
       await release();
@@ -1659,11 +1777,29 @@ export async function handleHook({
       ? previousTransition
       : ledger.events.find((entry) => entry.identity === identity);
     const created = !record;
+    let inboxMessage;
     if (!record) {
       const classification = await classifyEvent(event, mapping, api);
       record = newRecord(event, mapping, classification, identity);
       ledger.events.push(record);
       signalParentGoal(manifest, record);
+      inboxMessage = await persistControllerMessage(configDir, {
+        logicalKey: `lane-event:${record.workflow_id}/${record.lane_id}/${record.classification}`,
+        occurrenceId: record.identity,
+        kind: "lifecycle-event",
+        from: inboxIdentity(
+          record.workspace_id,
+          record.pane_id,
+          record.source?.agent,
+        ),
+        to: inboxIdentity(
+          mapping.orchestrator.root.workspace_id,
+          mapping.orchestrator.root.pane_id,
+          mapping.orchestrator.root.agent_kind,
+        ),
+        payload: record,
+        wake: ACTIONABLE_CLASSIFICATIONS.has(record.classification),
+      });
       await atomicWriteJson(mapping.workflow.manifest_path, manifest);
       if ("parentGoal" in manifest)
         await publishParentGoalSidebar(
@@ -1688,6 +1824,23 @@ export async function handleHook({
       });
       return { accepted: true, deduplicated: true, record };
     }
+    inboxMessage ??= await persistControllerMessage(configDir, {
+      logicalKey: `lane-event:${record.workflow_id}/${record.lane_id}/${record.classification}`,
+      occurrenceId: record.identity,
+      kind: "lifecycle-event",
+      from: inboxIdentity(
+        record.workspace_id,
+        record.pane_id,
+        record.source?.agent,
+      ),
+      to: inboxIdentity(
+        mapping.orchestrator.root.workspace_id,
+        mapping.orchestrator.root.pane_id,
+        mapping.orchestrator.root.agent_kind,
+      ),
+      payload: record,
+      wake: true,
+    });
     await updateWake(mapping.workflow.manifest_path, manifest, record, {
       status: "sending",
       attempts: Number.isSafeInteger(record.wake.attempts)
@@ -1695,8 +1848,20 @@ export async function handleHook({
         : 1,
       reason: "root_delivery_started",
     });
+    if (inboxMessage)
+      await markDelivery(
+        inboxMessage.path,
+        inboxMessage.message.occurrence_id,
+        "sending",
+        { attempts: record.wake.attempts },
+      );
     const outcome = await deliverWake(record, mapping.orchestrator.root, api);
     await updateWake(mapping.workflow.manifest_path, manifest, record, outcome);
+    await finishControllerMessage(
+      inboxMessage,
+      outcome.status,
+      { attempts: record.wake.attempts, reason: outcome.reason },
+    );
     return { accepted: true, deduplicated: !created, record };
   } finally {
     await release();

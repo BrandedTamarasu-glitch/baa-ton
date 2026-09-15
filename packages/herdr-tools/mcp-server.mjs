@@ -8,8 +8,31 @@
  */
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import {
+  lstat,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { Value } from "typebox/value";
+import { Type } from "typebox";
+import {
+  answerMessage,
+  digest,
+  enqueueWakeHint,
+  findMessage,
+  makeEnvelope,
+  markDelivery,
+  markState,
+  putMessage,
+  releasePermission,
+  storePath,
+  updateMessage,
+} from "./inbox/index.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -50,14 +73,21 @@ const modelRuntime = await ModelRuntime.create({ refreshOnCreate: false });
 const modelRegistry = new ModelRegistry(modelRuntime);
 await modelRegistry.refresh();
 const tools = new Map();
+const lifecycleHandlers = new Map();
+const activeRequests = new Map();
 extension.default({
-  on() {},
+  on(event, handler) {
+    if (typeof event !== "string" || typeof handler !== "function") return;
+    const handlers = lifecycleHandlers.get(event) ?? [];
+    handlers.push(handler);
+    lifecycleHandlers.set(event, handlers);
+  },
   registerTool(definition) {
     if (definition.name.startsWith("herdr_"))
       tools.set(definition.name, definition);
   },
   registerCommand() {},
-  async exec(command, args) {
+  async exec(command, args, options = {}) {
     const result = await new Promise((resolveResult) => {
       const child = require("node:child_process").spawn(command, args, {
         cwd: process.cwd(),
@@ -66,16 +96,421 @@ extension.default({
       });
       let stdout = "";
       let stderr = "";
+      let settled = false;
+      let timer;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        options.signal?.removeEventListener("abort", abort);
+        resolveResult(value);
+      };
+      const abort = () => {
+        child.kill("SIGTERM");
+        finish({ stdout, stderr, code: null, cancelled: true });
+      };
       child.stdout.on("data", (chunk) => (stdout += chunk));
       child.stderr.on("data", (chunk) => (stderr += chunk));
-      child.on("close", (code) => resolveResult({ stdout, stderr, code }));
-      child.on("error", (error) =>
-        resolveResult({ stdout, stderr: error.message, code: 1 }),
+      child.on("close", (code, signal) =>
+        finish({ stdout, stderr, code, signal }),
       );
+      child.on("error", (error) =>
+        finish({ stdout, stderr: `${stderr}${error.message}`, code: 1 }),
+      );
+      if (options.signal?.aborted) abort();
+      else options.signal?.addEventListener("abort", abort, { once: true });
+      if (Number.isFinite(options.timeout) && options.timeout > 0)
+        timer = setTimeout(() => {
+          child.kill("SIGTERM");
+          finish({ stdout, stderr, code: null, timedOut: true });
+        }, options.timeout);
     });
     return result;
   },
+  sendMessage() {},
 });
+
+const permissionToolName =
+  "mcp__herdr-orchestrator__herdr_permission_prompt";
+
+const mutationKinds = new Map([
+  ["herdr_goal", "goal"],
+  ["herdr_question_answer", "answer"],
+  ["herdr_complete", "completion"],
+  ["herdr_plan", "lifecycle"],
+  ["herdr_dispatch", "lifecycle"],
+  ["herdr_resume", "lifecycle"],
+  ["herdr_close", "lifecycle"],
+]);
+
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function timestamp() {
+  return new Date().toISOString();
+}
+
+function configDirectory() {
+  const directory = process.env.HERDR_PLUGIN_CONFIG_DIR ?? process.env.HERDR_PLUGIN_STATE_DIR;
+  if (!directory || !isAbsolute(directory)) return undefined;
+  return resolve(directory);
+}
+
+async function readControllerConfig() {
+  const directory = configDirectory();
+  if (!directory) return undefined;
+  try {
+    return JSON.parse(await readFile(join(directory, "config.json"), "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function endpointFromEnvironment() {
+  const workspaceId = process.env.HERDR_WORKSPACE_ID;
+  const paneId = process.env.HERDR_PANE_ID;
+  if (!workspaceId || !paneId) return undefined;
+  const agent = process.env.HERDR_AGENT_KIND ?? process.env.HERDR_AGENT;
+  return {
+    workspace_id: workspaceId,
+    pane_id: paneId,
+    ...(agent ? { agent } : {}),
+  };
+}
+
+function routeManifest(orchestrator) {
+  if (orchestrator.program?.parent_manifest_path)
+    return resolve(orchestrator.program.parent_manifest_path);
+  const first = orchestrator.workflows?.find((workflow) => workflow.manifest_path);
+  return first?.manifest_path ? resolve(first.manifest_path) : undefined;
+}
+
+async function currentRoute() {
+  const self = endpointFromEnvironment();
+  if (!self) return undefined;
+  const config = await readControllerConfig();
+  if (!config) return undefined;
+  const orchestrators =
+    config.version === 1
+      ? [
+          {
+            id: `legacy:${config.root?.workspace_id}:${config.root?.pane_id}`,
+            root: config.root,
+            program: { id: process.cwd(), workspace_id: config.root?.workspace_id },
+            workflows: config.workflows ?? [],
+          },
+        ]
+      : config.orchestrators ?? [];
+  for (const orchestrator of orchestrators) {
+    if (
+      orchestrator.root?.pane_id === self.pane_id &&
+      orchestrator.root?.workspace_id === self.workspace_id
+    )
+      return {
+        role: "root",
+        orchestrator,
+        root: orchestrator.root,
+        manifestPath: routeManifest(orchestrator),
+        workflowId: undefined,
+        laneId: undefined,
+      };
+    for (const workflow of orchestrator.workflows ?? [])
+      for (const lane of workflow.lanes ?? [])
+        if (
+          lane.pane_id === self.pane_id &&
+          lane.workspace_id === self.workspace_id
+        )
+          return {
+            role: "lane",
+            orchestrator,
+            root: orchestrator.root,
+            manifestPath: routeManifest(orchestrator),
+            workflowId: workflow.workflow_id,
+            laneId: lane.lane_id,
+            lane,
+          };
+  }
+  return undefined;
+}
+
+async function acquireManifestLock(manifestPath) {
+  const lockPath = join(
+    dirname(manifestPath),
+    `.${manifestPath.split("/").at(-1)}.herdr-orchestrator.lock`,
+  );
+  const deadline = Date.now() + 2_000;
+  while (true) {
+    try {
+      await mkdir(lockPath, { mode: 0o700 });
+      return async () => rm(lockPath, { recursive: true, force: true });
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      if (Date.now() >= deadline) throw new Error("Timed out acquiring MCP lifecycle lock.");
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, 10));
+    }
+  }
+}
+
+async function atomicWriteJson(path, value) {
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    await rename(temporary, path);
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function updateManifest(manifestPath, mutate) {
+  if (!manifestPath) return false;
+  let details;
+  try {
+    details = await lstat(manifestPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  if (!details.isFile()) throw new Error("MCP lifecycle manifest is not a regular file.");
+  const release = await acquireManifestLock(manifestPath);
+  try {
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    const changed = await mutate(manifest);
+    if (changed) await atomicWriteJson(manifestPath, manifest);
+    return changed;
+  } finally {
+    await release();
+  }
+}
+
+async function persistBridgeLifecycle(route, state, runId) {
+  if (!route || route.role !== "root") return;
+  const self = endpointFromEnvironment();
+  await updateManifest(route.manifestPath, (manifest) => {
+    const supervisor = manifest.parentGoal?.supervisor;
+    if (!supervisor || !self) return false;
+    if (
+      state !== "active" &&
+      supervisor.rootTurn &&
+      supervisor.rootTurn.runId !== runId
+    )
+      return false;
+    supervisor.rootTurn = {
+      state,
+      runId,
+      paneId: self.pane_id,
+      workspaceId: self.workspace_id,
+      updatedAt: timestamp(),
+    };
+    supervisor.updatedAt = supervisor.rootTurn.updatedAt;
+    if (manifest.parentGoal) manifest.parentGoal.updatedAt = supervisor.updatedAt;
+    return true;
+  });
+}
+
+function lifecycleContext(controller, state) {
+  return {
+    ...ctx,
+    signal: controller.signal,
+    isIdle: () => state === "idle",
+    abort: () => controller.abort(),
+    sessionManager: {
+      getSessionFile: () => process.env.HERDR_SESSION_PATH,
+    },
+  };
+}
+
+async function emitLifecycle(event, controller, state) {
+  for (const handler of lifecycleHandlers.get(event) ?? [])
+    await handler({}, lifecycleContext(controller, state));
+}
+
+async function beginMcpTurn(requestId, controller) {
+  const runId = `mcp-${String(requestId)}-${randomUUID()}`;
+  const route = await currentRoute();
+  await persistBridgeLifecycle(route, "active", runId);
+  await emitLifecycle("before_agent_start", controller, "active");
+  await emitLifecycle("agent_start", controller, "active");
+  // The extension lifecycle handler owns its own Pi run identifier. Reassert
+  // this bridge request's active lease after those handlers so the matching
+  // settled/cancelled transition can close exactly this MCP turn.
+  await persistBridgeLifecycle(route, "active", runId);
+  return { runId, route };
+}
+
+async function endMcpTurn(turn, controller) {
+  const state = controller.signal.aborted ? "unknown" : "idle";
+  try {
+    await emitLifecycle("agent_settled", controller, state);
+  } finally {
+    await persistBridgeLifecycle(turn.route, state, turn.runId);
+  }
+}
+
+function bridgeStorePath(route) {
+  const directory = configDirectory();
+  return directory
+    ? storePath({ stateDir: directory })
+    : route?.manifestPath
+      ? storePath({ manifestPath: route.manifestPath })
+      : undefined;
+}
+
+function bridgeMessageEndpoints(route) {
+  const from = endpointFromEnvironment();
+  if (!route || !from || !route.root) return undefined;
+  const to = {
+    workspace_id: route.root.workspace_id,
+    pane_id: route.root.pane_id,
+    ...(route.root.agent_kind ? { agent: route.root.agent_kind } : {}),
+  };
+  return { from, to };
+}
+
+async function persistBridgeMessage(name, args, requestId) {
+  const kind = mutationKinds.get(name);
+  if (!kind) return undefined;
+  const route = await currentRoute();
+  const endpoints = bridgeMessageEndpoints(route);
+  const path = bridgeStorePath(route);
+  if (!route || !endpoints || !path) return undefined;
+  const logicalKey = `${kind}:${route.workflowId ?? "root"}:${route.laneId ?? route.root.pane_id}:${name}:${digest(args)}`;
+  const occurrenceId = `${name}:${String(requestId)}`;
+  const stored = await putMessage(path, {
+    envelope: makeEnvelope({
+      logicalKey,
+      occurrenceId,
+      kind,
+      from: endpoints.from,
+      to: endpoints.to,
+      payload: args,
+    }),
+  });
+  await markState(path, stored.message.occurrence_id, "received", {
+    transport: "mcp",
+  });
+  await enqueueWakeHint(path, {
+    recipient: endpoints.to,
+    occurrenceId: stored.message.occurrence_id,
+  });
+  return { path, route, message: stored.message, created: stored.created };
+}
+
+async function finishBridgeMessage(entry, output) {
+  if (!entry) return;
+  await updateMessage(entry.path, entry.message.occurrence_id, {
+    result: output,
+    delivery: { status: "resolved" },
+  });
+  await markState(entry.path, entry.message.occurrence_id, "acknowledged", {
+    transport: "mcp",
+  });
+  await markState(entry.path, entry.message.occurrence_id, "resolved", {
+    transport: "mcp",
+  });
+}
+
+async function failBridgeMessage(entry, error, uncertain) {
+  if (!entry) return;
+  await markDelivery(
+    entry.path,
+    entry.message.occurrence_id,
+    uncertain ? "uncertain" : "pending",
+    { reason: error instanceof Error ? error.message : String(error) },
+  );
+}
+
+function pendingToolResult(message, text) {
+  return {
+    content: [{ type: "text", text }],
+    isError: true,
+    details: { pending: true, occurrenceId: message.occurrence_id },
+  };
+}
+
+async function answerPermissionFromBridge(args) {
+  const route = await currentRoute();
+  if (!route || route.role !== "root") return undefined;
+  const path = bridgeStorePath(route);
+  if (!path) return undefined;
+  const existing = await findMessage(
+    path,
+    (message) =>
+      message.occurrence_id === args.requestId &&
+      message.envelope.message.type === "permission-request",
+  );
+  if (!existing) return undefined;
+  const stored = await answerMessage(path, args.requestId, args.answer);
+  return {
+    content: [
+      {
+        type: "text",
+        text: `Stored permission answer for ${args.requestId}; the child must re-present the request for release.`,
+      },
+    ],
+    details: stored,
+  };
+}
+
+async function permissionPrompt(args) {
+  if (process.env.HERDR_ENV !== "1")
+    throw new Error("Permission broker is available only inside a HERDR_ENV=1 session.");
+  const route = await currentRoute();
+  if (!route || route.role !== "lane")
+    throw new Error("Permission broker requires a registered Herdr child lane.");
+  const endpoints = bridgeMessageEndpoints(route);
+  const path = bridgeStorePath(route);
+  if (!endpoints || !path) throw new Error("Permission broker route is unavailable.");
+  const logicalKey = `permission:${route.workflowId}/${route.laneId}:${digest({
+    tool_name: args.tool_name,
+    input: args.input,
+  })}`;
+  const stored = await putMessage(path, {
+    envelope: makeEnvelope({
+      logicalKey,
+      kind: "permission-request",
+      from: endpoints.from,
+      to: endpoints.to,
+      payload: { tool_name: args.tool_name, input: args.input },
+    }),
+  });
+  await enqueueWakeHint(path, {
+    recipient: endpoints.to,
+    occurrenceId: stored.message.occurrence_id,
+  });
+  const released = await releasePermission(path, stored.message.occurrence_id);
+  if (released.released || released.replay)
+    return {
+      content: [{ type: "text", text: JSON.stringify(released.decision) }],
+      details: released,
+    };
+  return pendingToolResult(
+    stored.message,
+    JSON.stringify({
+      behavior: "deny",
+      message: `Permission request ${stored.message.occurrence_id} is pending parent approval.`,
+    }),
+  );
+}
+
+const permissionDefinition = {
+  name: "herdr_permission_prompt",
+  description:
+    `Durably route a Claude permission prompt through ${permissionToolName}; it is deny-by-default until explicitly answered.`,
+  parameters: Type.Object(
+    {
+      tool_name: Type.String({ minLength: 1 }),
+      input: Type.Record(Type.String(), Type.Unknown()),
+    },
+    { additionalProperties: false },
+  ),
+  async execute(_id, args) {
+    return permissionPrompt(args);
+  },
+};
+tools.set(permissionDefinition.name, permissionDefinition);
 
 const ctx = {
   get cwd() {
@@ -130,9 +565,175 @@ function toolDefinition(definition) {
   };
 }
 
+function toolError(text, details) {
+  return {
+    content: [{ type: "text", text }],
+    ...(details === undefined ? {} : { structuredContent: details }),
+    isError: true,
+  };
+}
+
+function outputResult(output) {
+  return {
+    content: output?.content ?? [],
+    ...(output?.details === undefined
+      ? {}
+      : { structuredContent: output.details }),
+    ...(output?.isError ? { isError: true } : {}),
+  };
+}
+
+function requestTimeout(params) {
+  const value = params.timeoutMs ?? params.timeout_ms;
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || value <= 0 || value > 86_400_000)
+    throw new Error("timeoutMs must be a positive integer no greater than 86400000.");
+  return value;
+}
+
+function requestKey(id) {
+  return typeof id === "string" || typeof id === "number" ? String(id) : undefined;
+}
+
+async function callTool(id, params) {
+  if (!isHerdrSession())
+    return toolError(
+      "Herdr Orchestrator tools are available only inside a HERDR_ENV=1 session.",
+    );
+  if (!isRecord(params) || typeof params.name !== "string")
+    throw new Error("tools/call requires a tool name.");
+  const definition = tools.get(params.name);
+  if (!definition) throw new Error(`Unknown tool: ${params.name}`);
+  const args = params.arguments ?? {};
+  if (!isRecord(args)) throw new Error(`Arguments for ${params.name} must be an object.`);
+  // Every harness must see the same validated surface: reject arguments
+  // outside the tool's declared schema before it reaches the shared execute
+  // path, instead of letting the implementation's ad hoc checks decide.
+  if (!Value.Check(definition.parameters, args)) {
+    const issues = [...Value.Errors(definition.parameters, args)]
+      .slice(0, 5)
+      .map((issue) => `${issue.path || "(root)"} ${issue.message}`)
+      .join("; ");
+    return toolError(
+      `Invalid arguments for ${params.name}: ${issues || "schema validation failed"}`,
+    );
+  }
+
+  const controller = new AbortController();
+  const key = requestKey(id);
+  if (key) activeRequests.set(key, { controller, name: params.name });
+  let timedOut = false;
+  let timer;
+  let turn;
+  let entry;
+  try {
+    const timeout = requestTimeout(params);
+    if (timeout)
+      timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeout);
+    turn = await beginMcpTurn(id, controller);
+
+    // A parent answer to a brokered permission request is already durable in
+    // the inbox. It must not be routed through the legacy question ledger.
+    if (params.name === "herdr_question_answer") {
+      const permissionAnswer = await answerPermissionFromBridge(args);
+      if (permissionAnswer) return outputResult(permissionAnswer);
+    }
+
+    entry = await persistBridgeMessage(params.name, args, id);
+    if (entry && !entry.created) {
+      if (entry.message.result !== undefined)
+        return outputResult(entry.message.result);
+      if (entry.message.delivery.status === "uncertain")
+        return pendingToolResult(
+          entry.message,
+          `Tool call ${params.name} is pending review because its previous delivery was uncertain.`,
+        );
+    }
+    const output = await definition.execute(
+      "mcp",
+      args,
+      controller.signal,
+      undefined,
+      lifecycleContext(controller, "active"),
+    );
+    await finishBridgeMessage(entry, output);
+    return outputResult(output);
+  } catch (caught) {
+    const cause = caught instanceof Error ? caught : new Error(String(caught));
+    const uncertain =
+      timedOut ||
+      controller.signal.aborted ||
+      Boolean(caught?.sent) ||
+      /pending|uncertain|timeout|cancel/i.test(cause.message);
+    await failBridgeMessage(entry, cause, uncertain).catch(() => undefined);
+    return toolError(
+      timedOut
+        ? `Tool call ${params.name} timed out and remains pending review.`
+        : controller.signal.aborted
+          ? `Tool call ${params.name} was cancelled and remains pending review.`
+          : cause.message,
+    );
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (key) activeRequests.delete(key);
+    if (turn) {
+      try {
+        await endMcpTurn(turn, controller);
+      } catch (lifecycleError) {
+        // Tool results are already durable; lifecycle failure invalidates the
+        // root idle proof and is intentionally visible in the server log.
+        console.error(
+          `MCP lifecycle settlement failed: ${lifecycleError instanceof Error ? lifecycleError.message : String(lifecycleError)}`,
+        );
+      }
+    }
+  }
+}
+
+async function handleRequest(request) {
+  if (!isRecord(request)) {
+    error(null, -32600, "Invalid JSON-RPC request.");
+    return;
+  }
+  const { id, method, params = {} } = request;
+  if (method === "initialize") {
+    result(id, {
+      protocolVersion: "2024-11-05",
+      capabilities: { tools: {}, cancellation: {} },
+      serverInfo: { name: "herdr-orchestrator", version: "0.1.0" },
+    });
+    return;
+  }
+  if (method === "notifications/initialized") return;
+  if (method === "notifications/cancelled") {
+    const key = requestKey(params?.requestId);
+    const active = key ? activeRequests.get(key) : undefined;
+    if (active) active.controller.abort();
+    return;
+  }
+  if (method === "tools/list") {
+    result(id, {
+      tools: isHerdrSession() ? [...tools.values()].map(toolDefinition) : [],
+    });
+    return;
+  }
+  if (method === "tools/call") {
+    try {
+      result(id, await callTool(id, params));
+    } catch (caught) {
+      error(id, -32602, caught instanceof Error ? caught.message : String(caught));
+    }
+    return;
+  }
+  error(id, -32601, `Unsupported method: ${method}`);
+}
+
 let buffer = "";
 process.stdin.setEncoding("utf8");
-process.stdin.on("data", async (chunk) => {
+process.stdin.on("data", (chunk) => {
   buffer += chunk;
   while (true) {
     const newline = buffer.indexOf("\n");
@@ -147,83 +748,6 @@ process.stdin.on("data", async (chunk) => {
       error(null, -32700, "Invalid JSON-RPC request.");
       continue;
     }
-    const { id, method, params = {} } = request;
-    if (method === "initialize") {
-      result(id, {
-        protocolVersion: "2024-11-05",
-        capabilities: { tools: {} },
-        serverInfo: { name: "herdr-orchestrator", version: "0.1.0" },
-      });
-    } else if (method === "notifications/initialized") {
-      // JSON-RPC notification: intentionally no response.
-    } else if (method === "tools/list") {
-      result(id, {
-        tools: isHerdrSession() ? [...tools.values()].map(toolDefinition) : [],
-      });
-    } else if (method === "tools/call") {
-      if (!isHerdrSession()) {
-        result(id, {
-          content: [
-            {
-              type: "text",
-              text: "Herdr Orchestrator tools are available only inside a HERDR_ENV=1 session.",
-            },
-          ],
-          isError: true,
-        });
-        continue;
-      }
-      const definition = tools.get(params.name);
-      if (!definition) {
-        error(id, -32602, `Unknown tool: ${params.name}`);
-        continue;
-      }
-      const args = params.arguments ?? {};
-      // Every harness must see the same validated surface: reject arguments
-      // outside the tool's declared schema (an out-of-enum action, a missing
-      // required field) before it ever reaches the shared execute path,
-      // instead of letting the implementation's own ad hoc checks decide.
-      if (!Value.Check(definition.parameters, args)) {
-        const issues = [...Value.Errors(definition.parameters, args)]
-          .slice(0, 5)
-          .map((issue) => `${issue.path || "(root)"} ${issue.message}`)
-          .join("; ");
-        result(id, {
-          content: [
-            {
-              type: "text",
-              text: `Invalid arguments for ${params.name}: ${issues || "schema validation failed"}`,
-            },
-          ],
-          isError: true,
-        });
-        continue;
-      }
-      try {
-        const output = await definition.execute(
-          "mcp",
-          args,
-          undefined,
-          undefined,
-          ctx,
-        );
-        result(id, {
-          content: output.content ?? [],
-          structuredContent: output.details,
-        });
-      } catch (caught) {
-        result(id, {
-          content: [
-            {
-              type: "text",
-              text: caught instanceof Error ? caught.message : String(caught),
-            },
-          ],
-          isError: true,
-        });
-      }
-    } else {
-      error(id, -32601, `Unsupported method: ${method}`);
-    }
+    void handleRequest(request);
   }
 });

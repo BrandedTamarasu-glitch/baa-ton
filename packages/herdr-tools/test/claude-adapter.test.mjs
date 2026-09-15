@@ -8,9 +8,8 @@ import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const jiti = require("jiti")(import.meta.url);
-const { claudeLaunchAdapter, CLAUDE_PROVIDER } = await jiti.import(
-  "../claude-launch-adapter.ts",
-);
+const { claudeLaunchAdapter, CLAUDE_PERMISSION_PROMPT_TOOL, CLAUDE_PROVIDER } =
+  await jiti.import("../claude-launch-adapter.ts");
 const { mergeAttestation } = await import("../attest-merge.mjs");
 const here = dirname(fileURLToPath(import.meta.url));
 const helperPath = join(here, "..", "claude-startup-attest.mjs");
@@ -53,9 +52,64 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
       mcp.mcpServers["herdr-orchestrator"].args[0],
       "/bridge/mcp-server.mjs",
     );
+    assert.equal(args.includes("--permission-prompt-tool"), false);
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
+});
+
+test("permission broker launch flag is opt-in and preserves the exact tool name", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "baa-claude-permission-"));
+  try {
+    const adapter = claudeLaunchAdapter({
+      bridge: "/bridge/mcp-server.mjs",
+      attestHelper: "/bridge/claude-startup-attest.mjs",
+      scratchDirectory: scratch,
+      permissionPromptTool: CLAUDE_PERMISSION_PROMPT_TOOL,
+    });
+    const args = adapter.launchArguments(profile);
+    const flag = args.indexOf("--permission-prompt-tool");
+    assert.equal(
+      args.slice(flag, flag + 2).join(" "),
+      `--permission-prompt-tool ${CLAUDE_PERMISSION_PROMPT_TOOL}`,
+    );
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("permission broker can be enabled by an explicit default-off environment opt-in", () => {
+  const previous = process.env.BAA_CLAUDE_PERMISSION_PROMPT_TOOL;
+  process.env.BAA_CLAUDE_PERMISSION_PROMPT_TOOL = "1";
+  try {
+    const adapter = claudeLaunchAdapter({
+      bridge: "/b.js",
+      attestHelper: "/a.js",
+      scratchDirectory: "/tmp",
+    });
+    const args = adapter.launchArguments(profile);
+    assert.deepEqual(
+      args.slice(
+        args.indexOf("--permission-prompt-tool"),
+        args.indexOf("--permission-prompt-tool") + 2,
+      ),
+      ["--permission-prompt-tool", CLAUDE_PERMISSION_PROMPT_TOOL],
+    );
+  } finally {
+    if (previous === undefined)
+      delete process.env.BAA_CLAUDE_PERMISSION_PROMPT_TOOL;
+    else process.env.BAA_CLAUDE_PERMISSION_PROMPT_TOOL = previous;
+  }
+});
+
+test("permission broker rejects an empty opt-in value", () => {
+  const adapter = claudeLaunchAdapter({
+    bridge: "/b.js",
+    attestHelper: "/a.js",
+    scratchDirectory: "/tmp",
+    permissionPromptTool: " ",
+  });
+  assert.throws(() => adapter.launchArguments(profile), /non-empty string/);
 });
 
 test("preflight rejects foreign providers", () => {
