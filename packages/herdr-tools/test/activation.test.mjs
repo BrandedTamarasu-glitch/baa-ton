@@ -12,10 +12,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { activateTask } from "../activate-task.mjs";
-import {
-  handleActivation,
-  acknowledgeActivation,
-} from "../../controller/activation.mjs";
+import { handleActivation } from "../../controller/activation.mjs";
+import { acknowledgeActivation } from "../activation-ack.mjs";
 
 test("authorized isolated task migration preserves other mappings and is idempotent", async () => {
   const directory = await mkdtemp(join(tmpdir(), "baa-activation-"));

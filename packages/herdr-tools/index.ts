@@ -28,7 +28,7 @@ import {
   type NativeSessionRef,
 } from "./harness-adapter.js";
 import { fileURLToPath } from "node:url";
-import { acknowledgeActivation } from "../controller/activation.mjs";
+import { acknowledgeActivation } from "./activation-ack.mjs";
 
 const MANIFEST_DIR = ".pi/herdr-orchestrator";
 const MANIFEST_NAME = "manifest.json";
