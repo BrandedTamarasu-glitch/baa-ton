@@ -41,6 +41,34 @@ Verified before activation: extension smoke + **18/18 extension tests**, **28/28
 - Environmental finding: smoke-check misbehaves when `BAA_STARTUP_INTENT` is inherited (lane ran `env -u BAA_STARTUP_INTENT npm test`); follow-up guard/neutralization recommended.
 - Workflow `herdr-f3afd260` left `completion-reported`/open; lane tab idle and reusable. Parent acknowledgment/closure is an explicit decision.
 
+## Verification run (2026-09-15, `astra_verifier` gpt-6-astra/high) — findings and dispositions
+
+Independent verifier executed a four-phase plan from a non-root pane (`w17:p3`, manually started; tab since closed). Full findings and how each was resolved:
+
+| Finding | Disposition | Evidence |
+| --- | --- | --- |
+| Phase 1 “FAIL baseline”: HEAD `4f8b386` ≠ expected `cb6baa9`; four activation files modified | Explained, no defect — stale prompt (symlink-fix commit landed after the prompt was written) plus post-commit formatter churn, committed separately as `39ce443`/`efcc68f` | Tests 48/48 green in verifier's own run |
+| Phase 2 partial: activation journal shows **manual** acknowledgement, not automatic | Known design gap, documented below: `session_start` hook does not fire on `/reload`, so the automatic ack path never runs | `activation-ack.mjs` exists (moved in `4f8b386` to keep the extension self-contained across its symlink); the reload-ack trigger remains open work |
+| Phase 2: `pane current --current` returned the verifier, not the root | Correct behavior — caller context; prompt ambiguity, not a defect | — |
+| Phase 3 delegation smoke **blocked**: `Only the verified controller-mapped root may create or update the parent goal` | **System working as designed.** Root-only delegation gating refused a non-root pane; verifier correctly refused to impersonate `w17:p1`. The earlier live dispatch (`herdr-f3afd260`) remains the Phase-3 evidence | Manifest ledger; verifier report |
+| Phase 4 fail-closed proofs blocked live | Completed afterward **from root**: `herdr-f8973cb0` (thinking `high` on Luna) and `herdr-59b80276` (`agentKind claude`) both rejected before any topology mutation | Manifest `dispatch-error` evidence; topology stayed 3 tabs |
+| Post-review reversal: thinking `high` on `gpt-5.6-luna` actually **works** (live probe: Pi accepted it and the backend served a turn at `high`) | Validation semantics corrected in `572f4bd`: only explicit-null catalog entries reject; absent levels are trusted to runtime attestation | Probe pane `w17:p5` (closed); regression tests updated |
+
+### Live lessons consolidated
+
+1. **Extensions must be self-contained across their symlink.** Relative imports that leave the extension package fail when Pi loads via `~/.pi/agent/extensions/<name>` (fix: `4f8b386`, `activation-ack.mjs` moved in-package).
+2. **Shell-init race:** zshrc's synchronous `pyenv init -` leaves a new pane non-startable for ~1–3s; `agent start` correctly fail-fasts. Fixed by gating on the native `pane process-info` readiness signal (`d4104cd`). Upstream suggestion for Herdr: a native `agent start --wait-for-shell` / `tab create --wait-ready` flag.
+3. **Catalog maps are UI enumerations, not support boundaries** (thinking-level semantics above).
+4. **Event-driven monitoring is the contract:** lanes' completion reaches the root through the controller's durable wake (dedup + retry), as happened for `herdr-f3afd260`. Root-side blocking waits (`agent wait`) are redundant and abort on user input — do not use them as the monitoring path.
+5. **Environment quirk:** smoke-check misbehaves when a lane inherits `BAA_STARTUP_INTENT`; lanes must run `env -u BAA_STARTUP_INTENT npm test` (hardening remains open work).
+
+### Open items (tracked for delegated follow-up)
+
+- Reload-ack mechanism (ack on `/reload` rather than `session_start`)
+- smoke-check hardening against inherited startup-intent env
+- Herdr upstream request: native shell-readiness wait flag
+- Paseo-pattern contract evolution (in flight: workflow `herdr-fc6d2a3e`, items 1–2)
+
 ## Remaining work
 
 Broader durable-core integration (neutral domain types, durable inbox/outbox, incarnation recovery, MCP/CLI validation/timeouts), real Codex/Claude adapter qualification, reload-ack mechanism, smoke-check startup-env hardening. Delegate via Herdr plan/dispatch in w17 with disjoint ownership and acceptance contracts.
