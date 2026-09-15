@@ -160,6 +160,12 @@ async function fixture(options = {}) {
           throw new Error("agent_pane_busy");
         }
         if (options.busyAlways) throw new Error("agent_pane_busy");
+        if (options.notReadyOnce) {
+          options.notReadyOnce = false;
+          throw new Error(
+            "agent_not_ready: agent is blocked during startup and is not ready for prompts",
+          );
+        }
         const intent = JSON.parse(await readFile(p.intentPath, "utf8"));
         const hello = {
           nonce: intent.nonce,
@@ -220,6 +226,7 @@ async function fixture(options = {}) {
       state = value;
     },
     calls,
+    panes,
     ctx,
     ports,
     run: () => dispatchTask(structuredClone(state), true, ports),
@@ -488,5 +495,42 @@ test("claude adapter dispatches through unchanged sequencing with its own attest
   } finally {
     await f.close();
     await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("startup-blocked lane is adopted on retry once its attestation appears", async () => {
+  const f = await fixture({ notReadyOnce: true });
+  try {
+    await assert.rejects(f.run(), /agent_not_ready/);
+    assert.equal(f.calls.some((c) => c[1] === "prompt"), false);
+    // Operator unblocks the harness; its SessionStart hook writes the
+    // attestation for the blocked lane and its native session appears.
+    const blocked = f.state.lanes[0];
+    const pane = [...f.panes.values()].find(
+      (p) => p.paneId === blocked.paneId,
+    );
+    const intent = JSON.parse(
+      await readFile(blocked.startupIntentPath, "utf8"),
+    );
+    pane.session = `/sessions/${pane.paneId}.jsonl`;
+    await writeFile(
+      `${blocked.startupIntentPath}.ready`,
+      JSON.stringify({
+        nonce: intent.nonce,
+        paneId: pane.paneId,
+        workspaceId: "task-space",
+        source: f.ports.source,
+        profile: { ...profile },
+        sessionPath: pane.session,
+        tools: ["herdr_complete", "herdr_plan", "herdr_dispatch"],
+      }),
+    );
+    assert.equal((await f.run()).dispatched, true);
+    // One blocked attempt plus one fresh start for the untouched lane.
+    assert.equal(f.calls.filter((c) => c[1] === "start").length, 2);
+    assert.equal(f.calls.filter((c) => c[1] === "prompt").length, 2);
+    assert.equal(f.state.ownership.paneIds.length, 2);
+  } finally {
+    await f.close();
   }
 });

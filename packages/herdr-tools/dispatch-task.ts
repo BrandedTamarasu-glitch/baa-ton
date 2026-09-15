@@ -224,50 +224,67 @@ export async function dispatchTask(
       );
       stage = "agent-start";
       if (!lane.agentStartedAt) {
-        if (lane.agentStartAttemptedAt)
-          throw new Error(
-            "Agent start response was lost; verify its incarnation through recovery before retrying.",
-          );
-        await update((w) => {
-          w.lanes[i].agentStartAttemptedAt = new Date().toISOString();
-        });
-        await waitForShellReady(port, lane.paneId!, signal);
-        for (let attempt = 0; ; attempt++) {
-          try {
-            await port.run(
-              [
-                "agent",
-                "start",
-                lane.agentName!,
-                "--kind",
-                lane.agentKind,
-                "--pane",
-                lane.paneId!,
-                "--timeout",
-                "60000",
-                "--",
-                ...adapters[i].launchArguments(profile, port.source),
-              ],
-              signal,
-              65_000,
+        if (lane.agentStartAttemptedAt) {
+          // A previous start was rejected mid-startup (e.g. the harness paused
+          // on a first-run dialog) or its response was lost. Adopt it only when
+          // the startup attestation now exists and matches this lane's intent
+          // nonce; the full startup-proof verification below still fences any
+          // unrelated occupant. Otherwise the outcome is genuinely uncertain.
+          const recovered = await readFile(
+            `${lane.startupIntentPath}.ready`,
+            "utf8",
+          )
+            .then((text) => JSON.parse(text))
+            .catch(() => null);
+          if (!recovered || recovered.nonce !== lane.startupNonce)
+            throw new Error(
+              "Agent start outcome is uncertain and unattested; inspect the pane and reconcile before retrying dispatch.",
             );
-            break;
-          } catch (error) {
-            // Native busy rejection is before launch, unlike timeout after submission.
-            if (attempt < 2 && /agent_pane_busy/.test(String(error))) {
-              await delay(port.busyRetryDelayMs ?? 1_500, { signal });
-              continue;
+          await update((w) => {
+            w.lanes[i].agentStartedAt = new Date().toISOString();
+          });
+        } else {
+          await update((w) => {
+            w.lanes[i].agentStartAttemptedAt = new Date().toISOString();
+          });
+          await waitForShellReady(port, lane.paneId!, signal);
+          for (let attempt = 0; ; attempt++) {
+            try {
+              await port.run(
+                [
+                  "agent",
+                  "start",
+                  lane.agentName!,
+                  "--kind",
+                  lane.agentKind,
+                  "--pane",
+                  lane.paneId!,
+                  "--timeout",
+                  "60000",
+                  "--",
+                  ...adapters[i].launchArguments(profile, port.source),
+                ],
+                signal,
+                65_000,
+              );
+              break;
+            } catch (error) {
+              // Native busy rejection is before launch, unlike timeout after submission.
+              if (attempt < 2 && /agent_pane_busy/.test(String(error))) {
+                await delay(port.busyRetryDelayMs ?? 1_500, { signal });
+                continue;
+              }
+              if (/agent_pane_busy/.test(String(error)))
+                await update((w) => {
+                  delete w.lanes[i].agentStartAttemptedAt;
+                });
+              throw error;
             }
-            if (/agent_pane_busy/.test(String(error)))
-              await update((w) => {
-                delete w.lanes[i].agentStartAttemptedAt;
-              });
-            throw error;
           }
+          await update((w) => {
+            w.lanes[i].agentStartedAt = new Date().toISOString();
+          });
         }
-        await update((w) => {
-          w.lanes[i].agentStartedAt = new Date().toISOString();
-        });
       }
       stage = "startup-proof";
       lane = workflow.lanes[i];

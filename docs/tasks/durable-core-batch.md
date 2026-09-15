@@ -26,33 +26,43 @@ Work ONLY in: /Users/zchristmas/.herdr/worktrees/baa-ton/astra-supervisor-nudge-
 ## Work items (audit implementation order — this sequence is deliberate)
 
 ### 1. P0 — Single transactional state owner
+
 Replace the aggregate read-modify-write manifest pattern with one transactional store: every mutation goes through a single revision/operation-ID mechanism (SQLite via node:sqlite is acceptable; the requirement is one transaction contract, not a particular database). No long transaction across terminal/network calls — persist intent, perform effect, reconcile in a second conditional transaction. Migrate the existing manifest format with an explicit, idempotent migration. Convert the audit's concurrent-writer and pause-overwrite probes into corrected-behavior regressions.
 
 ### 2. P0 — Transport uncertainty cannot duplicate prompts
+
 In `packages/controller/controller.mjs`, distinguish pre-send rejection from post-send uncertainty (`socket_timeout` after submission is NOT nondelivery). Add durable operation IDs so prompt retries are idempotent. Convert the lost-socket-response probe into a regression proving one logical delivery despite lost replies.
 
 ### 3. P1 — Unified durable inbox/outbox
+
 One durable message substrate for completion, questions, answers, lifecycle events, and supervisor wakes (today these are several incompatible implementations — audit finding with sources listed). Persist before notifying; separate stored/notified/received/acknowledged/resolved states; a notification is a coalesced wake hint, not the only copy. Adoption reference for the wire format: the `herdr-link/1` envelope protocol (github.com/LZHcode1986/herdr-link, PROTOCOL.md — adapter-resolved sender identity, workspace-scoped authorization) — reuse the envelope shape rather than inventing a fourth format; keep OUR durability semantics, which herdr-link deliberately lacks. Convert the retry-dedup and pending-drain probes into regressions.
 
 ### 4. P1 — Occurrence-aware events + pending reconciler
+
 Controller event identity currently hashes normalized event data, so genuine repeated statuses (`blocked → working → blocked`) collapse permanently. Use occurrence-aware identity (state_change_seq or equivalent), and add an event-driven pending-outbox reconciler that drains pending deliveries when the root becomes ready (today pending events retry only if an identical hook recurs, and action-required goals are excluded). Convert both probes into regressions.
 
 ### 5. P1 — Scoped lane goals, focus-independent completion
+
 Goals are parent-only today; `observe()` marks workflows completed when agents are `done`, but native `done` means "idle and unseen," not success — display focus changes it. Add goal IDs, revisions, dependency edges, scoped ownership (lanes own their subgoals; only the authorized root/user holds broader authority), and explicit outcomes independent of terminal attention state.
 
 ### 6. P1 — MCP bridge behavioral parity
+
 `packages/herdr-tools/mcp-server.mjs` currently: ignores `on()` lifecycle handlers, omits schema validation of tool arguments, and drops timeout/cancellation. Bring the bridge to behavioral parity with the Pi extension path: validated/cancellable MCP transport, lifecycle-equivalent state, and the existing harness-neutral orchestration API. The audit probe "MCP argument validation" (out-of-enum action accepted) must become a rejection regression.
 
 ### 7. P1 — Per-lane launch profiles
+
 The workflow schema carries one launch profile for all lanes. Extend the schema (versioned) so each lane may declare its own provider/model/thinking/auth profile; the dispatcher already validates per-adapter, so wire per-lane profiles through `dispatch-task.ts`. Do not weaken: exact model, subscription-auth, startup attestation.
 
 ### 8. P1 — Automated authorized incarnation rebind
+
 Today a mismatched native session on a lane fails closed (correct) but recovery is manual. Implement the audit's recovery contract for the authorized case: a restart initiated through the orchestrator rebinds the lane to the new incarnation automatically, while an unrelated process in the same pane never acquires authority. Live-evidence docs must show both directions.
 
 ### 9. P2 — Installation doctor
+
 Add an idempotent `doctor`/preflight tool that verifies: extension/controller source consistency, plugin enablement, routing registration, adapter registry and capability matrix, manifest store version/migrations, and native Herdr connectivity — machine-readable output, no mutation.
 
 ### 10. Tracked smalls
+
 - Reload-acknowledgement mechanism: the activation ack currently can never fire because `session_start` does not run on `/reload`; ack should happen on the reload path (see `docs/native-prerequisite-progress.md` verification section).
 - Smoke-check hardening: `smoke-check.mjs` must tolerate an inherited `BAA_STARTUP_INTENT` instead of requiring `env -u` at the call site.
 
