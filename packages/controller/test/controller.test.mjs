@@ -678,6 +678,69 @@ test("protocol-22 named Pi root accepts agent kind events while serializing dupl
   }
 });
 
+test("a genuine repeated status (blocked -> working -> blocked) wakes twice, while an exact repeat still dedupes", async () => {
+  const fixture = await createFixture({ piGoalPauseDetection: false });
+  const prompts = [];
+  const mock = await startHerdrMock(async (request) => {
+    if (request.method === "agent.get") return rootAgentInfo();
+    if (request.method === "agent.prompt") {
+      prompts.push(request.params.target);
+      return { result: { type: "agent_prompted", agent: { name: ROOT.target } } };
+    }
+    throw new Error(`Unexpected method: ${request.method}`);
+  });
+  try {
+    const first = await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("blocked"),
+      stateDir: fixture.stateDir,
+      herdr: client(mock),
+    });
+    assert.equal(first.record.wake.status, "delivered");
+    const working = await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("working"),
+      stateDir: fixture.stateDir,
+      herdr: client(mock),
+    });
+    assert.equal(working.record.classification, "unclassified");
+    assert.equal(working.record.wake.status, "not-required");
+    const second = await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("blocked"),
+      stateDir: fixture.stateDir,
+      herdr: client(mock),
+    });
+    assert.equal(
+      second.deduplicated,
+      false,
+      "a real second blocker is not the same occurrence as the first",
+    );
+    assert.equal(second.record.wake.status, "delivered");
+    assert.notEqual(
+      second.record.identity,
+      first.record.identity,
+      "each genuine transition gets a distinct durable identity",
+    );
+    const repeat = await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("blocked"),
+      stateDir: fixture.stateDir,
+      herdr: client(mock),
+    });
+    assert.equal(repeat.deduplicated, true);
+    assert.equal(repeat.record.identity, second.record.identity);
+    assert.deepEqual(prompts, [ROOT.target, ROOT.target]);
+    const manifest = await fixture.manifest();
+    const events = manifest.workflows[0].eventController.events;
+    assert.equal(events.length, 3, "blocked, working, and blocked are three durable transitions");
+    assert.equal(manifest.parentGoal, undefined);
+  } finally {
+    await mock.close();
+    await fixture.cleanup();
+  }
+});
+
 test("a new actionable lane event advances the thin parent goal once", async () => {
   const fixture = await createFixture({
     parentGoal: {
@@ -1648,6 +1711,74 @@ test("an unavailable root leaves a durable pending event that an identical hook 
       "a retry updates the existing durable event record",
     );
     assert.equal(events[0].wake.attempts, 2);
+  } finally {
+    await mock.close();
+    await fixture.cleanup();
+  }
+});
+
+test("a supervisor tick drains a pending lane wake once the root is ready, even while the goal is action-required", async () => {
+  const fixture = await createFixture({ parentGoal: dueParentGoal() });
+  let rootAvailable = false;
+  const mock = await startHerdrMock((request) => {
+    if (request.method === "agent.get")
+      return rootAvailable
+        ? rootAgentInfo()
+        : { error: { code: "agent_not_found", message: "root is gone" } };
+    if (request.method === "agent.prompt")
+      return {
+        result: { type: "agent_prompted", agent: { name: ROOT.target } },
+      };
+    if (request.method === "pane.report_metadata") return { result: {} };
+    throw new Error(`Unexpected method: ${request.method}`);
+  });
+  try {
+    const pending = await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("blocked"),
+      stateDir: fixture.stateDir,
+      herdr: client(mock),
+    });
+    assert.equal(pending.record.wake.status, "pending");
+    const afterHook = (await fixture.manifest()).parentGoal;
+    assert.equal(
+      afterHook.status,
+      "action-required",
+      "an undelivered actionable event marks the goal action-required",
+    );
+
+    rootAvailable = true;
+    // No new hook recurs for this pane; only the root becoming ready again
+    // and a routine tick should be needed to recover the pending wake, even
+    // though the supervisor itself skips an action-required goal.
+    const tick = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: client(mock),
+      timestamp: "2026-09-14T00:05:00.000Z",
+    });
+    assert.equal(tick.results[0].status, "not-active");
+    assert.deepEqual(tick.pendingWakes, [
+      {
+        manifestPath: fixture.manifestPath,
+        workflowId: "herdr-bb029",
+        laneId: CHILD.lane_id,
+        status: "delivered",
+      },
+    ]);
+    assert.equal(requestsFor(mock, "agent.prompt").length, 1);
+    const manifest = await fixture.manifest();
+    const events = manifest.workflows[0].eventController.events;
+    assert.equal(events.length, 1);
+    assert.equal(events[0].wake.status, "delivered");
+    assert.equal(events[0].wake.attempts, 2);
+
+    // A second tick must not redeliver an already-drained wake.
+    await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: client(mock),
+      timestamp: "2026-09-14T00:10:00.000Z",
+    });
+    assert.equal(requestsFor(mock, "agent.prompt").length, 1);
   } finally {
     await mock.close();
     await fixture.cleanup();

@@ -1292,6 +1292,7 @@ export async function runSupervisorTick({
   const config = await loadConfig(configDir);
   const api = herdr ?? new JsonLineHerdrClient();
   const results = [];
+  const pendingWakes = [];
   const seenManifests = new Set();
   for (const entry of configuredParentManifests(config)) {
     const { orchestrator, manifestPath, workflows } = entry;
@@ -1306,12 +1307,51 @@ export async function runSupervisorTick({
       );
       // Do not schedule against an unowned or stale registration merely because
       // it shares a manifest with a valid workflow in this orchestrator.
-      for (const candidate of workflows)
+      const matchedWorkflows = workflows.map((candidate) =>
         validateMappedWorkflow(
           manifest,
           { workflow: candidate, lane: candidate.lanes[0] },
           config.owner,
+        ),
+      );
+      // Event-driven pending-outbox reconciliation. A lane wake that could
+      // not be delivered earlier (root busy or unavailable) previously
+      // retried only if an identical hook happened to recur later, and was
+      // never attempted while the parent goal sat in "action-required",
+      // which an undelivered actionable event usually causes in the first
+      // place. This tick is the event-driven recovery point (it fires on
+      // every hook/interval), so drain independently of parent-goal status.
+      // Each deliverWake call still makes its own live root-availability
+      // check and is a no-op unless the root actually accepts the prompt.
+      let pendingChanged = false;
+      for (const stored of matchedWorkflows) {
+        if (!("eventController" in stored)) continue;
+        const pendingRecords = stored.eventController.events.filter(
+          (record) =>
+            ACTIONABLE_CLASSIFICATIONS.has(record.classification) &&
+            record.wake?.status === "pending",
         );
+        for (const record of pendingRecords) {
+          record.wake = {
+            ...record.wake,
+            status: "sending",
+            attempts: Number.isSafeInteger(record.wake.attempts)
+              ? record.wake.attempts + 1
+              : 1,
+            updated_at: timestamp,
+          };
+          const outcome = await deliverWake(record, orchestrator.root, api);
+          record.wake = { ...record.wake, ...outcome, updated_at: timestamp };
+          pendingChanged = true;
+          pendingWakes.push({
+            manifestPath,
+            workflowId: stored.id,
+            laneId: record.lane_id,
+            status: outcome.status,
+          });
+        }
+      }
+      if (pendingChanged) await atomicWriteJson(manifestPath, manifest);
       if (!("parentGoal" in manifest)) {
         results.push({ manifestPath, status: "no-parent-goal" });
         continue;
@@ -1440,13 +1480,10 @@ export async function runSupervisorTick({
       await release();
     }
   }
-  return { accepted: true, results };
+  return { accepted: true, results, pendingWakes };
 }
 
-function newRecord(event, mapping, classification) {
-  const identity = sha256(
-    canonicalJson({ event: event.event, data: event.data }),
-  );
+function newRecord(event, mapping, classification, identity) {
   return {
     identity,
     received_at: now(),
@@ -1585,14 +1622,46 @@ export async function handleHook({
     );
     const workflow = validateMappedWorkflow(manifest, mapping, config.owner);
     const ledger = ensureLedger(workflow);
-    const identity = sha256(
-      canonicalJson({ event: event.event, data: event.data }),
-    );
-    let record = ledger.events.find((entry) => entry.identity === identity);
+    // Native protocol 22's pane_agent_status_changed payload carries no
+    // occurrence/state_change_seq field (unlike pane_output_changed, whose
+    // `revision` already makes its content hash occurrence-aware). Hashing
+    // status content alone collapses a genuine repeat transition (blocked ->
+    // working -> blocked) into the first occurrence's identity forever.
+    // Fence occurrences from our own ordered, durable delivery history
+    // instead of inventing an unsupported hook field: a status hook is only
+    // a "repeat" of the most recently recorded transition for that exact
+    // pane if the reported status actually matches it.
+    const priorPaneTransitions =
+      event.data.type === "pane_agent_status_changed"
+        ? ledger.events.filter(
+            (entry) =>
+              entry.pane_id === event.data.pane_id &&
+              entry.event === event.event,
+          )
+        : [];
+    const previousTransition = priorPaneTransitions.at(-1);
+    const isRepeatStatus =
+      Boolean(previousTransition) &&
+      previousTransition.source?.agent_status === event.data.agent_status;
+    const identity =
+      event.data.type === "pane_agent_status_changed"
+        ? sha256(
+            canonicalJson({
+              event: event.event,
+              data: event.data,
+              occurrence: isRepeatStatus
+                ? priorPaneTransitions.length - 1
+                : priorPaneTransitions.length,
+            }),
+          )
+        : sha256(canonicalJson({ event: event.event, data: event.data }));
+    let record = isRepeatStatus
+      ? previousTransition
+      : ledger.events.find((entry) => entry.identity === identity);
     const created = !record;
     if (!record) {
       const classification = await classifyEvent(event, mapping, api);
-      record = newRecord(event, mapping, classification);
+      record = newRecord(event, mapping, classification, identity);
       ledger.events.push(record);
       signalParentGoal(manifest, record);
       await atomicWriteJson(mapping.workflow.manifest_path, manifest);
