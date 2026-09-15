@@ -303,10 +303,8 @@ test("uncertain assignment retry does not type a second prompt or create replace
     await f.close();
   }
 });
-test("thinking high fails closed when absent from the installed model map", async () => {
-  const f = await fixture({
-    thinkingLevelMap: { minimal: "minimal", xhigh: "xhigh", max: "max" },
-  });
+test("explicitly unsupported thinking level fails closed before topology", async () => {
+  const f = await fixture({ thinkingLevelMap: { high: null } });
   try {
     await assert.rejects(f.run(), /Thinking level high is unsupported/);
     assert.equal(f.calls.length, 0);
@@ -316,9 +314,10 @@ test("thinking high fails closed when absent from the installed model map", asyn
   }
 });
 
-test("thinking xhigh still dispatches with the minimal/xhigh/max model map", async () => {
+test("absent thinking level dispatches under runtime attestation", async () => {
+  // Live-proven 2026-09-15: gpt-5.6-luna served a turn at "high" though its
+  // catalog map lacks the entry. Only explicit null declares unsupported.
   const f = await fixture({
-    profile: { ...profile, thinking: "xhigh" },
     thinkingLevelMap: { minimal: "minimal", xhigh: "xhigh", max: "max" },
   });
   try {

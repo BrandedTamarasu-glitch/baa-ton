@@ -15,12 +15,18 @@ export function verifyAvailableProfile(
     throw new Error(
       `Exact installed model not found: ${profile.provider}/${profile.model}.`,
     );
+  // Empirically settled by a 2026-09-15 live probe: Pi and the backend
+  // accept thinking levels absent from the catalog map (gpt-5.6-luna served
+  // a turn at "high" though its map lists only minimal/xhigh/max). The map is
+  // an enumeration for UI cycling, not a support boundary. Only an explicit
+  // null entry declares a level unsupported; absent levels are trusted to
+  // runtime attestation, which fails the startup handshake unless the session
+  // actually reports the requested level.
   const map = model.thinkingLevelMap;
-  const hasThinkingLevel =
-    map != null &&
-    Object.hasOwn(map, profile.thinking) &&
-    map[profile.thinking] != null;
-  if ((!model.reasoning && profile.thinking !== "off") || !hasThinkingLevel)
+  if (
+    (!model.reasoning && profile.thinking !== "off") ||
+    map?.[profile.thinking] === null
+  )
     throw new Error(
       `Thinking level ${profile.thinking} is unsupported by ${profile.model}.`,
     );

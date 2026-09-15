@@ -33,7 +33,7 @@ Verified before activation: extension smoke + **18/18 extension tests**, **28/28
 
 ## First live Luna dispatch (2026-09-15)
 
-- `gpt-5.6-luna` supports only `minimal`/`xhigh`/`max` thinking (installed registry); `high` would have passed old validation — this motivated the delegated fix.
+- Catalog note (corrected 2026-09-15 by live probe): `gpt-5.6-luna`'s `thinkingLevelMap` lists only `minimal`/`xhigh`/`max`, but Pi and the backend accepted and served a turn at `high` in a probe pane. The map is a UI enumeration, not a support boundary; validation now rejects only explicit-null entries and trusts absent levels to runtime attestation. The original delegated fix (fail-closed on absent) was superseded by this evidence.
 - MCP bridge (`mcp-server.mjs`) now constructs the real installed `ModelRegistry` (absolute-path import; package `exports` blocks subpaths) so preflight validates real catalog/auth. All 10 `herdr_*` tools verified live via bridge.
 - Planned `herdr-f3afd260` (BB-029 scope, capabilities: local-herdr-topology, foreground-tests, durable-ledger, observe-retry-review), profile `openai-codex/gpt-5.6-luna/xhigh/subscription`.
 - Dispatch: lane tab `w17:t2`/pane `w17:p2` created in task workspace only; first `agent start` hit `agent_pane_busy` (shell-init race) and retry reused the same pane — no duplicate topology; startup proof (workspace, native session, profile, tools) verified before assignment.
