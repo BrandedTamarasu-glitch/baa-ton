@@ -23,6 +23,22 @@ Unregistered adapters fail before topology mutation. The synthetic Codex test is
 
 `launch-profile.ts` validates common shape only; provider qualification belongs to the adapter. Subscription-only auth is the current policy, not an automatic fallback. The present workflow schema uses one profile per workflow; heterogeneous profiles require a versioned per-lane schema extension.
 
+## Prior art: Paseo provider layer (design basis for contract evolution)
+
+Surveyed 2026-09-15 from `getpaseo/paseo` (`packages/server/src/server/agent/agent-sdk-types.ts`, `providers/acp-agent.ts`, `agent/tools/types.ts`; local clone under `/tmp/pi-github-repos/`). Paseo orchestrates Claude Code, Codex, OpenCode, Copilot, and Pi behind one provider layer. Adoptable patterns, mapped to our gaps:
+
+1. **Central injected tool catalog** (`PaseoToolCatalog`): orchestration tools are defined once and injected into every harness; MCP is one transport. They never depend on harness-native tool names — our core currently checks literal `herdr_*` strings and must move to protocol operations owned by the contract.
+2. **Open capability map**: `[capability: string]: boolean` with required flags (`supportsStreaming`, `supportsSessionPersistence`, `supportsMcpServers`, `supportsReasoningStream`, `supportsToolInvocations`, `supportsDynamicModes`) plus optional/custom flags. Extensible without contract version bumps; covers the whole lifecycle, not just launch.
+3. **Neutral contract module** (`agent-sdk-types.ts`): domain types live outside any harness entrypoint. Our `Workflow`/`Lane` still live in the Pi extension `index.ts` and must move to a neutral core module.
+4. **Live capability discovery** (`fetchCatalog`): models + modes + `thinkingOptions[]` are discovered from the live provider runtime with documented cache-key identity, not trusted from a static registry. Matches our Luna-at-`high` finding: the catalog map is a UI enumeration, not a support boundary.
+5. **Normalized event seam**: timeline items (`prompt`/`text`/`thinking`/`tool-execution`/`failure`) and a normalized permission request/response flow. This is the seam our question routing and completion still lack.
+6. **ACP tier**: any harness speaking Agent Client Protocol (agentclientprotocol.com) works through one generic adapter — the long tail for free; native adapters only where depth is needed.
+7. **Generalized persistence handle**: `{provider, sessionId, nativeHandle?, metadata?}` — a superset of our `NativeSessionRef {kind, value}`.
+
+Deliberately NOT copied: Paseo's daemon owns process spawning and transports. We run inside Herdr's native agent management; our adapters stay thin (launch arguments + startup attestation). Borrow the contract shapes, not the runtime.
+
+Near-term (this contract): items 1–2. Medium-term: 3–4. The event seam (5) is the bulk of remaining durable-core work; ACP (6) is a future harness tier.
+
 ## Remaining core work
 
 This is the dispatch boundary, not a completed multi-harness product. Domain types still live in the Pi entrypoint and need moving to a neutral core module. Goal/decision/completion adapters, durable inbox recovery, MCP/CLI validation, and real Codex/Claude qualification remain delegated-core work. New adapters must reuse those shared state transitions rather than implement independent persistence, retry, or routing engines.
