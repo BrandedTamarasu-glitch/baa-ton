@@ -101,6 +101,11 @@ export function opencodeLaunchAdapter(
       supportsNativeSessionIdentity: true,
     },
     lifecycle: "screen",
+    // OpenCode creates its native session lazily, so the dispatcher must
+    // submit the first turn that causes the attest plugin and MCP bridge to
+    // initialize. Keep this exact text stable: it is deliberately not an
+    // assignment or a harness-specific wrapper.
+    startupHandshake: "Reply with exactly: READY",
     attestationComplete: (attestation: unknown): boolean => {
       const hello = attestation as {
         sessionId?: unknown;

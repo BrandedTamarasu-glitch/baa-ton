@@ -137,6 +137,7 @@ const mutationKinds = new Map([
   ["herdr_goal", "goal"],
   ["herdr_question_answer", "answer"],
   ["herdr_complete", "completion"],
+  ["herdr_operator_close", "lifecycle"],
   ["herdr_plan", "lifecycle"],
   ["herdr_dispatch", "lifecycle"],
   ["herdr_resume", "lifecycle"],

@@ -46,6 +46,10 @@ export interface HarnessLaunchAdapter {
   /** Honest lifecycle reporting: native, screen-derived, or unavailable. */
   lifecycle: HarnessLifecycle;
   preflight(profile: LaunchProfile): void | Promise<void>;
+  /** Optional first turn needed to materialize lazy harness sessions. The
+   * dispatcher submits this exact text after the native agent starts, with
+   * the same durable terminal-input fence as assignment prompts. */
+  startupHandshake?: string;
   /** Optional: when the harness's attestation is assembled from multiple
    * writers, reports whether it is complete enough to verify (identity plus
    * tool/operation evidence). Default: any parseable attestation. */

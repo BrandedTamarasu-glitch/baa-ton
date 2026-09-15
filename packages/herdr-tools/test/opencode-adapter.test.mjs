@@ -22,6 +22,7 @@ test("opencode adapter generates project config, plugin, and model mapping", asy
   const scratch = join(root, ".pi", "herdr-orchestrator");
   try {
     const adapter = opencodeLaunchAdapter({ scratchDirectory: scratch });
+    assert.equal(adapter.startupHandshake, "Reply with exactly: READY");
     adapter.preflight(profile);
     const args = adapter.launchArguments(
       profile,

@@ -261,6 +261,8 @@ export async function dispatchTask(
           delete current.agentStartAttemptedAt;
           delete current.startupIntentPath;
           delete current.startupNonce;
+          delete current.startupHandshakeAttemptedAt;
+          delete current.startupHandshakeSentAt;
           delete current.promptAttemptedAt;
           delete current.promptedAt;
           delete current.nativeSession;
@@ -537,6 +539,25 @@ export async function dispatchTask(
             w.lanes[i].agentStartedAt = new Date().toISOString();
           });
         }
+      }
+      const startupHandshake = adapters[i].startupHandshake;
+      if (startupHandshake !== undefined && !lane.startupHandshakeSentAt) {
+        if (lane.startupHandshakeAttemptedAt)
+          throw new Error(
+            "Startup handshake submission is uncertain; do not repeat terminal input.",
+          );
+        stage = "startup-handshake";
+        await update((w) => {
+          w.lanes[i].startupHandshakeAttemptedAt = new Date().toISOString();
+        });
+        await port.run(
+          ["agent", "prompt", lane.paneId!, startupHandshake],
+          signal,
+        );
+        await update((w) => {
+          w.lanes[i].startupHandshakeSentAt = new Date().toISOString();
+        });
+        lane = workflow.lanes[i];
       }
       stage = "startup-proof";
       lane = workflow.lanes[i];

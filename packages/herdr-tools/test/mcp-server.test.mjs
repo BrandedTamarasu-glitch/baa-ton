@@ -19,6 +19,13 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
     // may still override via `env`.
     env: {
       ...process.env,
+      // A lane shell exports its startup intent for the harness bridge. The
+      // test bridge must never merge into that live intent while test files
+      // execute concurrently; fixtures below provide their own config when
+      // they need one.
+      BAA_STARTUP_INTENT: undefined,
+      HERDR_PLUGIN_CONFIG_DIR: undefined,
+      HERDR_PLUGIN_STATE_DIR: undefined,
       HERDR_PANE_ID: "w-test:p1",
       HERDR_WORKSPACE_ID: "w-test",
       ...env,
@@ -62,7 +69,9 @@ test("tools/call rejects arguments outside a tool's declared schema before it re
   await withMcpServer({ HERDR_ENV: "1" }, async (rpc) => {
     const listed = await rpc("tools/list");
     assert.equal(
-      listed.result.tools.some((tool) => tool.name === "herdr_permission_prompt"),
+      listed.result.tools.some(
+        (tool) => tool.name === "herdr_permission_prompt",
+      ),
       true,
     );
     const invalid = await rpc("tools/call", {
@@ -231,7 +240,9 @@ test("MCP calls run registered lifecycle handlers and settle the bridge root tur
         assert.equal(call.result.isError, undefined);
         const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
         assert.equal(manifest.parentGoal.supervisor.rootTurn.state, "idle");
-        const inbox = JSON.parse(await readFile(join(stateDir, "inbox.json"), "utf8"));
+        const inbox = JSON.parse(
+          await readFile(join(stateDir, "inbox.json"), "utf8"),
+        );
         assert.equal(inbox.messages.length, 1);
         assert.equal(inbox.messages[0].envelope.message.type, "goal");
         assert.equal(inbox.messages[0].states.resolved.at !== undefined, true);
@@ -272,7 +283,10 @@ test("MCP permission broker dedupes a request and releases a parent answer once"
         workflows: [
           {
             id: "workflow-1",
-            ownership: { createdBy: "herdr-orchestrator", workspaceId: root.workspace_id },
+            ownership: {
+              createdBy: "herdr-orchestrator",
+              workspaceId: root.workspace_id,
+            },
             lanes: [{ id: lane.lane_id, paneId: lane.pane_id }],
           },
         ],
@@ -292,8 +306,18 @@ test("MCP permission broker dedupes a request and releases a parent answer once"
           {
             id: "permission-orchestrator",
             root,
-            program: { id: cwd, workspace_id: root.workspace_id, parent_manifest_path: manifestPath },
-            workflows: [{ workflow_id: "workflow-1", manifest_path: manifestPath, lanes: [lane] }],
+            program: {
+              id: cwd,
+              workspace_id: root.workspace_id,
+              parent_manifest_path: manifestPath,
+            },
+            workflows: [
+              {
+                workflow_id: "workflow-1",
+                manifest_path: manifestPath,
+                lanes: [lane],
+              },
+            ],
           },
         ],
       },
@@ -358,8 +382,14 @@ test("MCP permission broker dedupes a request and releases a parent answer once"
       },
       { cwd },
     );
-    const inbox = JSON.parse(await readFile(join(stateDir, "inbox.json"), "utf8"));
-    assert.equal(inbox.messages.length, 1, "same logical permission request is deduped");
+    const inbox = JSON.parse(
+      await readFile(join(stateDir, "inbox.json"), "utf8"),
+    );
+    assert.equal(
+      inbox.messages.length,
+      1,
+      "same logical permission request is deduped",
+    );
     assert.equal(inbox.messages[0].resolution.release_count, 1);
   } finally {
     await rm(directory, { recursive: true, force: true });

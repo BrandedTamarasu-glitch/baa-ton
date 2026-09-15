@@ -32,7 +32,14 @@ export const MESSAGE_STATES = [
 const LOCK_TIMEOUT_MS = 2_000;
 const LOCK_RETRY_MS = 10;
 const STORE_NAME = "inbox.json";
-const STATE_ORDER = new Map(MESSAGE_STATES.map((state, index) => [state, index]));
+const STATE_ORDER = new Map(
+  MESSAGE_STATES.map((state, index) => [state, index]),
+);
+// The filesystem lock coordinates separate bridge/controller processes. A
+// process-local queue additionally preserves invocation order for concurrent
+// callers in one process, so a logical retry cannot win the lock ahead of the
+// original call merely due to event-loop scheduling.
+const transactionQueues = new Map();
 
 const isRecord = (value) =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -42,7 +49,10 @@ function assert(condition, message) {
 }
 
 function assertString(value, label) {
-  assert(typeof value === "string" && value.length > 0, `${label} must be a non-empty string.`);
+  assert(
+    typeof value === "string" && value.length > 0,
+    `${label} must be a non-empty string.`,
+  );
   return value;
 }
 
@@ -110,7 +120,8 @@ export function makeEnvelope({
 }
 
 export function storePath({ stateDir, manifestPath } = {}) {
-  const directory = stateDir ?? (manifestPath ? dirname(manifestPath) : undefined);
+  const directory =
+    stateDir ?? (manifestPath ? dirname(manifestPath) : undefined);
   assertString(directory, "inbox state directory");
   assert(isAbsolute(directory), "inbox state directory must be absolute.");
   return join(resolve(directory), STORE_NAME);
@@ -127,10 +138,22 @@ function emptyStore() {
 
 function validateStore(value) {
   assert(isRecord(value), "Inbox store must be an object.");
-  assert(value.version === INBOX_STORE_VERSION, "Inbox store version is unsupported.");
-  assert(Number.isSafeInteger(value.revision) && value.revision >= 0, "Inbox store revision is invalid.");
-  assert(Array.isArray(value.messages), "Inbox store messages must be an array.");
-  assert(Array.isArray(value.wake_hints), "Inbox store wake_hints must be an array.");
+  assert(
+    value.version === INBOX_STORE_VERSION,
+    "Inbox store version is unsupported.",
+  );
+  assert(
+    Number.isSafeInteger(value.revision) && value.revision >= 0,
+    "Inbox store revision is invalid.",
+  );
+  assert(
+    Array.isArray(value.messages),
+    "Inbox store messages must be an array.",
+  );
+  assert(
+    Array.isArray(value.wake_hints),
+    "Inbox store wake_hints must be an array.",
+  );
   return value;
 }
 
@@ -176,21 +199,36 @@ async function acquireLock(path) {
       if (error?.code !== "EEXIST") throw error;
       if (Date.now() >= deadline)
         throw new Error(`Timed out acquiring inbox lock for ${path}.`);
-      await new Promise((resolveSleep) => setTimeout(resolveSleep, LOCK_RETRY_MS));
+      await new Promise((resolveSleep) =>
+        setTimeout(resolveSleep, LOCK_RETRY_MS),
+      );
     }
   }
 }
 
 async function transaction(path, mutate) {
-  const release = await acquireLock(path);
+  const resolvedPath = resolve(path);
+  const previous = transactionQueues.get(resolvedPath) ?? Promise.resolve();
+  const operation = previous
+    .catch(() => undefined)
+    .then(async () => {
+      const release = await acquireLock(resolvedPath);
+      try {
+        const store = await loadUnlocked(resolvedPath);
+        const result = await mutate(store);
+        store.revision += 1;
+        await atomicWrite(resolvedPath, store);
+        return result;
+      } finally {
+        await release();
+      }
+    });
+  transactionQueues.set(resolvedPath, operation);
   try {
-    const store = await loadUnlocked(path);
-    const result = await mutate(store);
-    store.revision += 1;
-    await atomicWrite(path, store);
-    return result;
+    return await operation;
   } finally {
-    await release();
+    if (transactionQueues.get(resolvedPath) === operation)
+      transactionQueues.delete(resolvedPath);
   }
 }
 
@@ -202,7 +240,10 @@ function messageAt(store, occurrenceId) {
   const message = store.messages.find(
     (candidate) => candidate.occurrence_id === occurrenceId,
   );
-  assert(message, `No durable inbox message exists with occurrence ${occurrenceId}.`);
+  assert(
+    message,
+    `No durable inbox message exists with occurrence ${occurrenceId}.`,
+  );
   return message;
 }
 
@@ -211,10 +252,15 @@ function stateEntry(at, details = {}) {
 }
 
 function setState(message, state, details = {}) {
-  const current = MESSAGE_STATES.findLast((candidate) => message.states[candidate]);
+  const current = MESSAGE_STATES.findLast(
+    (candidate) => message.states[candidate],
+  );
   if (current && STATE_ORDER.get(state) < STATE_ORDER.get(current))
-    throw new Error(`Inbox message state cannot move from ${current} to ${state}.`);
-  if (!message.states[state]) message.states[state] = stateEntry(now(), details);
+    throw new Error(
+      `Inbox message state cannot move from ${current} to ${state}.`,
+    );
+  if (!message.states[state])
+    message.states[state] = stateEntry(now(), details);
   return message.states[state];
 }
 
@@ -229,12 +275,25 @@ function messageView(message) {
  */
 export async function putMessage(
   path,
-  { envelope, logicalKey, occurrenceId, kind, from, to, payload, dedupe = "logical" },
+  {
+    envelope,
+    logicalKey,
+    occurrenceId,
+    kind,
+    from,
+    to,
+    payload,
+    dedupe = "logical",
+  },
 ) {
   const resolvedPath = resolve(path);
   const candidate =
-    envelope ?? makeEnvelope({ logicalKey, occurrenceId, kind, from, to, payload });
-  assert(candidate.protocol === HERDR_LINK_PROTOCOL, "Inbox envelope protocol must be herdr-link/1.");
+    envelope ??
+    makeEnvelope({ logicalKey, occurrenceId, kind, from, to, payload });
+  assert(
+    candidate.protocol === HERDR_LINK_PROTOCOL,
+    "Inbox envelope protocol must be herdr-link/1.",
+  );
   const logical = candidate.message.logical_key;
   const occurrence = candidate.message.occurrence_id;
   return transaction(resolvedPath, (store) => {
@@ -242,14 +301,22 @@ export async function putMessage(
       (message) => message.occurrence_id === occurrence,
     );
     if (byOccurrence)
-      return { created: false, message: messageView(byOccurrence), revision: store.revision };
+      return {
+        created: false,
+        message: messageView(byOccurrence),
+        revision: store.revision,
+      };
     if (dedupe === "logical") {
       const unresolved = store.messages.find(
         (message) =>
           message.logical_key === logical && !message.states.resolved,
       );
       if (unresolved)
-        return { created: false, message: messageView(unresolved), revision: store.revision };
+        return {
+          created: false,
+          message: messageView(unresolved),
+          revision: store.revision,
+        };
     }
     const timestamp = now();
     const message = {
@@ -268,7 +335,11 @@ export async function putMessage(
       updated_at: timestamp,
     };
     store.messages.push(message);
-    return { created: true, message: messageView(message), revision: store.revision };
+    return {
+      created: true,
+      message: messageView(message),
+      revision: store.revision,
+    };
   });
 }
 
@@ -292,9 +363,15 @@ export async function updateMessage(path, occurrenceId, update = {}) {
     if (update.state) setState(message, update.state, update.details);
     if (update.delivery) {
       assert(
-        ["pending", "sending", "notified", "delivered", "uncertain", "acknowledged", "resolved"].includes(
-          update.delivery.status,
-        ),
+        [
+          "pending",
+          "sending",
+          "notified",
+          "delivered",
+          "uncertain",
+          "acknowledged",
+          "resolved",
+        ].includes(update.delivery.status),
         "Inbox delivery status is invalid.",
       );
       message.delivery = {
@@ -303,7 +380,8 @@ export async function updateMessage(path, occurrenceId, update = {}) {
         updated_at: now(),
       };
     }
-    if (update.result !== undefined) message.result = structuredClone(update.result);
+    if (update.result !== undefined)
+      message.result = structuredClone(update.result);
     if (update.resolution !== undefined)
       message.resolution = structuredClone(update.resolution);
     message.updated_at = now();
@@ -353,7 +431,11 @@ export async function enqueueWakeHint(path, { recipient, occurrenceId }) {
     const added = !hint.occurrence_ids.includes(occurrenceId);
     if (added) hint.occurrence_ids.push(occurrenceId);
     hint.updated_at = timestamp;
-    return { created: added, hint: structuredClone(hint), revision: store.revision };
+    return {
+      created: added,
+      hint: structuredClone(hint),
+      revision: store.revision,
+    };
   });
 }
 
@@ -361,7 +443,10 @@ export async function markWakeHint(path, hintId, status, details = {}) {
   return transaction(resolve(path), (store) => {
     const hint = store.wake_hints.find((candidate) => candidate.id === hintId);
     assert(hint, `No durable wake hint exists with ID ${hintId}.`);
-    assert(["pending", "notified", "uncertain", "resolved"].includes(status), "Wake hint status is invalid.");
+    assert(
+      ["pending", "notified", "uncertain", "resolved"].includes(status),
+      "Wake hint status is invalid.",
+    );
     hint.status = status;
     hint.attempts += status === "pending" || status === "uncertain" ? 1 : 0;
     Object.assign(hint, details, { updated_at: now() });
@@ -375,9 +460,11 @@ export async function pendingMessages(path, { recipient, kinds } = {}) {
     .filter((message) => {
       if (message.states.resolved) return false;
       if (message.delivery.status === "uncertain") return false;
-      if (recipient &&
-          (message.envelope.to.workspace_id !== recipient.workspace_id ||
-            message.envelope.to.pane_id !== recipient.pane_id))
+      if (
+        recipient &&
+        (message.envelope.to.workspace_id !== recipient.workspace_id ||
+          message.envelope.to.pane_id !== recipient.pane_id)
+      )
         return false;
       if (kinds && !kinds.includes(message.envelope.message.type)) return false;
       return true;
@@ -390,8 +477,14 @@ export async function pendingMessages(path, { recipient, kinds } = {}) {
  * delivery callback, which runs outside the store transaction and then calls
  * markDelivery/markState. This keeps the substrate useful to every adapter.
  */
-export async function reconcilePending(path, { recipient, kinds, deliver } = {}) {
-  assert(typeof deliver === "function", "reconcilePending requires a deliver callback.");
+export async function reconcilePending(
+  path,
+  { recipient, kinds, deliver } = {},
+) {
+  assert(
+    typeof deliver === "function",
+    "reconcilePending requires a deliver callback.",
+  );
   const pending = await pendingMessages(path, { recipient, kinds });
   const results = [];
   for (const message of pending) {
@@ -406,7 +499,10 @@ function permissionDecision(answer, input) {
   if (typeof answer === "string") {
     try {
       const parsed = JSON.parse(answer);
-      if (isRecord(parsed) && (parsed.behavior === "allow" || parsed.behavior === "deny"))
+      if (
+        isRecord(parsed) &&
+        (parsed.behavior === "allow" || parsed.behavior === "deny")
+      )
         return parsed;
     } catch {
       // Plain-text answers remain safe denials below.
@@ -416,14 +512,20 @@ function permissionDecision(answer, input) {
   }
   return {
     behavior: "deny",
-    message: typeof answer === "string" && answer.trim()
-      ? answer
-      : "Permission remains pending parent approval.",
+    message:
+      typeof answer === "string" && answer.trim()
+        ? answer
+        : "Permission remains pending parent approval.",
   };
 }
 
 /** Store a parent answer. It never releases a waiting permission request. */
-export async function answerMessage(path, occurrenceId, answer, { uncertain = false } = {}) {
+export async function answerMessage(
+  path,
+  occurrenceId,
+  answer,
+  { uncertain = false } = {},
+) {
   return transaction(resolve(path), (store) => {
     const message = messageAt(store, occurrenceId);
     assert(
@@ -434,7 +536,10 @@ export async function answerMessage(path, occurrenceId, answer, { uncertain = fa
       return { stored: false, message: messageView(message) };
     message.resolution = {
       answer,
-      decision: permissionDecision(answer, message.envelope.message.payload.input),
+      decision: permissionDecision(
+        answer,
+        message.envelope.message.payload.input,
+      ),
       released_at: null,
       release_count: 0,
     };
@@ -461,7 +566,12 @@ export async function releasePermission(path, occurrenceId) {
     if (!resolution)
       return { released: false, pending: true, message: messageView(message) };
     if (message.delivery.status === "uncertain")
-      return { released: false, pending: true, uncertain: true, message: messageView(message) };
+      return {
+        released: false,
+        pending: true,
+        uncertain: true,
+        message: messageView(message),
+      };
     if (resolution.released_at)
       return {
         released: false,
@@ -471,7 +581,11 @@ export async function releasePermission(path, occurrenceId) {
       };
     resolution.released_at = now();
     resolution.release_count = 1;
-    message.delivery = { ...message.delivery, status: "resolved", updated_at: now() };
+    message.delivery = {
+      ...message.delivery,
+      status: "resolved",
+      updated_at: now(),
+    };
     if (!message.states.received && !message.states.acknowledged)
       setState(message, "received", { decision_released: true });
     setState(message, "resolved", { decision_released: true });

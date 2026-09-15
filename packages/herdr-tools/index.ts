@@ -1,4 +1,5 @@
 import {
+  access,
   chmod,
   lstat,
   mkdir,
@@ -9,6 +10,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -33,6 +35,7 @@ import { codexLaunchAdapter } from "./codex-launch-adapter.js";
 import { opencodeLaunchAdapter } from "./opencode-launch-adapter.js";
 import {
   HarnessAdapterRegistry,
+  STARTUP_PROOF_REQUIRED_OPERATIONS,
   type NativeSessionRef,
 } from "./harness-adapter.js";
 import { fileURLToPath } from "node:url";
@@ -229,6 +232,8 @@ export type Lane = {
   tabRenamedAt?: string;
   readiness?: ReadinessCheck;
   agentStartedAt?: string;
+  startupHandshakeAttemptedAt?: string;
+  startupHandshakeSentAt?: string;
   promptAttemptedAt?: string;
   promptedAt?: string;
   agentSessionPath?: string;
@@ -288,6 +293,15 @@ export type GoalRecord = {
   ownership: GoalOwnership;
   updatedAt: string;
 };
+export type OperatorClosure = {
+  version: 1;
+  id: string;
+  laneId: string;
+  who: string;
+  why: string;
+  evidence: string[];
+  recordedAt: string;
+};
 export type Workflow = {
   taskBinding?: {
     workspaceId: string;
@@ -301,7 +315,13 @@ export type Workflow = {
   goals: GoalRecord[];
   id: string;
   objective: string;
-  outcome: "planned" | "running" | "completed" | "closed" | "unknown";
+  outcome:
+    | "planned"
+    | "running"
+    | "completed"
+    | "closed"
+    | "operator-closed"
+    | "unknown";
   status: string;
   lanes: Lane[];
   herdr: {
@@ -340,6 +360,9 @@ export type Workflow = {
   observedAt?: string;
   closeRequestedAt?: string;
   closedAt?: string;
+  operatorClosedAt?: string;
+  /** Explicit reconciliation when a lane could not persist its own receipt. */
+  operatorClosure?: OperatorClosure;
 };
 type ParentGoalStatus =
   | "active"
@@ -698,6 +721,14 @@ function requireRootGoalExecutor(): void {
   if (!isRootOrchestrator())
     throw new Error(
       "Only the verified controller-mapped root may create or update the parent goal.",
+    );
+}
+
+function requireRootOperator(): void {
+  requireHerdr();
+  if (!isRootOrchestrator())
+    throw new Error(
+      "Only the verified controller-mapped root may record an operator closure.",
     );
 }
 
@@ -1656,6 +1687,87 @@ function requireHerdr(): void {
     throw new Error(
       "HERDR_ENV=1 is required; dispatch and close are unavailable outside a Herdr pane.",
     );
+}
+
+type GitMetadataDirectories = {
+  gitDirectory: string;
+  commonDirectory: string;
+};
+
+/** Resolve the directories Git will mutate for a checkout without invoking a
+ * mutating Git command. Linked worktrees keep their administrative metadata
+ * outside the checkout, which is the path Codex's workspace-write sandbox can
+ * leave unwritable. */
+async function gitMetadataDirectories(
+  cwd: string,
+): Promise<GitMetadataDirectories> {
+  const dotGit = join(resolve(cwd), ".git");
+  const details = await lstat(dotGit);
+  if (details.isSymbolicLink())
+    throw new Error(
+      ".git is a symbolic link; Git metadata ownership is ambiguous.",
+    );
+  let gitDirectory: string;
+  if (details.isDirectory()) gitDirectory = dotGit;
+  else if (details.isFile()) {
+    const pointer = (await readFile(dotGit, "utf8")).trim();
+    const match = /^gitdir:\s*(.+)$/i.exec(pointer);
+    if (!match)
+      throw new Error(".git is not a valid Git worktree metadata pointer.");
+    gitDirectory = resolve(dirname(dotGit), match[1].trim());
+  } else throw new Error(".git is not a regular directory or worktree pointer.");
+
+  let commonDirectory = gitDirectory;
+  try {
+    const common = (await readFile(join(gitDirectory, "commondir"), "utf8"))
+      .trim();
+    if (common) commonDirectory = resolve(gitDirectory, common);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return { gitDirectory, commonDirectory };
+}
+
+async function inspectCodexSandboxGitMetadata(
+  cwd: string,
+): Promise<{ status: "ok" | "warn" | "fail"; detail: string }> {
+  let directories: GitMetadataDirectories;
+  try {
+    directories = await gitMetadataDirectories(cwd);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT")
+      return {
+        status: "warn",
+        detail: `No Git metadata found under ${resolve(cwd)}; this check is not applicable to a non-Git checkout.`,
+      };
+    return {
+      status: "fail",
+      detail: `Cannot resolve Git metadata for ${resolve(cwd)}: ${(error as Error).message}`,
+    };
+  }
+  const paths = [
+    ...new Set([directories.gitDirectory, directories.commonDirectory]),
+  ];
+  const blocked: string[] = [];
+  for (const path of paths) {
+    try {
+      const details = await lstat(path);
+      if (!details.isDirectory() || details.isSymbolicLink())
+        blocked.push(`${path} (not a real directory)`);
+      else await access(path, fsConstants.W_OK);
+    } catch {
+      blocked.push(path);
+    }
+  }
+  if (blocked.length)
+    return {
+      status: "fail",
+      detail: `Codex sandbox cannot write Git metadata: ${blocked.join(", ")}. A parent-side commit/reconciliation is required.`,
+    };
+  return {
+    status: "ok",
+    detail: `Git metadata directories are writable: ${paths.join(", ")}.`,
+  };
 }
 
 function rootConfigPath(): string {
@@ -3515,6 +3627,97 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     return result();
   }
 
+  async function operatorClose(
+    cwd: string,
+    id: string,
+    laneId: string,
+    who: string,
+    why: string,
+    evidence: string[],
+  ) {
+    requireRootOperator();
+    const normalizedLaneId = laneId.trim();
+    const normalizedWho = who.trim();
+    const normalizedWhy = why.trim();
+    const normalizedEvidence = evidence
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (!normalizedLaneId)
+      throw new Error("operator closure requires a laneId.");
+    if (!normalizedWho)
+      throw new Error("operator closure requires who.");
+    if (!normalizedWhy)
+      throw new Error("operator closure requires why.");
+    if (normalizedEvidence.length === 0)
+      throw new Error("operator closure requires at least one evidence item.");
+
+    const workflow = await withManifestTransaction(cwd, (manifest) => {
+      const stored = workflowFor(manifest, id);
+      const requested = {
+        laneId: normalizedLaneId,
+        who: normalizedWho,
+        why: normalizedWhy,
+        evidence: normalizedEvidence,
+      };
+      if (stored.operatorClosure) {
+        const existing = stored.operatorClosure;
+        if (
+          existing.laneId !== requested.laneId ||
+          existing.who !== requested.who ||
+          existing.why !== requested.why ||
+          JSON.stringify(existing.evidence) !== JSON.stringify(requested.evidence)
+        )
+          throw new Error(
+            "Workflow already has an operator closure with different reconciliation evidence.",
+          );
+        return stored;
+      }
+      const lane = stored.lanes.find((item) => item.id === normalizedLaneId);
+      if (!lane) throw new Error(`Unknown lane in workflow: ${normalizedLaneId}.`);
+      if (lane.completionReceipt)
+        throw new Error(
+          "Operator closure cannot replace or duplicate an existing lane completion receipt.",
+        );
+      if (stored.outcome === "completed" || stored.outcome === "closed")
+        throw new Error(
+          "Operator closure cannot reconcile a workflow that already has a normal completion or close state.",
+        );
+      const timestamp = now();
+      stored.operatorClosure = {
+        version: 1,
+        id: `operator-closure-${randomUUID().slice(0, 12)}`,
+        ...requested,
+        recordedAt: timestamp,
+      };
+      // This state is deliberately separate from completionReceipt: it says
+      // an authorized operator reconciled the outcome, not that the lane
+      // successfully called herdr_complete.
+      lane.status = "operator-closed";
+      stored.status = "operator-closed";
+      stored.outcome = "operator-closed";
+      stored.operatorClosedAt = timestamp;
+      stored.evidence.push({
+        at: timestamp,
+        kind: "operator-closure",
+        text: JSON.stringify({
+          laneId: normalizedLaneId,
+          who: normalizedWho,
+          why: normalizedWhy,
+          evidence: normalizedEvidence,
+          receipt: "not recorded; lane completion receipt was unavailable",
+        }),
+      });
+      stored.updatedAt = timestamp;
+      return stored;
+    });
+    return {
+      operatorClosed: true,
+      workflow,
+      operatorClosure: workflow.operatorClosure,
+      laneCompletionReceiptRecorded: false,
+    };
+  }
+
   async function reparent(
     cwd: string,
     id: string,
@@ -3799,6 +4002,105 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       return {
         status: "ok",
         detail: `Version 2 manifest at ${manifestPath(cwd)}: ${manifest.workflows.length} workflow(s), parent goal ${manifest.parentGoal ? "present" : "absent"}.`,
+      };
+    });
+
+    await check(
+      "codex-sandbox-git-metadata-writability",
+      () => inspectCodexSandboxGitMetadata(cwd),
+    );
+
+    await check("lane-bridge-liveness", async () => {
+      if (!controllerConfig)
+        return {
+          status: "warn",
+          detail:
+            "No controller config is available; no mapped lane bridge can be checked.",
+        };
+      const lanes = controllerConfig.orchestrators.flatMap((orchestrator) =>
+        orchestrator.workflows.flatMap((workflow) =>
+          workflow.lanes.map((lane) => ({
+            orchestrator,
+            workflow,
+            lane,
+          })),
+        ),
+      );
+      if (lanes.length === 0)
+        return {
+          status: "ok",
+          detail: "No mapped lane bridges are currently registered.",
+        };
+      const results: string[] = [];
+      const warnings: string[] = [];
+      for (const { workflow, lane } of lanes) {
+        const response = responseRecord(
+          await runHerdr(["agent", "get", lane.pane_id], signal),
+          `lane bridge ${lane.lane_id}`,
+        );
+        const agent = response.agent;
+        if (!isRecord(agent))
+          throw new Error(
+            `Lane ${lane.lane_id} agent response did not contain native identity.`,
+          );
+        if (
+          agent.pane_id !== lane.pane_id ||
+          agent.workspace_id !== lane.workspace_id
+        )
+          throw new Error(
+            `Lane ${lane.lane_id} native identity does not match its registered route.`,
+          );
+        if (agent.launch_pending || agent.interactive_ready === false) {
+          warnings.push(
+            `${lane.lane_id} (${lane.pane_id}) is not interactive-ready`,
+          );
+          continue;
+        }
+        // A startup attestation containing all protocol operations is the
+        // strongest read-only evidence available for a stdio bridge: the
+        // bridge has no independently addressable socket to ping. Missing or
+        // incomplete evidence is surfaced as a warning rather than guessed
+        // healthy from a pane status alone.
+        let attestation: any = null;
+        try {
+          const manifest = await loadManifest(workflow.manifest_path);
+          const stored = manifest.workflows.find(
+            (candidate) => candidate.id === workflow.workflow_id,
+          );
+          const storedLane = stored?.lanes.find(
+            (candidate) => candidate.id === lane.lane_id,
+          );
+          if (storedLane?.startupIntentPath)
+            attestation = JSON.parse(
+              await readFile(`${storedLane.startupIntentPath}.ready`, "utf8"),
+            );
+        } catch {
+          attestation = null;
+        }
+        const operations = isRecord(attestation)
+          ? attestation.operations
+          : undefined;
+        if (
+          !Array.isArray(operations) ||
+          !STARTUP_PROOF_REQUIRED_OPERATIONS.every((operation) =>
+            operations.includes(operation),
+          )
+        ) {
+          warnings.push(
+            `${lane.lane_id} (${lane.pane_id}) has no complete startup bridge attestation`,
+          );
+          continue;
+        }
+        results.push(`${lane.lane_id} (${lane.pane_id}) native/bridge evidence present`);
+      }
+      return {
+        status: warnings.length ? "warn" : "ok",
+        detail: [
+          results.length
+            ? `Checked ${results.length}/${lanes.length} mapped lane bridge(s): ${results.join("; ")}.`
+            : `Checked ${lanes.length} mapped lane bridge(s).`,
+          ...(warnings.length ? [`Warnings: ${warnings.join("; ")}.`] : []),
+        ].join(" "),
       };
     });
 
@@ -4191,6 +4493,44 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           {
             type: "text",
             text: `Stored completion receipt ${result.relationshipId}; parent notification: ${result.delivery}.`,
+          },
+        ],
+        details: result,
+      };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_operator_close",
+    label: "Herdr Operator Close",
+    description:
+      "Record a root-authorized operator reconciliation for a lane that could not store its own completion receipt; this never creates or impersonates herdr_complete.",
+    promptSnippet:
+      "Reconcile a verified receipt-blocked lane with explicit operator, reason, and evidence.",
+    promptGuidelines: [
+      "Use only from the verified controller-mapped root after independently verifying the lane's work and recording who, why, and concrete evidence.",
+      "This operation sets an explicit operator-closed state and never writes a lane completionReceipt.",
+    ],
+    parameters: Type.Object({
+      workflowId: Type.String({ minLength: 1 }),
+      laneId: Type.String({ minLength: 1 }),
+      who: Type.String({ minLength: 1 }),
+      why: Type.String({ minLength: 1 }),
+      evidence: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+    }),
+    async execute(_id, params, _signal, _update, ctx) {
+      const result = await operatorClose(
+        ctx.cwd,
+        params.workflowId,
+        params.laneId,
+        params.who,
+        params.why,
+        params.evidence,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Operator-closed ${params.workflowId}/${params.laneId}; lane completion receipt was not recorded.`,
           },
         ],
         details: result,

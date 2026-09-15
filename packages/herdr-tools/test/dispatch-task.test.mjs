@@ -238,10 +238,11 @@ async function fixture(options = {}) {
       }
       if (args[0] === "agent" && args[1] === "prompt") {
         assert.equal(registered, true);
-        assert.ok(
-          state.lanes.every((l) => l.nativeSession),
-          "all startup proofs precede every assignment",
-        );
+        if (args[3]?.startsWith("assignment:"))
+          assert.ok(
+            state.lanes.every((l) => l.nativeSession),
+            "all startup proofs precede every assignment",
+          );
         if (options.lostPrompt)
           throw new Error("socket_timeout after submitted");
         return {};
@@ -298,6 +299,75 @@ test("shell-init race and a busy rejection self-heal within one dispatch", async
     await f.close();
   }
 });
+
+test("adapter startup handshakes are sent exactly once before startup proof and assignment", async () => {
+  const base = piLaunchAdapter(
+    {
+      modelRegistry: {
+        find: () => ({ reasoning: true, thinkingLevelMap: { high: "high" } }),
+        hasConfiguredAuth: () => true,
+        isUsingOAuth: () => true,
+      },
+    },
+    "/native/pi.ts",
+  );
+  const f = await fixture({
+    adapter: { ...base, startupHandshake: "Reply with exactly: READY" },
+  });
+  try {
+    assert.equal((await f.run()).dispatched, true);
+    const prompts = f.calls.filter(
+      (call) => call[0] === "agent" && call[1] === "prompt",
+    );
+    assert.deepEqual(prompts.map((call) => call[3]), [
+      "Reply with exactly: READY",
+      "Reply with exactly: READY",
+      "assignment:lane-1",
+      "assignment:lane-2",
+    ]);
+    assert.equal(f.state.lanes[0].startupHandshakeAttemptedAt !== undefined, true);
+    assert.equal(f.state.lanes[0].startupHandshakeSentAt !== undefined, true);
+  } finally {
+    await f.close();
+  }
+});
+
+test("an uncertain startup handshake is fenced and never submitted twice", async () => {
+  const base = piLaunchAdapter(
+    {
+      modelRegistry: {
+        find: () => ({ reasoning: true, thinkingLevelMap: { high: "high" } }),
+        hasConfiguredAuth: () => true,
+        isUsingOAuth: () => true,
+      },
+    },
+    "/native/pi.ts",
+  );
+  const f = await fixture({
+    adapter: { ...base, startupHandshake: "Reply with exactly: READY" },
+    lostPrompt: true,
+  });
+  try {
+    await assert.rejects(f.run(), /socket_timeout after submitted/);
+    const handshakePrompts = () =>
+      f.calls.filter(
+        (call) =>
+          call[0] === "agent" &&
+          call[1] === "prompt" &&
+          call[3] === "Reply with exactly: READY",
+      );
+    assert.equal(handshakePrompts().length, 1);
+    f.options.lostPrompt = false;
+    await assert.rejects(
+      f.run(),
+      /Startup handshake submission is uncertain; do not repeat terminal input/,
+    );
+    assert.equal(handshakePrompts().length, 1);
+  } finally {
+    await f.close();
+  }
+});
+
 test("persistent busy still fails closed and remains retryable in the same tabs", async () => {
   const f = await fixture({ busyAlways: true });
   try {

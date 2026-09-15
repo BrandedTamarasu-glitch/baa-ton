@@ -65,7 +65,9 @@ test("herdr_doctor reports a healthy installation and never mutates the manifest
     const checkIds = report.details.checks.map((entry) => entry.id).sort();
     assert.deepEqual(checkIds, [
       "adapter-registry-capability-matrix",
+      "codex-sandbox-git-metadata-writability",
       "extension-source",
+      "lane-bridge-liveness",
       "manifest-store",
       "native-herdr-connectivity",
       "plugin-enablement-and-routing",
