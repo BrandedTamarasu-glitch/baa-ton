@@ -64,14 +64,29 @@ Independent verifier executed a four-phase plan from a non-root pane (`w17:p3`, 
 
 ### Open items (tracked for delegated follow-up)
 
-- Reload-ack mechanism (ack on `/reload` rather than `session_start`)
-- smoke-check hardening against inherited startup-intent env
+- ~~Reload-ack mechanism (ack on `/reload` rather than `session_start`)~~ Done, see Durable-core batch evidence below.
+- ~~smoke-check hardening against inherited startup-intent env~~ Done, see Durable-core batch evidence below.
 - Herdr upstream request: native shell-readiness wait flag
-- Paseo-pattern contract evolution (in flight: workflow `herdr-fc6d2a3e`, items 1–2)
+- Paseo-pattern contract evolution (in flight: workflow `herdr-fc6d2a3e`, items 1-2)
+
+## Durable-core batch evidence (2026-09-15, `astra-supervisor-nudge-fix`)
+
+Source-level evidence only; no live installation, reload, or agent launch was performed as part of this batch. Full suite green at each step: `env -u BAA_STARTUP_INTENT npm test` (30 extension + 32 controller after all commits below; also verified green with `BAA_STARTUP_INTENT` inherited, see item 4), `tsc --noEmit -p tsconfig.json`, `git diff --check`.
+
+1. **Item 1 (P0, transactional manifest writer), commit `89e3297`:** re-ran `docs/audit-probes/herdr-native.mjs` against this checkout before touching anything. The "different-cwd completion," "completion retry idempotency," and "concurrent durable state" probes no longer reproduced (already fixed by prior work, undocumented here until now). `observe()`/`registerEventController()` still had the unlocked load-then-save race; fixed via a new `withManifestTransaction()` primitive. Regression: `packages/herdr-tools/test/manifest-transaction.test.mjs`, verified to fail against the pre-fix source.
+2. **Item 2 (P0, transport uncertainty), commit `9c544a0`:** the "ambiguous socket delivery" probe still reproduced (two prompts sent after a lost reply). `JsonLineHerdrClient` now tracks whether a request was already written before a socket-level failure; `deliverWake`/`deliverSupervisorNudge` classify a post-write failure as durable `uncertain` regardless of error code. Regressions added to `controller.test.mjs` for both the supervisor-nudge and lane-wake paths.
+3. **Item 4 (P1, occurrence-aware events plus pending reconciler), commit `6628bf7`:** the "lifecycle dedupe identity" and "pending event recovery" probes still reproduced. Fixed via pane-transition-history-derived occurrence identity (no new hook field) and an event-driven pending-wake drain in `runSupervisorTick` that runs independently of parent-goal status. Regressions added to `controller.test.mjs`.
+4. **Item 10 (tracked smalls), commits `15c9412`, `15c7db4`:** reload-ack now also fires from `agent_start` (session_start never runs on `/reload`); smoke-check now drops an inherited `BAA_STARTUP_INTENT` itself. Regressions in `activation.test.mjs`; `npm test` verified green both with and without `env -u BAA_STARTUP_INTENT`.
+
+**Remaining MCP probes still reproduce as of this evidence:** "MCP schema validation" (an out-of-enum `herdr_goal` action is accepted) and "MCP lifecycle parity" (the bridge discards all `on()` lifecycle callbacks) are item 6's scope, not addressed by the above.
+
+**Not attempted in this batch:** items 3 (durable inbox/outbox unification, including the mid-batch permission-broker amendment), 5 (scoped lane goals), 6 (MCP bridge parity), 7 (per-lane launch profiles), 8 (incarnation rebind automation), 9 (doctor tool). See the batch's final report for scope/reasoning.
+
+**Observed concurrent edit:** commit `00f9c94` ("Wait for question and answer delivery to settle," author `zachristmas@icloud.com`) landed in this worktree mid-batch, between items 1 and 4, changing `wakeParentForQuestion`/`answerChildQuestion`'s `herdr agent prompt` calls from `--timeout 60000` to `--wait`. Not authored by this batch; noted for traceability since it touches question/answer delivery, which is adjacent to item 3's durable-inbox scope.
 
 ## Remaining work
 
-Broader durable-core integration (neutral domain types, durable inbox/outbox, incarnation recovery, MCP/CLI validation/timeouts), real Codex/Claude adapter qualification, reload-ack mechanism, smoke-check startup-env hardening. Delegate via Herdr plan/dispatch in w17 with disjoint ownership and acceptance contracts.
+Broader durable-core integration (neutral domain types, durable inbox/outbox, incarnation recovery, MCP/CLI validation/timeouts), real Codex/Claude adapter qualification. Delegate via Herdr plan/dispatch in w17 with disjoint ownership and acceptance contracts.
 
 ## Next event / delegation
 
