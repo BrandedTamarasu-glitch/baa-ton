@@ -1,13 +1,40 @@
 import type { LaunchProfile } from "./launch-profile.js";
 
+export const PROTOCOL_OPERATIONS = {
+  plan: "plan",
+  dispatch: "dispatch",
+  complete: "complete",
+} as const;
+export type ProtocolOperation =
+  (typeof PROTOCOL_OPERATIONS)[keyof typeof PROTOCOL_OPERATIONS];
+
+/** Operations every verified lane must expose before it can receive work. */
+export const STARTUP_PROOF_REQUIRED_OPERATIONS = [
+  PROTOCOL_OPERATIONS.plan,
+  PROTOCOL_OPERATIONS.dispatch,
+  PROTOCOL_OPERATIONS.complete,
+] as const satisfies readonly ProtocolOperation[];
+
 export type NativeSessionRef = { kind: "path" | "id"; value: string };
+export type HarnessLifecycle = "native" | "screen" | "unavailable";
+
+/**
+ * Boolean capabilities are intentionally open-ended so a harness can publish
+ * new provider features without changing this contract version. The lifecycle
+ * tier is metadata rather than a boolean and stays explicit on the adapter.
+ */
+export type HarnessCapabilityFlags = Record<string, boolean | undefined> & {
+  startupAttestation: boolean;
+  supportsSessionPersistence: boolean;
+};
+
 export type StartupProof = {
   paneId: string;
   workspaceId: string;
   nonce: string;
   source: string;
   profile: LaunchProfile;
-  tools: string[];
+  operations: ProtocolOperation[];
   session: NativeSessionRef;
 };
 
@@ -15,16 +42,31 @@ export type StartupProof = {
 export interface HarnessLaunchAdapter {
   version: 1;
   kind: string;
-  capabilities: {
-    sessionIdentity: "native";
-    lifecycle: "native" | "screen" | "unavailable";
-    startupAttestation: boolean;
-  };
+  capabilities: HarnessCapabilityFlags;
+  /** Honest lifecycle reporting: native, screen-derived, or unavailable. */
+  lifecycle: HarnessLifecycle;
   preflight(profile: LaunchProfile): void | Promise<void>;
   launchArguments(profile: LaunchProfile, source: string): string[];
   /** Must compare native identity with the harness's startup attestation.
    * Screen-derived idle alone is never startup attestation. */
   verifyStartup(nativeAgent: unknown, attestation: unknown): StartupProof;
+}
+
+export const REQUIRED_ADAPTER_CAPABILITIES = [
+  "startupAttestation",
+  "supportsSessionPersistence",
+] as const;
+
+export type RequiredAdapterCapability =
+  (typeof REQUIRED_ADAPTER_CAPABILITIES)[number];
+
+export function missingRequiredAdapterCapabilities(
+  adapter: Pick<HarnessLaunchAdapter, "capabilities"> | undefined,
+): RequiredAdapterCapability[] {
+  if (!adapter?.capabilities) return [...REQUIRED_ADAPTER_CAPABILITIES];
+  return REQUIRED_ADAPTER_CAPABILITIES.filter(
+    (name) => adapter.capabilities[name] !== true,
+  );
 }
 
 export class HarnessAdapterRegistry {
@@ -40,15 +82,23 @@ export class HarnessAdapterRegistry {
   }
   resolve(kind: string): HarnessLaunchAdapter {
     const adapter = this.adapters.get(kind);
-    if (!adapter?.capabilities.startupAttestation)
+    const missing = missingRequiredAdapterCapabilities(adapter);
+    if (!adapter || adapter.version !== 1 || missing.length > 0)
       throw new Error(
-        `Harness ${kind} has no qualified startup adapter; detection support is not launch qualification.`,
+        `Harness ${kind} has no qualified startup adapter; detection support is not launch qualification${
+          missing.length ? ` (missing required capability flags: ${missing.join(", ")})` : ""
+        }.`,
       );
     return adapter;
   }
   capabilities() {
     return [...this.adapters.values()].map(
-      ({ kind, version, capabilities }) => ({ kind, version, ...capabilities }),
+      ({ kind, version, capabilities, lifecycle }) => ({
+        kind,
+        version,
+        ...capabilities,
+        lifecycle,
+      }),
     );
   }
 }

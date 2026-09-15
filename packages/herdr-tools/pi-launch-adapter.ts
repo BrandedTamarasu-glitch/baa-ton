@@ -1,6 +1,33 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { LaunchProfile } from "./launch-profile.js";
-import type { HarnessLaunchAdapter, StartupProof } from "./harness-adapter.js";
+import {
+  PROTOCOL_OPERATIONS,
+  type HarnessLaunchAdapter,
+  type ProtocolOperation,
+  type StartupProof,
+} from "./harness-adapter.js";
+
+const PI_TOOL_TO_PROTOCOL_OPERATION: Readonly<
+  Record<string, ProtocolOperation>
+> = {
+  herdr_plan: PROTOCOL_OPERATIONS.plan,
+  herdr_dispatch: PROTOCOL_OPERATIONS.dispatch,
+  herdr_complete: PROTOCOL_OPERATIONS.complete,
+};
+
+/** Convert Pi's exposed tool names at the process boundary to neutral operations. */
+export function mapPiToolNamesToProtocolOperations(
+  toolNames: unknown,
+): ProtocolOperation[] {
+  if (!Array.isArray(toolNames)) return [];
+  const operations = new Set<ProtocolOperation>();
+  for (const toolName of toolNames) {
+    if (typeof toolName !== "string") continue;
+    const operation = PI_TOOL_TO_PROTOCOL_OPERATION[toolName];
+    if (operation) operations.add(operation);
+  }
+  return [...operations];
+}
 
 export function verifyAvailableProfile(
   profile: LaunchProfile,
@@ -62,10 +89,11 @@ export function piLaunchAdapter(
     version: 1,
     kind: "pi",
     capabilities: {
-      sessionIdentity: "native",
-      lifecycle: "native",
       startupAttestation: true,
+      supportsSessionPersistence: true,
+      supportsNativeSessionIdentity: true,
     },
+    lifecycle: "native",
     preflight: (profile) => verifyAvailableProfile(profile, ctx),
     launchArguments: (profile, source) => [
       "--provider",
@@ -87,8 +115,14 @@ export function piLaunchAdapter(
         workspace_id?: string;
         agent_session?: { kind?: string; value?: string };
       };
-      const hello = attestation as Omit<StartupProof, "session"> & {
-        sessionPath?: string;
+      const hello = attestation as {
+        paneId: string;
+        workspaceId: string;
+        nonce: string;
+        source: string;
+        profile: LaunchProfile;
+        tools?: unknown;
+        sessionPath?: unknown;
       };
       if (
         !agent ||
@@ -103,7 +137,15 @@ export function piLaunchAdapter(
         throw new Error(
           "Pi native-session/startup attestation mismatch; no work assigned.",
         );
-      return { ...hello, session: { kind: "path", value: hello.sessionPath } };
+      return {
+        paneId: hello.paneId,
+        workspaceId: hello.workspaceId,
+        nonce: hello.nonce,
+        source: hello.source,
+        profile: hello.profile,
+        operations: mapPiToolNamesToProtocolOperations(hello.tools),
+        session: { kind: "path", value: hello.sessionPath },
+      };
     },
   };
 }

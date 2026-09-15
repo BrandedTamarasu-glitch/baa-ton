@@ -15,8 +15,9 @@ The common dispatcher additionally enforces workspace/pane/agent identity, start
 
 | Adapter | Source/local tests | Live qualification |
 | --- | --- | --- |
-| Pi / openai-codex subscription | Implemented in `pi-launch-adapter.ts` | Pending activation and observed startup |
-| Codex | Synthetic ID-session adapter proves the shared dispatch path without editing the core | No production launch adapter registered |
+| Pi / openai-codex subscription | Implemented in `pi-launch-adapter.ts`; maps Pi tool names to the neutral `plan`/`dispatch`/`complete` operations | Pending activation and observed startup |
+| Codex | Synthetic ID-session adapter with native tool names proves normalized operations and shared dispatch sequencing without editing the core | No production launch adapter registered |
+| Missing-capability adapter | Registry regression rejects missing `supportsSessionPersistence` before topology mutation | Not launch-qualified |
 | Claude | Native Herdr compatibility is not startup qualification | No production launch adapter registered |
 
 Unregistered adapters fail before topology mutation. The synthetic Codex test is **not** a claim that real Codex startup is qualified.

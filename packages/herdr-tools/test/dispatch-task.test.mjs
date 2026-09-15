@@ -8,7 +8,10 @@ const require = createRequire(import.meta.url);
 const jiti = require("jiti")(import.meta.url);
 const { dispatchTask } = await jiti.import("../dispatch-task.ts");
 const { piLaunchAdapter } = await jiti.import("../pi-launch-adapter.ts");
-const { HarnessAdapterRegistry } = await jiti.import("../harness-adapter.ts");
+const {
+  HarnessAdapterRegistry,
+  PROTOCOL_OPERATIONS,
+} = await jiti.import("../harness-adapter.ts");
 const profile = {
   provider: "openai-codex",
   model: "gpt-5.6-luna",
@@ -159,7 +162,9 @@ async function fixture(options = {}) {
           source: ports.source,
           sessionPath: `/sessions/${p.paneId}.jsonl`,
           profile: launchProfile,
-          tools: ["herdr_complete", "herdr_plan", "herdr_dispatch"],
+          tools:
+            options.nativeTools ??
+            ["herdr_complete", "herdr_plan", "herdr_dispatch"],
         };
         options.changeHello?.(hello);
         p.session = hello.sessionId ?? hello.sessionPath;
@@ -344,18 +349,47 @@ test("unqualified harnesses and unsupported exact profiles never launch", async 
   }
 });
 
-test("a non-Pi ID-session adapter plugs into unchanged dispatch sequencing", async () => {
+test("registry rejects an adapter missing session persistence before topology mutation", async () => {
+  const adapter = {
+    version: 1,
+    kind: "missing-persistence",
+    capabilities: { startupAttestation: true },
+    lifecycle: "unavailable",
+    preflight: () => {},
+    launchArguments: () => [],
+    verifyStartup: () => {
+      throw new Error("startup proof must not be reached");
+    },
+  };
+  const f = await fixture({ adapter });
+  try {
+    await assert.rejects(f.run(), /supportsSessionPersistence/);
+    assert.equal(f.calls.length, 0);
+    assert.deepEqual(f.state.ownership.paneIds, []);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a non-Pi ID-session adapter with native tool names plugs into unchanged dispatch sequencing", async () => {
   // Synthetic adapter contract proof; NOT live Codex qualification.
   let preflights = 0,
     proofs = 0;
+  const nativeToolOperations = {
+    "codex.plan": PROTOCOL_OPERATIONS.plan,
+    "codex.dispatch": PROTOCOL_OPERATIONS.dispatch,
+    "codex.complete": PROTOCOL_OPERATIONS.complete,
+  };
   const adapter = {
     version: 1,
     kind: "codex",
     capabilities: {
-      sessionIdentity: "native",
-      lifecycle: "screen",
       startupAttestation: true,
+      supportsSessionPersistence: true,
+      supportsNativeSessionIdentity: true,
+      supportsSyntheticNativeTools: true,
     },
+    lifecycle: "screen",
     preflight: () => {
       preflights++;
     },
@@ -372,11 +406,18 @@ test("a non-Pi ID-session adapter plugs into unchanged dispatch sequencing", asy
       assert.equal(native.agent_session.kind, "id");
       assert.equal(native.agent_session.value, hello.sessionId);
       proofs++;
-      return { ...hello, session: { kind: "id", value: hello.sessionId } };
+      return {
+        ...hello,
+        operations: hello.tools
+          .map((tool) => nativeToolOperations[tool])
+          .filter(Boolean),
+        session: { kind: "id", value: hello.sessionId },
+      };
     },
   };
   const f = await fixture({
     adapter,
+    nativeTools: ["codex.plan", "codex.dispatch", "codex.complete"],
     changeHello: (h) => {
       h.sessionId = `native-id:${h.paneId}`;
       delete h.sessionPath;

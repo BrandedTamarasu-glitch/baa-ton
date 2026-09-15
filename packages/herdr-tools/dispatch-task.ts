@@ -4,7 +4,11 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { Workflow, Lane } from "./index.js";
 import { validateLaunchProfile } from "./launch-profile.js";
-import type { HarnessLaunchAdapter } from "./harness-adapter.js";
+import {
+  STARTUP_PROOF_REQUIRED_OPERATIONS,
+  missingRequiredAdapterCapabilities,
+  type HarnessLaunchAdapter,
+} from "./harness-adapter.js";
 
 export type DispatchPorts = {
   directory: string;
@@ -69,9 +73,12 @@ export async function dispatchTask(
   const profile = validateLaunchProfile(workflow.launchProfile);
   const adapters = workflow.lanes.map((lane) => port.adapter(lane.agentKind));
   for (const adapter of adapters) {
-    if (adapter.version !== 1 || !adapter.capabilities.startupAttestation)
+    const missing = missingRequiredAdapterCapabilities(adapter);
+    if (adapter.version !== 1 || missing.length > 0)
       throw new Error(
-        "Harness lacks the required versioned startup capability.",
+        `Harness lacks the required versioned capabilities${
+          missing.length ? `: ${missing.join(", ")}` : ""
+        }.`,
       );
     await adapter.preflight(profile);
   }
@@ -283,8 +290,8 @@ export async function dispatchTask(
         proof.nonce !== lane.startupNonce ||
         proof.source !== port.source ||
         JSON.stringify(proof.profile) !== JSON.stringify(profile) ||
-        !["herdr_complete", "herdr_plan", "herdr_dispatch"].every((name) =>
-          proof.tools?.includes(name),
+        !STARTUP_PROOF_REQUIRED_OPERATIONS.every((operation) =>
+          proof.operations?.includes(operation),
         )
       )
         throw new Error(
