@@ -1788,8 +1788,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           "prompt",
           root.pane_id,
           `A mapped Herdr child needs a parent answer. Ask Zach the durable question in request ${request.id}, then call herdr_question_answer with that request ID and Zach's answer.\n\n${request.question}`,
-          "--timeout",
-          "60000",
+          "--wait",
         ],
         signal,
       );
@@ -1853,8 +1852,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             "prompt",
             request.paneId,
             `Herdr parent answer to your question (${requestId}):\n${answer}`,
-            "--timeout",
-            "60000",
+            "--wait",
           ],
           signal,
         );
