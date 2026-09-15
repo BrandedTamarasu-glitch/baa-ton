@@ -2607,6 +2607,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         attestHelper: fileURLToPath(
           new URL("./codex-startup-attest.mjs", import.meta.url),
         ),
+        sessionRoot: join(homedir(), ".codex", "sessions"),
       }),
     );
     adapters.register(

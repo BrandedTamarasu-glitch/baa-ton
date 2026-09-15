@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
@@ -105,6 +105,58 @@ test("codex verifyStartup binds thread identity for id and path sessions", () =>
   );
 });
 
+test("codex rollout fallback fences identity when Herdr exposes no agent_session", async () => {
+  const root = await mkdtemp(join(tmpdir(), "baa-codex-sessions-"));
+  try {
+    const day = join(root, "2026", "09", "15");
+    await mkdir(day, { recursive: true });
+    const threadId = "01a0a697-9dcc-4f1e";
+    const rollout = join(day, `rollout-2026-09-15T12-00-00-${threadId}.jsonl`);
+    await writeFile(rollout, "{}", { mode: 0o600 });
+    const adapter = codexLaunchAdapter({
+      bridge: "/b.js",
+      attestHelper: "/a.js",
+      sessionRoot: root,
+    });
+    const attestation = {
+      paneId: "w17:p9",
+      workspaceId: "w17",
+      nonce: "n",
+      source: "/src/index.ts",
+      profile,
+      sessionId: threadId,
+      operations: ["plan", "complete"],
+    };
+    const native = {
+      agent: "codex",
+      pane_id: "w17:p9",
+      workspace_id: "w17",
+      // Herdr 0.9.0 codex agents expose no agent_session at all.
+    };
+    const proof = adapter.verifyStartup(native, attestation);
+    assert.equal(proof.session.kind, "path");
+    assert.equal(proof.session.value, rollout);
+    await writeFile(
+      join(day, `rollout-2026-09-15T13-00-00-${threadId}.jsonl`),
+      "{}",
+      { mode: 0o600 },
+    );
+    assert.throws(
+      () => adapter.verifyStartup(native, attestation),
+      /no durable rollout/,
+    );
+    await rm(rollout, { force: true });
+    await rm(join(day, `rollout-2026-09-15T13-00-00-${threadId}.jsonl`), {
+      force: true,
+    });
+    assert.throws(
+      () => adapter.verifyStartup(native, attestation),
+      /no durable rollout/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 test("codex notify helper attests thread identity and fails closed on binding mismatch", async () => {
   const directory = await mkdtemp(join(tmpdir(), "baa-codex-helper-"));
   try {

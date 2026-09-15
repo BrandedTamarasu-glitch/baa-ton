@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import type { LaunchProfile } from "./launch-profile.js";
 import {
@@ -15,6 +15,10 @@ export type CodexAdapterPaths = {
   bridge: string;
   /** Absolute path to the notify attestation helper. */
   attestHelper: string;
+  /** Codex durable session root. Herdr 0.9.0 does not surface a native
+   * agent_session for codex; rollout files are codex's own session identity
+   * (what `codex resume` consumes) and provide incarnation fencing. */
+  sessionRoot: string;
 };
 
 function codexBinaryAvailable(): boolean {
@@ -22,6 +26,38 @@ function codexBinaryAvailable(): boolean {
     if (entry && existsSync(join(resolve(entry), "codex"))) return true;
   }
   return false;
+}
+
+/** Find codex's durable rollout for an attested thread id. Sessions are laid
+ * out as <root>/YYYY/MM/DD/rollout-*-<thread-id>.jsonl. Bounded depth walk;
+ * exactly one match is accepted so an ambiguous or absent identity fails
+ * closed. */
+function findRolloutForThread(
+  sessionRoot: string,
+  threadId: string,
+): string | null {
+  const matches: string[] = [];
+  const walk = (directory: string, depth: number) => {
+    if (depth > 3 || matches.length > 1) return;
+    let entries;
+    try {
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) walk(path, depth + 1);
+      else if (
+        entry.isFile() &&
+        entry.name.endsWith(".jsonl") &&
+        entry.name.includes(threadId)
+      )
+        matches.push(path);
+    }
+  };
+  walk(sessionRoot, 0);
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function filterProtocolOperations(operations: unknown): ProtocolOperation[] {
@@ -108,19 +144,35 @@ export function codexLaunchAdapter(paths: CodexAdapterPaths): HarnessLaunchAdapt
         throw new Error("Codex native identity mismatch; no work assigned.");
       const kind = agent.agent_session?.kind;
       const value = agent.agent_session?.value;
-      if (kind !== "path" && kind !== "id")
-        throw new Error("Codex native session reference missing; no work assigned.");
-      if (typeof value !== "string" || !value)
-        throw new Error("Codex native session reference missing; no work assigned.");
+      if (kind !== undefined && kind !== "path" && kind !== "id")
+        throw new Error("Codex native session reference malformed; no work assigned.");
+      if (kind !== undefined && (typeof value !== "string" || !value))
+        throw new Error("Codex native session reference malformed; no work assigned.");
       if (typeof hello.sessionId !== "string" || !hello.sessionId)
         throw new Error("Codex attestation lacks thread identity; no work assigned.");
-      // Native identity is either the thread id itself (kind id) or a rollout
-      // file path embedding it (kind path); both must bind to the attestation.
-      const attested = kind === "id" ? value === hello.sessionId : value.includes(hello.sessionId);
-      if (!attested)
-        throw new Error(
-          "Codex session attestation does not match native identity; no work assigned.",
-        );
+      let session: { kind: "path" | "id"; value: string };
+      if (kind === "id" || kind === "path") {
+        // Native identity is authoritative when Herdr exposes it: a mismatch
+        // fences the lane instead of falling back to a weaker check.
+        const matches =
+          kind === "id"
+            ? value === hello.sessionId
+            : value!.includes(hello.sessionId);
+        if (!matches)
+          throw new Error(
+            "Codex session attestation does not match native identity; no work assigned.",
+          );
+        session = { kind, value: value! };
+      } else {
+        // Herdr 0.9.0 exposes no agent_session for codex; fence against
+        // codex's own durable rollout store, its native session identity.
+        const rollout = findRolloutForThread(paths.sessionRoot, hello.sessionId);
+        if (!rollout)
+          throw new Error(
+            "Codex attested thread has no durable rollout; no work assigned.",
+          );
+        session = { kind: "path", value: rollout };
+      }
       if (agent.pane_id !== hello.paneId || agent.workspace_id !== hello.workspaceId)
         throw new Error("Codex startup binding mismatch; no work assigned.");
       return {
@@ -130,7 +182,7 @@ export function codexLaunchAdapter(paths: CodexAdapterPaths): HarnessLaunchAdapt
         source: hello.source!,
         profile: hello.profile!,
         operations: filterProtocolOperations(hello.operations),
-        session: { kind, value },
+        session,
       };
     },
   };
