@@ -15,6 +15,15 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { handleHook, runSupervisorTick } from "../controller/controller.mjs";
 
+// This check simulates its own session_start events against synthetic
+// fixtures; it never dispatches a real lane. BAA_STARTUP_INTENT is set only
+// by dispatch-task.ts for an actually-launched lane and points at a startup
+// proof file that does not exist here. An inherited copy of that variable
+// (e.g. this check running inside a pane that a lane itself dispatched)
+// must not make session_start try to read and verify it, so drop it before
+// exercising anything rather than requiring `env -u` at the call site.
+delete process.env.BAA_STARTUP_INTENT;
+
 const root = dirname(fileURLToPath(import.meta.url));
 const source = await readFile(join(root, "index.ts"), "utf8");
 const readme = await readFile(join(root, "README.md"), "utf8");
