@@ -1,3 +1,5 @@
+export const LAUNCH_PROFILE_SCHEMA_VERSION = 1 as const;
+
 export type LaunchProfile = {
   provider: string;
   model: string;
@@ -5,11 +7,16 @@ export type LaunchProfile = {
   auth: "subscription";
 };
 
+export type LaunchProfileVersion = typeof LAUNCH_PROFILE_SCHEMA_VERSION;
+
 /** Shape validation only. Provider IDs and thinking support belong to adapters. */
-export function validateLaunchProfile(input: unknown): LaunchProfile {
+export function validateLaunchProfile(
+  input: unknown,
+  label = "launchProfile",
+): LaunchProfile {
   if (!input || typeof input !== "object" || Array.isArray(input))
     throw new Error(
-      "An explicit launchProfile (provider, model, thinking, auth) is required; no model substitution is allowed.",
+      `An explicit launchProfile (provider, model, thinking, auth) is required for ${label}; no model substitution is allowed.`,
     );
   const profile = input as LaunchProfile;
   if (
@@ -23,6 +30,6 @@ export function validateLaunchProfile(input: unknown): LaunchProfile {
     ) ||
     profile.auth !== "subscription"
   )
-    throw new Error("Invalid launchProfile.");
+    throw new Error(`Invalid ${label}.`);
   return { ...profile };
 }

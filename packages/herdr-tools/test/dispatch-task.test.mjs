@@ -25,6 +25,8 @@ async function fixture(options = {}) {
   const calls = [],
     panes = new Map();
   const launchProfile = options.profile ?? profile;
+  const laneProfiles = options.laneProfiles ?? [];
+  const profileForLane = (index) => laneProfiles[index] ?? launchProfile;
   let number = 0,
     registered = false;
   let state = {
@@ -38,6 +40,9 @@ async function fixture(options = {}) {
       id: `lane-${i}`,
       agentKind: options.adapter?.kind ?? "pi",
       status: "planned",
+      ...(laneProfiles[i - 1]
+        ? { launchProfile: laneProfiles[i - 1], launchProfileVersion: 1 }
+        : {}),
     })),
     ownership: { createdBy: "herdr-orchestrator", tabIds: [], paneIds: [] },
     evidence: [],
@@ -45,7 +50,11 @@ async function fixture(options = {}) {
   const ctx = {
     modelRegistry: {
       find: (provider, model) =>
-        provider === launchProfile.provider && model === launchProfile.model
+      provider === launchProfile.provider && model === launchProfile.model
+        || laneProfiles.some(
+          (laneProfile) =>
+            provider === laneProfile.provider && model === laneProfile.model,
+        )
           ? {
               reasoning: true,
               thinkingLevelMap: options.thinkingLevelMap ?? {
@@ -141,16 +150,19 @@ async function fixture(options = {}) {
           true,
           "route is established before start, not after assignment",
         );
-        assert.equal(args[args.indexOf("--model") + 1], launchProfile.model);
+        const p = panes.get(args[args.indexOf("--pane") + 1]);
+        const laneIndex = [...panes.values()].indexOf(p);
+        const selectedProfile = profileForLane(laneIndex);
+        assert.equal(args[args.indexOf("--model") + 1], selectedProfile.model);
         if (args.includes("--provider"))
           assert.equal(
             args[args.indexOf("--provider") + 1],
-            launchProfile.provider,
+            selectedProfile.provider,
           );
         for (const flag of ["--thinking", "--effort"])
           if (args.includes(flag))
-            assert.equal(args[args.indexOf(flag) + 1], launchProfile.thinking);
-        const p = panes.get(args[args.indexOf("--pane") + 1]);
+            assert.equal(args[args.indexOf(flag) + 1], selectedProfile.thinking);
+        if (p.unrelated) throw new Error("agent_pane_busy: unrelated occupant");
         if (options.startSilentOnce) {
           options.startSilentOnce = false;
           p.absent = true;
@@ -173,13 +185,14 @@ async function fixture(options = {}) {
           );
         }
         const intent = JSON.parse(await readFile(p.intentPath, "utf8"));
+        p.sessionGeneration = (p.sessionGeneration ?? 0) + 1;
         const hello = {
           nonce: intent.nonce,
           paneId: p.paneId,
           workspaceId: "task-space",
           source: ports.source,
-          sessionPath: `/sessions/${p.paneId}.jsonl`,
-          profile: launchProfile,
+          sessionPath: `/sessions/${p.paneId}-${p.sessionGeneration}.jsonl`,
+          profile: selectedProfile,
           tools: options.nativeTools ?? [
             "herdr_complete",
             "herdr_plan",
@@ -191,6 +204,17 @@ async function fixture(options = {}) {
         p.sessionKind = hello.sessionId && !hello.sessionPath ? "id" : "path";
         delete p.absent;
         await writeFile(`${p.intentPath}.ready`, JSON.stringify(hello));
+        return {};
+      }
+      if (args[0] === "agent" && args[1] === "send-keys") {
+        const p = panes.get(args[2]);
+        assert.equal(args[3], "ctrl+c");
+        if (options.unrelatedAfterRestart) {
+          p.unrelated = true;
+          p.absent = false;
+          p.session = "/sessions/unrelated.jsonl";
+          p.sessionKind = "path";
+        } else p.absent = true;
         return {};
       }
       if (args[0] === "agent" && args[1] === "get") {
@@ -239,7 +263,8 @@ async function fixture(options = {}) {
     panes,
     ctx,
     ports,
-    run: () => dispatchTask(structuredClone(state), true, ports),
+    run: (options = {}) =>
+      dispatchTask(structuredClone(state), true, ports, undefined, options),
     close: () => rm(directory, { recursive: true, force: true }),
   };
 }
@@ -352,6 +377,70 @@ test("absent thinking level dispatches under runtime attestation", async () => {
   try {
     assert.equal((await f.run()).dispatched, true);
     assert.equal(f.calls.filter((c) => c[1] === "prompt").length, 2);
+  } finally {
+    await f.close();
+  }
+});
+
+test("lane launch profiles override the version-1 workflow fallback independently", async () => {
+  const f = await fixture({
+    laneProfiles: [
+      { ...profile, thinking: "xhigh" },
+      { ...profile, thinking: "max" },
+    ],
+  });
+  try {
+    assert.equal((await f.run()).dispatched, true);
+    const starts = f.calls.filter((call) => call[0] === "agent" && call[1] === "start");
+    assert.deepEqual(
+      starts.map((call) => call[call.indexOf("--thinking") + 1]),
+      ["xhigh", "max"],
+    );
+    assert.deepEqual(
+      f.state.lanes.map((lane) => lane.launchProfile.thinking),
+      ["xhigh", "max"],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("an orchestrator restart rebinds every lane to a fresh incarnation", async () => {
+  const f = await fixture();
+  try {
+    assert.equal((await f.run()).dispatched, true);
+    const before = f.state.lanes.map((lane) => lane.nativeSession.value);
+    assert.equal((await f.run({ restart: true })).dispatched, true);
+    const after = f.state.lanes.map((lane) => lane.nativeSession.value);
+    assert.notDeepEqual(after, before);
+    assert.equal(
+      f.calls.filter((call) => call[0] === "agent" && call[1] === "send-keys").length,
+      2,
+    );
+    assert.ok(f.state.lanes.every((lane) => lane.restart.status === "bound"));
+    assert.ok(
+      f.state.lanes.every((lane) => lane.incarnationRevision === 2),
+      "the new sessions are a durable authorized incarnation, not a pane alias",
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("an unrelated occupant after restart authorization never inherits the lane", async () => {
+  const f = await fixture({ unrelatedAfterRestart: true });
+  try {
+    assert.equal((await f.run()).dispatched, true);
+    await assert.rejects(
+      f.run({ restart: true }),
+      /agent_pane_busy|unrelated occupant/,
+    );
+    assert.equal(f.calls.filter((call) => call[1] === "prompt").length, 2);
+    assert.equal(
+      f.state.lanes.some((lane) => lane.status === "running"),
+      false,
+      "the failed rebind must not assign work to the unrelated process",
+    );
   } finally {
     await f.close();
   }

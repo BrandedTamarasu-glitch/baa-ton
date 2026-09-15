@@ -185,14 +185,18 @@ test("a parent pause during herdr_observe's unlocked reads is never overwritten 
     );
     release();
     const observed = await inFlight;
-    assert.equal(observed.details.workflow.status, "completed");
+    assert.equal(
+      observed.details.workflow.status,
+      "awaiting-explicit-outcome",
+      "native Herdr done is readiness telemetry, not task success",
+    );
     const final = JSON.parse(await readFile(manifestFile, "utf8"));
     assert.equal(
       final.parentGoal.status,
       "paused",
       "observe()'s eventual save must not revert a pause it never touched",
     );
-    assert.equal(final.workflows[0].status, "completed");
+    assert.equal(final.workflows[0].status, "awaiting-explicit-outcome");
     assert.equal(final.workflows[0].lanes[0].herdrState, "done");
   } finally {
     for (const [key, value] of Object.entries(saved))

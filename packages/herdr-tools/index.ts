@@ -21,7 +21,12 @@ import type {
 import { Type } from "typebox";
 import { blocksUnmanagedAgentCommand } from "./command-policy.js";
 import { dispatchTask } from "./dispatch-task.js";
-import { type LaunchProfile, validateLaunchProfile } from "./launch-profile.js";
+import {
+  LAUNCH_PROFILE_SCHEMA_VERSION,
+  type LaunchProfile,
+  type LaunchProfileVersion,
+  validateLaunchProfile,
+} from "./launch-profile.js";
 import { piLaunchAdapter, verifyActualProfile } from "./pi-launch-adapter.js";
 import { claudeLaunchAdapter } from "./claude-launch-adapter.js";
 import { codexLaunchAdapter } from "./codex-launch-adapter.js";
@@ -185,6 +190,22 @@ type EventControllerRegistration = {
   workflow?: ControllerWorkflowMapping;
 };
 export type Lane = {
+  goalId?: string;
+  goalRevision?: number;
+  dependencies?: string[];
+  goalOwnership?: GoalOwnership;
+  launchProfile?: LaunchProfile;
+  launchProfileVersion?: LaunchProfileVersion;
+  incarnationId?: string;
+  incarnationRevision?: number;
+  incarnationStartedAt?: string;
+  restart?: {
+    version: 1;
+    status: "requested" | "starting" | "bound";
+    requestedAt: string;
+    previousIncarnationId?: string;
+    incarnationId: string;
+  };
   nativeSession?: NativeSessionRef;
   completionReceipt?: {
     id: string;
@@ -232,7 +253,41 @@ type WorktreeBinding = {
 };
 type LaneInput =
   | string
-  | { objective: string; readOnly?: boolean; agentKind?: AgentKind };
+  | {
+      objective: string;
+      readOnly?: boolean;
+      agentKind?: AgentKind;
+      launchProfile?: unknown;
+      dependencies?: string[];
+      dependsOn?: string[];
+    };
+
+type GoalStatus =
+  | "planned"
+  | "ready"
+  | "running"
+  | "blocked"
+  | "completed"
+  | "paused";
+type GoalOutcome = "unresolved" | "success" | "failure" | "cancelled";
+export type GoalOwnership = {
+  scope: "workflow" | "lane";
+  workflowId: string;
+  laneId?: string;
+  authority: "authorized-root" | "lane";
+};
+export type GoalRecord = {
+  version: 1;
+  id: string;
+  revision: number;
+  parentId?: string;
+  dependencies: string[];
+  objective: string;
+  status: GoalStatus;
+  outcome: GoalOutcome;
+  ownership: GoalOwnership;
+  updatedAt: string;
+};
 export type Workflow = {
   taskBinding?: {
     workspaceId: string;
@@ -240,6 +295,10 @@ export type Workflow = {
     rootSessionPath: string;
   };
   launchProfile?: LaunchProfile;
+  launchProfileVersion?: LaunchProfileVersion;
+  goalSchemaVersion: 1;
+  rootGoalId: string;
+  goals: GoalRecord[];
   id: string;
   objective: string;
   outcome: "planned" | "running" | "completed" | "closed" | "unknown";
@@ -360,6 +419,7 @@ const HERDR_PANE_ID_ENV = "HERDR_PANE_ID";
 const HERDR_PLUGIN_CONFIG_DIR_ENV = "HERDR_PLUGIN_CONFIG_DIR";
 const CONTROLLER_PLUGIN_ID = "herdr-orchestrator-controller";
 const CONTROLLER_CONFIG_NAME = "config.json";
+const SCOPED_GOALS_SCHEMA_VERSION = 1 as const;
 const now = () => new Date().toISOString();
 const manifestPath = (cwd: string) => join(cwd, MANIFEST_DIR, MANIFEST_NAME);
 const jsonText = (value: unknown) => JSON.stringify(value, null, 2);
@@ -393,6 +453,128 @@ function pausedGoalIds(output: string): string[] {
   return [...goalIds].sort((left, right) => left.localeCompare(right));
 }
 
+function goalStatus(value: unknown, fallback: GoalStatus): GoalStatus {
+  return typeof value === "string" &&
+    ["planned", "ready", "running", "blocked", "completed", "paused"].includes(
+      value,
+    )
+    ? (value as GoalStatus)
+    : fallback;
+}
+
+function goalOutcome(value: unknown, fallback: GoalOutcome): GoalOutcome {
+  return typeof value === "string" &&
+    ["unresolved", "success", "failure", "cancelled"].includes(value)
+    ? (value as GoalOutcome)
+    : fallback;
+}
+
+function normalizeWorkflowGoals(workflow: Workflow): Workflow {
+  if (!Array.isArray(workflow.lanes)) return workflow;
+  const rootGoalId =
+    typeof workflow.rootGoalId === "string" && workflow.rootGoalId
+      ? workflow.rootGoalId
+      : `goal-${workflow.id}`;
+  const existing = Array.isArray(workflow.goals) ? workflow.goals : [];
+  const byId = new Map(
+    existing
+      .filter(
+        (goal): goal is GoalRecord =>
+          isRecord(goal) && typeof goal.id === "string",
+      )
+      .map((goal) => [goal.id, goal]),
+  );
+  const timestamp =
+    typeof workflow.updatedAt === "string" && workflow.updatedAt
+      ? workflow.updatedAt
+      : now();
+  const rootExisting = byId.get(rootGoalId);
+  const root: GoalRecord = {
+    version: 1,
+    id: rootGoalId,
+    revision:
+      typeof rootExisting?.revision === "number" &&
+      Number.isSafeInteger(rootExisting.revision) &&
+      rootExisting.revision > 0
+        ? rootExisting.revision
+        : 1,
+    dependencies: Array.isArray(rootExisting?.dependencies)
+      ? rootExisting.dependencies.filter(
+          (item): item is string => typeof item === "string",
+        )
+      : [],
+    objective: workflow.objective,
+    status: goalStatus(rootExisting?.status, "planned"),
+    outcome: goalOutcome(rootExisting?.outcome, "unresolved"),
+    ownership: {
+      scope: "workflow",
+      workflowId: workflow.id,
+      authority: "authorized-root",
+    },
+    updatedAt: rootExisting?.updatedAt ?? timestamp,
+  };
+  const laneGoals: GoalRecord[] = [];
+  for (const lane of workflow.lanes) {
+    const goalId =
+      typeof lane.goalId === "string" && lane.goalId
+        ? lane.goalId
+        : `${rootGoalId}/${lane.id}`;
+    const existingGoal = byId.get(goalId);
+    const explicitSuccess = Boolean(lane.completionReceipt);
+    const revision =
+      typeof existingGoal?.revision === "number" &&
+      Number.isSafeInteger(existingGoal.revision) &&
+      existingGoal.revision > 0
+        ? existingGoal.revision
+        : Number.isSafeInteger(lane.goalRevision) && lane.goalRevision! > 0
+          ? lane.goalRevision!
+          : 1;
+    const dependencies = Array.isArray(lane.dependencies)
+      ? lane.dependencies.filter(
+          (item): item is string => typeof item === "string",
+        )
+      : Array.isArray(existingGoal?.dependencies)
+        ? existingGoal.dependencies.filter(
+            (item): item is string => typeof item === "string",
+          )
+        : [];
+    const goal: GoalRecord = {
+      version: 1,
+      id: goalId,
+      revision,
+      parentId: rootGoalId,
+      dependencies,
+      objective: lane.objective,
+      status: explicitSuccess
+        ? "completed"
+        : goalStatus(existingGoal?.status, "planned"),
+      outcome: explicitSuccess
+        ? "success"
+        : goalOutcome(existingGoal?.outcome, "unresolved"),
+      ownership: {
+        scope: "lane",
+        workflowId: workflow.id,
+        laneId: lane.id,
+        authority: "lane",
+      },
+      updatedAt: existingGoal?.updatedAt ?? timestamp,
+    };
+    lane.goalId = goal.id;
+    lane.goalRevision = goal.revision;
+    lane.dependencies = goal.dependencies;
+    lane.goalOwnership = goal.ownership;
+    if (lane.launchProfile && lane.launchProfileVersion === undefined)
+      lane.launchProfileVersion = LAUNCH_PROFILE_SCHEMA_VERSION;
+    laneGoals.push(goal);
+  }
+  workflow.goalSchemaVersion = SCOPED_GOALS_SCHEMA_VERSION;
+  workflow.rootGoalId = rootGoalId;
+  workflow.goals = [root, ...laneGoals];
+  if (workflow.launchProfile && workflow.launchProfileVersion === undefined)
+    workflow.launchProfileVersion = LAUNCH_PROFILE_SCHEMA_VERSION;
+  return workflow;
+}
+
 async function loadManifest(cwd: string): Promise<Manifest> {
   try {
     const parsed = JSON.parse(await readFile(manifestPath(cwd), "utf8")) as {
@@ -407,7 +589,9 @@ async function loadManifest(cwd: string): Promise<Manifest> {
     )
       return {
         version: 2,
-        workflows: parsed.workflows as Workflow[],
+        workflows: (parsed.workflows as Workflow[]).map((workflow) =>
+          normalizeWorkflowGoals(workflow),
+        ),
         parentGoal: parsed.parentGoal,
         questionRequests: parsed.questionRequests,
       };
@@ -719,27 +903,153 @@ function normalizedLanes(
   objective: string,
   inputs: LaneInput[],
   defaultAgentKind: AgentKind,
+  workflowId: string,
+  rootGoalId: string,
 ): Lane[] {
   const values = inputs.length ? inputs : [objective];
   return values.map((input, index) => {
+    const laneId = `lane-${index + 1}`;
+    const goalId = `${rootGoalId}/${laneId}`;
     if (typeof input === "string")
       return {
-        id: `lane-${index + 1}`,
+        id: laneId,
         objective: input,
         readOnly: false,
         agentKind: defaultAgentKind,
         status: "planned",
+        goalId,
+        goalRevision: 1,
+        dependencies: [],
+        goalOwnership: {
+          scope: "lane" as const,
+          workflowId,
+          laneId,
+          authority: "lane" as const,
+        },
       };
     if (!input || typeof input.objective !== "string" || !input.objective)
       throw new Error("Each lane object needs a non-empty objective.");
+    const launchProfile =
+      input.launchProfile === undefined
+        ? undefined
+        : validateLaunchProfile(
+            input.launchProfile,
+            `Lane ${laneId} launchProfile`,
+          );
     return {
-      id: `lane-${index + 1}`,
+      id: laneId,
       objective: input.objective,
       readOnly: input.readOnly === true,
       agentKind: validateAgentKind(input.agentKind ?? defaultAgentKind),
       status: "planned",
+      goalId,
+      goalRevision: 1,
+      dependencies: Array.isArray(input.dependencies ?? input.dependsOn)
+        ? [...(input.dependencies ?? input.dependsOn)!]
+        : [],
+      goalOwnership: {
+        scope: "lane" as const,
+        workflowId,
+        laneId,
+        authority: "lane" as const,
+      },
+      ...(launchProfile
+        ? {
+            launchProfile,
+            launchProfileVersion: LAUNCH_PROFILE_SCHEMA_VERSION,
+          }
+        : {}),
     };
   });
+}
+
+function createWorkflowGoals(
+  workflowId: string,
+  objective: string,
+  lanes: Lane[],
+): { rootGoalId: string; goals: GoalRecord[] } {
+  const rootGoalId = `goal-${workflowId}`;
+  const laneIds = new Set(lanes.map((lane) => lane.id));
+  const laneGoalIds = new Map(lanes.map((lane) => [lane.id, lane.goalId!]));
+  const root: GoalRecord = {
+    version: 1,
+    id: rootGoalId,
+    revision: 1,
+    dependencies: [],
+    objective,
+    status: "planned",
+    outcome: "unresolved",
+    ownership: {
+      scope: "workflow",
+      workflowId,
+      authority: "authorized-root",
+    },
+    updatedAt: now(),
+  };
+  const laneGoals = lanes.map((lane) => {
+    const requested = lane.dependencies ?? [];
+    for (const dependency of requested)
+      if (!laneIds.has(dependency))
+        throw new Error(
+          `Lane ${lane.id} dependency must reference another lane ID: ${dependency}.`,
+        );
+    if (requested.includes(lane.id))
+      throw new Error(`Lane ${lane.id} cannot depend on itself.`);
+    const dependencies = requested.map(
+      (dependency) => laneGoalIds.get(dependency)!,
+    );
+    lane.dependencies = dependencies;
+    const goal: GoalRecord = {
+      version: 1,
+      id: lane.goalId!,
+      revision: 1,
+      parentId: rootGoalId,
+      dependencies,
+      objective: lane.objective,
+      status: "planned",
+      outcome: "unresolved",
+      ownership: lane.goalOwnership!,
+      updatedAt: now(),
+    };
+    return goal;
+  });
+  return { rootGoalId, goals: [root, ...laneGoals] };
+}
+
+function laneGoal(workflow: Workflow, lane: Lane): GoalRecord {
+  const goal = workflow.goals.find((item) => item.id === lane.goalId);
+  if (
+    !goal ||
+    goal.ownership.scope !== "lane" ||
+    goal.ownership.laneId !== lane.id
+  )
+    throw new Error(`Lane ${lane.id} has no scoped goal owned by that lane.`);
+  return goal;
+}
+
+function updateLaneGoal(
+  workflow: Workflow,
+  lane: Lane,
+  status: GoalStatus,
+  outcome: GoalOutcome,
+): void {
+  const goal = laneGoal(workflow, lane);
+  if (goal.status === status && goal.outcome === outcome) return;
+  goal.revision += 1;
+  goal.status = status;
+  goal.outcome = outcome;
+  goal.updatedAt = now();
+  lane.goalRevision = goal.revision;
+}
+
+function workflowHasExplicitSuccess(workflow: Workflow): boolean {
+  return (
+    workflow.lanes.length > 0 &&
+    workflow.lanes.every((lane) => {
+      const goal = laneGoal(workflow, lane);
+      return goal.outcome === "success";
+    })
+  );
 }
 
 function exactKeys(value: Record<string, unknown>, keys: string[]): boolean {
@@ -1306,6 +1616,18 @@ function deepString(value: unknown, keys: string[]): string | undefined {
 
 function deepState(value: unknown): string | undefined {
   return deepString(value, ["agent_status", "state", "agent_state", "status"]);
+}
+
+function nativeSessionFromAgent(value: unknown): NativeSessionRef | undefined {
+  if (!isRecord(value) || !isRecord(value.agent_session)) return undefined;
+  const session = value.agent_session;
+  if (
+    (session.kind !== "path" && session.kind !== "id") ||
+    typeof session.value !== "string" ||
+    !session.value
+  )
+    return undefined;
+  return { kind: session.kind, value: session.value };
 }
 
 function contract(workflow: Workflow, lane: Lane): string {
@@ -2469,7 +2791,15 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         `authorizationPolicy.scope.workflow requires an objective containing ${BB029_AUTHORIZATION_SCOPE}.`,
       );
     const target = await plannedCwd(cwd, worktreeCwd);
-    const lanes = normalizedLanes(objective, laneObjectives, agentKind);
+    const id = `herdr-${randomUUID().slice(0, 8)}`;
+    const rootGoalId = `goal-${id}`;
+    const lanes = normalizedLanes(
+      objective,
+      laneObjectives,
+      agentKind,
+      id,
+      rootGoalId,
+    );
     if (
       target.worktree &&
       lanes.length > 1 &&
@@ -2502,7 +2832,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ? undefined
         : validateLaunchProfile(launchProfileInput);
     const stamp = now();
-    const id = `herdr-${randomUUID().slice(0, 8)}`;
+    const goals = createWorkflowGoals(id, objective, lanes);
     const workflow: Workflow = {
       id,
       objective,
@@ -2521,6 +2851,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         rootSessionPath,
       },
       launchProfile,
+      ...(launchProfile
+        ? { launchProfileVersion: LAUNCH_PROFILE_SCHEMA_VERSION }
+        : {}),
+      goalSchemaVersion: SCOPED_GOALS_SCHEMA_VERSION,
+      rootGoalId: goals.rootGoalId,
+      goals: goals.goals,
       evidence: [],
       ownership: { createdBy: OWNER, tabIds: [], paneIds: [] },
       authorizationPolicy,
@@ -2558,6 +2894,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     execute: boolean,
     ctx: ExtensionContext,
     signal?: AbortSignal,
+    restart = false,
   ): Promise<{
     workflow: Workflow;
     dryRun?: boolean;
@@ -2713,6 +3050,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         },
       },
       signal,
+      { restart },
     );
   }
 
@@ -2844,23 +3182,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const hasPausedGoal = observations.some(
       (item) => item.pausedGoalIds.length > 0,
     );
-    const completed =
+    const allNativeAgentsSettled =
       states.length > 0 && states.every((state) => state === "done");
-    const status = hasPausedGoal
+    const observedStatus = hasPausedGoal
       ? "goal-paused"
-      : completed
-        ? "completed"
-        : states.includes("blocked")
-          ? "blocked"
-          : states.includes("working")
-            ? "running"
-            : "unknown";
-    const outcome =
-      completed && !hasPausedGoal
-        ? "completed"
-        : status === "running"
+      : states.includes("blocked")
+        ? "blocked"
+        : states.includes("working")
           ? "running"
-          : "unknown";
+          : allNativeAgentsSettled
+            ? "awaiting-explicit-outcome"
+            : "unknown";
     const observationEvidenceText = clip(jsonText(observations), 6000);
 
     const observedWorkflow = await withManifestTransaction(cwd, (current) => {
@@ -2876,8 +3208,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         stored.agent = primaryLaneUpdate.agent;
         if (primaryLaneUpdate.pi) stored.pi = primaryLaneUpdate.pi;
       }
-      stored.status = status;
-      stored.outcome = outcome;
+      const explicitlyCompleted = workflowHasExplicitSuccess(stored);
+      stored.status = explicitlyCompleted ? "completed" : observedStatus;
+      stored.outcome = explicitlyCompleted ? "completed" : "unknown";
       stored.observedAt = now();
       stored.updatedAt = now();
       stored.evidence.push({
@@ -3053,19 +3386,20 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       signal,
     );
     const child = liveAgentIdentity(raw, "completion child identity");
-    const nativeSession = responseRecord(raw, "completion child").agent;
-    const sessionPath =
-      isRecord(nativeSession) && isRecord(nativeSession.agent_session)
-        ? nativeSession.agent_session.value
-        : undefined;
+    const nativeAgent = responseRecord(raw, "completion child").agent;
+    const liveSession = nativeSessionFromAgent(nativeAgent);
     if (
       !lane?.relationshipId ||
       child.paneId !== lane.paneId ||
       child.workspaceId !== assignment.lane.workspace_id ||
       child.kind !== laneAgentKind(initial, lane) ||
-      (lane.agentSessionPath
-        ? sessionPath !== lane.agentSessionPath
-        : child.name !== lane.agentName)
+      (lane.nativeSession
+        ? !liveSession ||
+          liveSession.kind !== lane.nativeSession.kind ||
+          liveSession.value !== lane.nativeSession.value
+        : lane.agentSessionPath
+          ? liveSession?.value !== lane.agentSessionPath
+          : child.name !== lane.agentName)
     )
       throw new Error(
         "Live child incarnation differs from its recorded completion authority.",
@@ -3080,7 +3414,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const current = stored.lanes.find((item) => item.id === lane.id)!;
         if (
           !current ||
-          current.agentSessionPath !== lane.agentSessionPath ||
+          (lane.nativeSession
+            ? !current.nativeSession ||
+              current.nativeSession.kind !== lane.nativeSession.kind ||
+              current.nativeSession.value !== lane.nativeSession.value
+            : current.agentSessionPath !== lane.agentSessionPath) ||
           current.relationshipId !== lane.relationshipId
         )
           throw new Error(
@@ -3102,13 +3440,18 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         return;
       }
       current.completionReceipt = {
-        id: current.relationshipId!,
+        id: current.incarnationId ?? current.relationshipId!,
         summary,
         delivery: "pending",
       };
       current.status = "completion-reported";
-      stored.status = "completion-reported";
-      stored.outcome = "unknown";
+      updateLaneGoal(stored, current, "completed", "success");
+      stored.status = workflowHasExplicitSuccess(stored)
+        ? "completed"
+        : "completion-reported";
+      stored.outcome = workflowHasExplicitSuccess(stored)
+        ? "completed"
+        : "unknown";
       stored.evidence.push({
         at: now(),
         kind: "child-completion-receipt",
@@ -3123,6 +3466,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       delivery,
       workflow,
       relationshipId: lane.relationshipId,
+      incarnationId: lane.incarnationId,
     });
     if (delivery !== "pending") return result();
     const rootBinding = assignment.record.root;
@@ -3910,6 +4254,19 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                   objective: Type.String(),
                   readOnly: Type.Optional(Type.Boolean()),
                   agentKind: Type.Optional(Type.String()),
+                  dependencies: Type.Optional(Type.Array(Type.String())),
+                  dependsOn: Type.Optional(Type.Array(Type.String())),
+                  launchProfile: Type.Optional(
+                    Type.Object(
+                      {
+                        provider: Type.String(),
+                        model: Type.String(),
+                        thinking: Type.String(),
+                        auth: Type.Literal("subscription"),
+                      },
+                      { additionalProperties: false },
+                    ),
+                  ),
                 },
                 { additionalProperties: false },
               ),
@@ -3983,7 +4340,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     name: "herdr_dispatch",
     label: "Herdr Dispatch",
     description:
-      "Dispatch verified Pi lanes into the root-bound task workspace only. Explicit provider/model/thinking/subscription launchProfile and startup proof are mandatory; no workspace creation or model fallback.",
+      "Dispatch verified lanes into the root-bound task workspace only. Explicit per-lane or workflow-fallback launch profiles and startup proof are mandatory; no workspace creation or model fallback.",
     promptSnippet:
       "Dispatch only a planned Herdr workflow; dry-run by default.",
     promptGuidelines: [
@@ -3992,6 +4349,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     parameters: Type.Object({
       workflowId: Type.String(),
       execute: Type.Optional(Type.Boolean()),
+      restart: Type.Optional(Type.Boolean()),
     }),
     async execute(_id, params, signal, _update, ctx) {
       const result = await dispatch(
@@ -4000,6 +4358,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         params.execute ?? false,
         ctx,
         signal,
+        params.restart ?? false,
       );
       return {
         content: [
@@ -4148,11 +4507,19 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     },
   });
   pi.registerCommand("herdr-dispatch", {
-    description: "Preview or dispatch: /herdr-dispatch <id> [--execute]",
+    description:
+      "Preview or dispatch: /herdr-dispatch <id> [--execute] [--restart]",
     handler: async (args, ctx) => {
-      const [id, flag] = args.trim().split(/\s+/);
+      const [id, ...flags] = args.trim().split(/\s+/);
       if (!id) throw new Error("Usage: /herdr-dispatch <id> [--execute]");
-      const result = await dispatch(ctx.cwd, id, flag === "--execute", ctx);
+      const result = await dispatch(
+        ctx.cwd,
+        id,
+        flags.includes("--execute"),
+        ctx,
+        undefined,
+        flags.includes("--restart"),
+      );
       let message = `Dispatched ${id}`;
       if (result.dryRun) message = `Dry-run: ${id}`;
       else if (result.parentApprovalRequired)

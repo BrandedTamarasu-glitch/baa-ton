@@ -3,7 +3,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { Workflow, Lane } from "./index.js";
-import { validateLaunchProfile } from "./launch-profile.js";
+import {
+  LAUNCH_PROFILE_SCHEMA_VERSION,
+  validateLaunchProfile,
+} from "./launch-profile.js";
 import {
   STARTUP_PROOF_REQUIRED_OPERATIONS,
   missingRequiredAdapterCapabilities,
@@ -22,6 +25,36 @@ export type DispatchPorts = {
   contract(workflow: Workflow, lane: Lane): string;
   busyRetryDelayMs?: number;
 };
+
+export type DispatchOptions = {
+  /** Rebind each lane to a new, orchestrator-authorized incarnation. */
+  restart?: boolean;
+};
+
+function nativeAgent(raw: any): any {
+  return (raw?.result ?? raw)?.agent;
+}
+
+function nativeSession(
+  agent: any,
+): { kind: "path" | "id"; value: string } | undefined {
+  const session = agent?.agent_session;
+  if (session?.kind === "path" || session?.kind === "id") {
+    return typeof session.value === "string" && session.value
+      ? { kind: session.kind, value: session.value }
+      : undefined;
+  }
+  return undefined;
+}
+
+function sameSession(
+  left: { kind: "path" | "id"; value: string } | undefined,
+  right: { kind: "path" | "id"; value: string } | undefined,
+): boolean {
+  return Boolean(
+    left && right && left.kind === right.kind && left.value === right.value,
+  );
+}
 
 /** Herdr has no native wait-for-shell command. `pane process-info` is the
  * native readiness signal: a pane is startable when its interactive shell is
@@ -59,6 +92,7 @@ export async function dispatchTask(
   execute: boolean,
   port: DispatchPorts,
   signal?: AbortSignal,
+  options: DispatchOptions = {},
 ) {
   if (!execute)
     return {
@@ -70,9 +104,32 @@ export async function dispatchTask(
       ],
     };
   await port.verifyRoot(workflow);
-  const profile = validateLaunchProfile(workflow.launchProfile);
+  const workflowProfile =
+    workflow.launchProfile === undefined
+      ? undefined
+      : validateLaunchProfile(workflow.launchProfile, "workflow launchProfile");
+  if (
+    workflow.launchProfile !== undefined &&
+    workflow.launchProfileVersion !== undefined &&
+    workflow.launchProfileVersion !== LAUNCH_PROFILE_SCHEMA_VERSION
+  )
+    throw new Error("Unsupported workflow launchProfile schema version.");
+  const profiles = workflow.lanes.map((lane) => {
+    if (
+      lane.launchProfile !== undefined &&
+      lane.launchProfileVersion !== undefined &&
+      lane.launchProfileVersion !== LAUNCH_PROFILE_SCHEMA_VERSION
+    )
+      throw new Error(
+        `Unsupported launchProfile schema version for lane ${lane.id}.`,
+      );
+    return validateLaunchProfile(
+      lane.launchProfile ?? workflowProfile,
+      `Lane ${lane.id} launchProfile`,
+    );
+  });
   const adapters = workflow.lanes.map((lane) => port.adapter(lane.agentKind));
-  for (const adapter of adapters) {
+  for (const [index, adapter] of adapters.entries()) {
     const missing = missingRequiredAdapterCapabilities(adapter);
     if (adapter.version !== 1 || missing.length > 0)
       throw new Error(
@@ -80,8 +137,9 @@ export async function dispatchTask(
           missing.length ? `: ${missing.join(", ")}` : ""
         }.`,
       );
-    await adapter.preflight(profile);
+    await adapter.preflight(profiles[index]);
   }
+  const restart = options.restart === true;
   const workspaceId = workflow.taskBinding?.workspaceId;
   if (
     !workspaceId ||
@@ -91,7 +149,14 @@ export async function dispatchTask(
     throw new Error(
       "Missing or mismatched task workspace binding; no replacement workspace will be created.",
     );
-  if (!["planned", "dispatch-failed", "starting"].includes(workflow.status))
+  if (
+    ![
+      "planned",
+      "dispatch-failed",
+      "starting",
+      ...(restart ? ["running"] : []),
+    ].includes(workflow.status)
+  )
     throw new Error(`Workflow cannot be dispatched from ${workflow.status}.`);
   if (!(await port.authorize(workflow))) return { cancelled: true, workflow };
   // Per-workflow effect serialization, not a global manifest transaction. The
@@ -146,6 +211,90 @@ export async function dispatchTask(
   let stage = "workspace-verify";
   try {
     await port.run(["workspace", "get", workspaceId], signal);
+    if (restart) {
+      for (let i = 0; i < workflow.lanes.length; i++) {
+        let lane = workflow.lanes[i];
+        if (
+          lane.restart?.status === "requested" ||
+          lane.restart?.status === "starting"
+        )
+          continue;
+        if (!lane.paneId || !lane.nativeSession)
+          throw new Error(
+            `Lane ${lane.id} cannot be restarted without a recorded native incarnation.`,
+          );
+        let raw;
+        try {
+          raw = await port.run(["agent", "get", lane.paneId], signal);
+        } catch (error) {
+          if (!/agent_not_found/.test(String(error))) throw error;
+        }
+        if (raw) {
+          const agent = nativeAgent(raw);
+          const liveSession = nativeSession(agent);
+          if (
+            !agent ||
+            agent.pane_id !== lane.paneId ||
+            agent.workspace_id !== workspaceId ||
+            agent.agent !== lane.agentKind ||
+            !sameSession(liveSession, lane.nativeSession)
+          )
+            throw new Error(
+              `Lane ${lane.id} has an unrelated or mismatched occupant; authorized rebind is refused.`,
+            );
+        }
+        const incarnationId = `incarnation-${randomUUID().slice(0, 12)}`;
+        const previousIncarnationId = lane.incarnationId;
+        await update((w) => {
+          const current = w.lanes[i];
+          current.restart = {
+            version: 1,
+            status: "requested",
+            requestedAt: new Date().toISOString(),
+            ...(previousIncarnationId ? { previousIncarnationId } : {}),
+            incarnationId,
+          };
+          current.incarnationId = incarnationId;
+          current.incarnationRevision = (current.incarnationRevision ?? 0) + 1;
+          delete current.incarnationStartedAt;
+          delete current.agentStartedAt;
+          delete current.agentStartAttemptedAt;
+          delete current.startupIntentPath;
+          delete current.startupNonce;
+          delete current.promptAttemptedAt;
+          delete current.promptedAt;
+          delete current.nativeSession;
+          delete current.agentSessionPath;
+          delete current.agentSessionId;
+          delete current.piSessionPath;
+          delete current.piSessionId;
+          delete current.completionReceipt;
+          current.status = "planned";
+          const goal = w.goals?.find((item) => item.id === current.goalId);
+          if (goal) {
+            goal.revision += 1;
+            goal.status = "planned";
+            goal.outcome = "unresolved";
+            goal.updatedAt = new Date().toISOString();
+            current.goalRevision = goal.revision;
+          }
+        });
+        lane = workflow.lanes[i];
+        if (raw)
+          await port.run(
+            ["agent", "send-keys", lane.paneId!, "ctrl+c"],
+            signal,
+          );
+        await update((w) => {
+          const current = w.lanes[i];
+          if (current.restart?.incarnationId === incarnationId)
+            current.restart.status = "starting";
+        });
+        workflow = await port.update(workflow.id, (w) => {
+          w.status = "starting";
+        });
+      }
+    }
     await update((w) => {
       w.status = "starting";
       w.ownership.workspaceId = workspaceId;
@@ -158,12 +307,15 @@ export async function dispatchTask(
     // Establish all routing before any assignment. Cwd only selects code location.
     for (let i = 0; i < workflow.lanes.length; i++) {
       let lane = workflow.lanes[i];
+      const profile = profiles[i];
       if (!lane.startupIntentPath) {
         const intentPath = join(
           port.directory,
           `${workflow.id}-${lane.id}-startup.json`,
         );
         const nonce = randomUUID();
+        const incarnationId =
+          lane.incarnationId ?? `incarnation-${randomUUID().slice(0, 12)}`;
         await writeFile(
           intentPath,
           JSON.stringify({
@@ -173,12 +325,17 @@ export async function dispatchTask(
             manifestDirectory: port.directory,
             workspaceId,
             profile,
+            profileVersion: LAUNCH_PROFILE_SCHEMA_VERSION,
+            incarnationId,
             nonce,
             source: port.source,
           }),
           { mode: 0o600 },
         );
         await update((w) => {
+          const current = w.lanes[i];
+          current.incarnationId = incarnationId;
+          current.incarnationRevision = current.incarnationRevision ?? 1;
           w.lanes[i].startupIntentPath = intentPath;
           w.lanes[i].startupNonce = nonce;
         });
@@ -248,9 +405,22 @@ export async function dispatchTask(
     await port.register(workflow);
     for (let i = 0; i < workflow.lanes.length; i++) {
       let lane = workflow.lanes[i];
+      const profile = profiles[i];
       const intent = JSON.parse(
         await readFile(lane.startupIntentPath!, "utf8"),
       );
+      const intentProfile = validateLaunchProfile(
+        intent.profile,
+        `Lane ${lane.id} startup intent profile`,
+      );
+      if (JSON.stringify(intentProfile) !== JSON.stringify(profile))
+        throw new Error(
+          `Lane ${lane.id} startup intent profile differs from its current launchProfile.`,
+        );
+      if (intent.incarnationId !== lane.incarnationId)
+        throw new Error(
+          `Lane ${lane.id} startup intent is not bound to its recorded incarnation.`,
+        );
       await writeFile(
         lane.startupIntentPath!,
         JSON.stringify({ ...intent, paneId: lane.paneId }),
@@ -268,7 +438,10 @@ export async function dispatchTask(
           present = !/agent_not_found/.test(String(error));
         }
         if (!present) {
-          const prior = await readFile(`${lane.startupIntentPath}.ready`, "utf8")
+          const prior = await readFile(
+            `${lane.startupIntentPath}.ready`,
+            "utf8",
+          )
             .then((text) => JSON.parse(text))
             .catch(() => null);
           if (prior && prior.nonce === lane.startupNonce)
@@ -415,11 +588,14 @@ export async function dispatchTask(
           "Unrelated replacement cannot inherit this lane; authorized incarnation recovery is required.",
         );
       await update((w) => {
-        w.lanes[i].nativeSession = proof.session;
+        const current = w.lanes[i];
+        current.nativeSession = proof.session;
+        current.incarnationStartedAt = new Date().toISOString();
         if (proof.session.kind === "path")
-          w.lanes[i].agentSessionPath = proof.session.value;
-        else w.lanes[i].agentSessionId = proof.session.value;
-        if (!w.lanes[i].completionReceipt) w.lanes[i].status = "agent-ready";
+          current.agentSessionPath = proof.session.value;
+        else current.agentSessionId = proof.session.value;
+        if (current.restart) current.restart.status = "bound";
+        if (!current.completionReceipt) current.status = "agent-ready";
       });
     }
     // No lane receives work until every lane is verified. Routing already exists.
@@ -440,8 +616,16 @@ export async function dispatchTask(
         signal,
       );
       await update((w) => {
-        w.lanes[i].promptedAt = new Date().toISOString();
-        if (!w.lanes[i].completionReceipt) w.lanes[i].status = "running";
+        const current = w.lanes[i];
+        current.promptedAt = new Date().toISOString();
+        if (!current.completionReceipt) current.status = "running";
+        const goal = w.goals?.find((item) => item.id === current.goalId);
+        if (goal && goal.outcome === "unresolved") {
+          goal.revision += 1;
+          goal.status = "running";
+          goal.updatedAt = new Date().toISOString();
+          current.goalRevision = goal.revision;
+        }
       });
     }
     await update((w) => {
