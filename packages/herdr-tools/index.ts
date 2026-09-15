@@ -461,6 +461,28 @@ async function acquireManifestLock(
   }
 }
 
+// The single transactional state owner for the manifest: every writer that
+// needs to mutate durable state after any await (a terminal/network call,
+// user confirmation, etc.) must reconcile against a freshly reloaded copy
+// under this same lock rather than blindly overwriting whatever it read
+// before that await. Never hold this across a terminal/network call; gather
+// external results first, then pass only the resulting mutation in.
+async function withManifestTransaction<T>(
+  cwd: string,
+  mutate: (manifest: Manifest) => T,
+  waitMs = 10_000,
+): Promise<T> {
+  const release = await acquireManifestLock(cwd, waitMs);
+  try {
+    const manifest = await loadManifest(cwd);
+    const result = mutate(manifest);
+    await saveManifest(cwd, manifest);
+    return result;
+  } finally {
+    await release();
+  }
+}
+
 const PARENT_GOAL_STATUSES = new Set<ParentGoalStatus>([
   "active",
   "waiting-for-event",
@@ -2089,10 +2111,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
 
   async function registerEventController(
     cwd: string,
-    manifest: Manifest,
-    workflow: Workflow,
+    id: string,
     signal?: AbortSignal,
   ): Promise<EventControllerRegistration> {
+    // Read-only snapshot for external identity checks only; the eventual
+    // registration write reconciles against a freshly reloaded manifest so
+    // it can never clobber a concurrent mutation made while these
+    // network/config calls were in flight.
+    const workflow = workflowFor(await loadManifest(cwd), id);
     try {
       const [configPath, root] = await Promise.all([
         controllerConfigPath(signal),
@@ -2172,10 +2198,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         root,
         workflow: mapping,
       };
-      recordControllerRegistration(workflow, registration);
-      workflow.updatedAt = now();
-      await saveManifest(cwd, manifest);
-      return registration;
+      return await withManifestTransaction(cwd, (current) => {
+        const stored = workflowFor(current, id);
+        recordControllerRegistration(stored, registration);
+        stored.updatedAt = now();
+        return registration;
+      });
     } catch (error) {
       const registration: EventControllerRegistration = {
         version: 1,
@@ -2183,10 +2211,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         updatedAt: now(),
         reason: clip((error as Error).message, 1200),
       };
-      recordControllerRegistration(workflow, registration);
-      workflow.updatedAt = now();
-      await saveManifest(cwd, manifest);
-      return registration;
+      return await withManifestTransaction(cwd, (current) => {
+        const stored = workflowFor(current, id);
+        recordControllerRegistration(stored, registration);
+        stored.updatedAt = now();
+        return registration;
+      });
     }
   }
 
@@ -2673,9 +2703,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   }
 
   async function observe(cwd: string, id: string, signal?: AbortSignal) {
-    const manifest = await loadManifest(cwd);
-    const workflow = workflowFor(manifest, id);
-    if (!workflow.lanes.some((lane) => lane.agentName))
+    // This snapshot drives which lanes to poll and their native identity; it
+    // is never itself written back. Every field this function persists is
+    // reconciled against a freshly reloaded manifest in the single
+    // transaction below, so a concurrent writer (a pause, a completion
+    // receipt, an approval) can never be silently overwritten by observation
+    // results gathered while these unlocked terminal/network calls ran.
+    const snapshot = workflowFor(await loadManifest(cwd), id);
+    if (!snapshot.lanes.some((lane) => lane.agentName))
       throw new Error(`Workflow ${id} has no recorded Herdr agents.`);
     requireHerdr();
 
@@ -2686,7 +2721,18 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       output: string;
       pausedGoalIds: string[];
     }> = [];
-    for (const [index, lane] of workflow.lanes.entries()) {
+    const laneUpdates: Array<{
+      id: string;
+      fields: Partial<Lane>;
+      newEvidence?: { at: string; kind: "goal-paused"; text: string };
+    }> = [];
+    let primaryLaneUpdate:
+      | {
+          agent: { sessionPath?: string; sessionId?: string };
+          pi?: { sessionPath?: string; sessionId?: string };
+        }
+      | undefined;
+    for (const [index, lane] of snapshot.lanes.entries()) {
       if (!lane.agentName) continue;
       const agent = await runHerdr(["agent", "get", lane.agentName], signal);
       const output = clip(
@@ -2705,7 +2751,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         GOAL_PAUSE_OUTPUT_LIMIT,
       );
       const state = deepState(agent) ?? "unknown";
-      const agentKind = laneAgentKind(workflow, lane);
+      const agentKind = laneAgentKind(snapshot, lane);
       const agentSessionPath = deepString(agent, [
         "agent_session_path",
         "session_path",
@@ -2734,8 +2780,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               output,
             }
         : undefined;
-      const observedLane: Lane = {
-        ...lane,
+      const fields: Partial<Lane> = {
         agentKind,
         status: goalPaused ? "goal-paused" : state,
         herdrState: state,
@@ -2744,25 +2789,33 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ...(agentKind === "pi"
           ? { piSessionPath: agentSessionPath, piSessionId: agentSessionId }
           : {}),
+        ...(goalPaused ? { goalPaused } : {}),
       };
-      if (goalPaused) observedLane.goalPaused = goalPaused;
-      workflow.lanes[index] = observedLane;
-      if (goalPaused && !unchangedPause)
-        workflow.evidence.push({
-          at: now(),
-          kind: "goal-paused",
-          text: `Lane ${lane.id} (${lane.agentName}) paused ${goalPaused.goalIds.join(", ")} from bounded recent agent output:\n${output}`,
-        });
+      laneUpdates.push({
+        id: lane.id,
+        fields,
+        ...(goalPaused && !unchangedPause
+          ? {
+              newEvidence: {
+                at: now(),
+                kind: "goal-paused",
+                text: `Lane ${lane.id} (${lane.agentName}) paused ${goalPaused.goalIds.join(", ")} from bounded recent agent output:\n${output}`,
+              },
+            }
+          : {}),
+      });
       if (index === 0) {
-        workflow.agent = {
-          sessionPath: agentSessionPath,
-          sessionId: agentSessionId,
+        primaryLaneUpdate = {
+          agent: { sessionPath: agentSessionPath, sessionId: agentSessionId },
+          ...(agentKind === "pi"
+            ? {
+                pi: {
+                  sessionPath: agentSessionPath,
+                  sessionId: agentSessionId,
+                },
+              }
+            : {}),
         };
-        if (agentKind === "pi")
-          workflow.pi = {
-            sessionPath: agentSessionPath,
-            sessionId: agentSessionId,
-          };
       }
       observations.push({
         lane: lane.id,
@@ -2779,7 +2832,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     );
     const completed =
       states.length > 0 && states.every((state) => state === "done");
-    workflow.status = hasPausedGoal
+    const status = hasPausedGoal
       ? "goal-paused"
       : completed
         ? "completed"
@@ -2788,28 +2841,47 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           : states.includes("working")
             ? "running"
             : "unknown";
-    workflow.outcome =
+    const outcome =
       completed && !hasPausedGoal
         ? "completed"
-        : workflow.status === "running"
+        : status === "running"
           ? "running"
           : "unknown";
-    workflow.observedAt = now();
-    workflow.updatedAt = now();
-    workflow.evidence.push({
-      at: now(),
-      kind: "agent-observation",
-      text: clip(jsonText(observations), 6000),
+    const observationEvidenceText = clip(jsonText(observations), 6000);
+
+    const observedWorkflow = await withManifestTransaction(cwd, (current) => {
+      const stored = workflowFor(current, id);
+      for (const update of laneUpdates) {
+        const index = stored.lanes.findIndex((lane) => lane.id === update.id);
+        // A lane removed by a concurrent writer has nothing left to update.
+        if (index === -1) continue;
+        stored.lanes[index] = { ...stored.lanes[index], ...update.fields };
+        if (update.newEvidence) stored.evidence.push(update.newEvidence);
+      }
+      if (primaryLaneUpdate) {
+        stored.agent = primaryLaneUpdate.agent;
+        if (primaryLaneUpdate.pi) stored.pi = primaryLaneUpdate.pi;
+      }
+      stored.status = status;
+      stored.outcome = outcome;
+      stored.observedAt = now();
+      stored.updatedAt = now();
+      stored.evidence.push({
+        at: now(),
+        kind: "agent-observation",
+        text: observationEvidenceText,
+      });
+      return stored;
     });
-    await saveManifest(cwd, manifest);
     // Explicit root observation is the bounded recovery path for a completed
     // dispatch whose controller registration was deferred before the plugin
     // config became available. It never dispatches or enables a plugin.
     if (
       isRootOrchestrator() &&
-      workflow.eventControllerRegistration?.status === "pending"
+      observedWorkflow.eventControllerRegistration?.status === "pending"
     )
-      await registerEventController(cwd, manifest, workflow, signal);
+      await registerEventController(cwd, id, signal);
+    const workflow = workflowFor(await loadManifest(cwd), id);
     return { workflow, state: workflow.status, observations };
   }
 
