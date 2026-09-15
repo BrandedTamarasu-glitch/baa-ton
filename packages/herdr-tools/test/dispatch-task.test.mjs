@@ -151,6 +151,11 @@ async function fixture(options = {}) {
           if (args.includes(flag))
             assert.equal(args[args.indexOf(flag) + 1], launchProfile.thinking);
         const p = panes.get(args[args.indexOf("--pane") + 1]);
+        if (options.startCrashesOnce) {
+          options.startCrashesOnce = false;
+          p.absent = true;
+          throw new Error("spawn crashed: unexpected server error");
+        }
         if (options.busy) {
           options.busy = false;
           throw new Error("agent_pane_busy");
@@ -179,11 +184,13 @@ async function fixture(options = {}) {
         options.changeHello?.(hello);
         p.session = hello.sessionId ?? hello.sessionPath;
         p.sessionKind = hello.sessionId && !hello.sessionPath ? "id" : "path";
+        delete p.absent;
         await writeFile(`${p.intentPath}.ready`, JSON.stringify(hello));
         return {};
       }
       if (args[0] === "agent" && args[1] === "get") {
         const p = panes.get(args[2]);
+        if (p.absent) throw new Error("agent_not_found");
         return {
           result: {
             agent: {
@@ -527,6 +534,21 @@ test("startup-blocked lane is adopted on retry once its attestation appears", as
     assert.equal((await f.run()).dispatched, true);
     // One blocked attempt plus one fresh start for the untouched lane.
     assert.equal(f.calls.filter((c) => c[1] === "start").length, 2);
+    assert.equal(f.calls.filter((c) => c[1] === "prompt").length, 2);
+    assert.equal(f.state.ownership.paneIds.length, 2);
+  } finally {
+    await f.close();
+  }
+});
+
+test("crashed lane start retries fresh when the pane holds no agent", async () => {
+  const f = await fixture({ startCrashesOnce: true });
+  try {
+    await assert.rejects(f.run(), /spawn crashed/);
+    assert.equal(f.calls.some((c) => c[1] === "prompt"), false);
+    // The retry finds no attestation and no live occupant: fresh start.
+    assert.equal((await f.run()).dispatched, true);
+    assert.equal(f.calls.filter((c) => c[1] === "start").length, 3);
     assert.equal(f.calls.filter((c) => c[1] === "prompt").length, 2);
     assert.equal(f.state.ownership.paneIds.length, 2);
   } finally {

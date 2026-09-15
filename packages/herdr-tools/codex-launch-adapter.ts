@@ -74,7 +74,9 @@ function filterProtocolOperations(operations: unknown): ProtocolOperation[] {
  * the attestation (thread-id) when that turn completes, and the MCP bridge
  * merges the live protocol operations. MCP children do not inherit pane env,
  * so the intent path is passed explicitly through mcp_servers env config. */
-export function codexLaunchAdapter(paths: CodexAdapterPaths): HarnessLaunchAdapter {
+export function codexLaunchAdapter(
+  paths: CodexAdapterPaths,
+): HarnessLaunchAdapter {
   return {
     version: 1,
     kind: "codex",
@@ -87,7 +89,10 @@ export function codexLaunchAdapter(paths: CodexAdapterPaths): HarnessLaunchAdapt
     // lifecycle state in Herdr is screen-derived.
     lifecycle: "screen",
     attestationComplete: (attestation: unknown): boolean => {
-      const hello = attestation as { sessionId?: unknown; operations?: unknown };
+      const hello = attestation as {
+        sessionId?: unknown;
+        operations?: unknown;
+      };
       return (
         typeof hello?.sessionId === "string" && Array.isArray(hello?.operations)
       );
@@ -106,7 +111,11 @@ export function codexLaunchAdapter(paths: CodexAdapterPaths): HarnessLaunchAdapt
       // Reasoning effort maps 1:1 onto model_reasoning_effort; a rejected
       // value makes codex exit before attestation, failing dispatch closed.
     },
-    launchArguments(profile: LaunchProfile, _source: string, context?: { startupIntentPath?: string }): string[] {
+    launchArguments(
+      profile: LaunchProfile,
+      _source: string,
+      context?: { startupIntentPath?: string },
+    ): string[] {
       const intentPath = context?.startupIntentPath;
       if (!intentPath)
         throw new Error("Codex launch requires the startup intent path.");
@@ -151,11 +160,17 @@ export function codexLaunchAdapter(paths: CodexAdapterPaths): HarnessLaunchAdapt
       const kind = agent.agent_session?.kind;
       const value = agent.agent_session?.value;
       if (kind !== undefined && kind !== "path" && kind !== "id")
-        throw new Error("Codex native session reference malformed; no work assigned.");
+        throw new Error(
+          "Codex native session reference malformed; no work assigned.",
+        );
       if (kind !== undefined && (typeof value !== "string" || !value))
-        throw new Error("Codex native session reference malformed; no work assigned.");
+        throw new Error(
+          "Codex native session reference malformed; no work assigned.",
+        );
       if (typeof hello.sessionId !== "string" || !hello.sessionId)
-        throw new Error("Codex attestation lacks thread identity; no work assigned.");
+        throw new Error(
+          "Codex attestation lacks thread identity; no work assigned.",
+        );
       let session: { kind: "path" | "id"; value: string };
       if (kind === "id" || kind === "path") {
         // Native identity is authoritative when Herdr exposes it: a mismatch
@@ -172,14 +187,20 @@ export function codexLaunchAdapter(paths: CodexAdapterPaths): HarnessLaunchAdapt
       } else {
         // Herdr 0.9.0 exposes no agent_session for codex; fence against
         // codex's own durable rollout store, its native session identity.
-        const rollout = findRolloutForThread(paths.sessionRoot, hello.sessionId);
+        const rollout = findRolloutForThread(
+          paths.sessionRoot,
+          hello.sessionId,
+        );
         if (!rollout)
           throw new Error(
             "Codex attested thread has no durable rollout; no work assigned.",
           );
         session = { kind: "path", value: rollout };
       }
-      if (agent.pane_id !== hello.paneId || agent.workspace_id !== hello.workspaceId)
+      if (
+        agent.pane_id !== hello.paneId ||
+        agent.workspace_id !== hello.workspaceId
+      )
         throw new Error("Codex startup binding mismatch; no work assigned.");
       return {
         paneId: hello.paneId!,

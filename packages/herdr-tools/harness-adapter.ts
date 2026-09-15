@@ -100,7 +100,9 @@ export class HarnessAdapterRegistry {
     if (!adapter || adapter.version !== 1 || missing.length > 0)
       throw new Error(
         `Harness ${kind} has no qualified startup adapter; detection support is not launch qualification${
-          missing.length ? ` (missing required capability flags: ${missing.join(", ")})` : ""
+          missing.length
+            ? ` (missing required capability flags: ${missing.join(", ")})`
+            : ""
         }.`,
       );
     return adapter;

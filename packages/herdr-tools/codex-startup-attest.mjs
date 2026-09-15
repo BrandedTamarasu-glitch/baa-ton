@@ -17,7 +17,10 @@ async function main() {
     console.error("notify payload is not valid JSON; not attesting.");
     process.exit(1);
   }
-  if (payload.type !== "agent-turn-complete" || typeof payload["thread-id"] !== "string") {
+  if (
+    payload.type !== "agent-turn-complete" ||
+    typeof payload["thread-id"] !== "string"
+  ) {
     console.error("notify payload lacks session identity; not attesting.");
     process.exit(1);
   }

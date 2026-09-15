@@ -3396,18 +3396,16 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     signal?: AbortSignal,
   ): Promise<{ ok: boolean; checks: DoctorCheck[] }> {
     const checks: DoctorCheck[] = [];
-    const check = (
-      id: string,
-      run: () => Promise<Omit<DoctorCheck, "id">>,
-    ) => run().then(
-      (partial) => checks.push({ id, ...partial }),
-      (error: unknown) =>
-        checks.push({
-          id,
-          status: "fail",
-          detail: error instanceof Error ? error.message : String(error),
-        }),
-    );
+    const check = (id: string, run: () => Promise<Omit<DoctorCheck, "id">>) =>
+      run().then(
+        (partial) => checks.push({ id, ...partial }),
+        (error: unknown) =>
+          checks.push({
+            id,
+            status: "fail",
+            detail: error instanceof Error ? error.message : String(error),
+          }),
+      );
 
     await check("extension-source", async () => ({
       status: "ok",

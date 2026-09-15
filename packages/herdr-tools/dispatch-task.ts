@@ -225,25 +225,43 @@ export async function dispatchTask(
       stage = "agent-start";
       if (!lane.agentStartedAt) {
         if (lane.agentStartAttemptedAt) {
-          // A previous start was rejected mid-startup (e.g. the harness paused
-          // on a first-run dialog) or its response was lost. Adopt it only when
-          // the startup attestation now exists and matches this lane's intent
-          // nonce; the full startup-proof verification below still fences any
-          // unrelated occupant. Otherwise the outcome is genuinely uncertain.
+          // A previous start was rejected mid-startup, crashed, or lost its
+          // response. Adopt it only when the attestation now exists and matches
+          // the lane's intent nonce. Without an attestation, a pane holding no
+          // live agent may be started fresh (the launch never took); an
+          // occupied pane is genuinely uncertain and needs operator review.
           const recovered = await readFile(
             `${lane.startupIntentPath}.ready`,
             "utf8",
           )
             .then((text) => JSON.parse(text))
             .catch(() => null);
-          if (!recovered || recovered.nonce !== lane.startupNonce)
-            throw new Error(
-              "Agent start outcome is uncertain and unattested; inspect the pane and reconcile before retrying dispatch.",
-            );
-          await update((w) => {
-            w.lanes[i].agentStartedAt = new Date().toISOString();
-          });
-        } else {
+          if (recovered && recovered.nonce === lane.startupNonce) {
+            await update((w) => {
+              w.lanes[i].agentStartedAt = new Date().toISOString();
+            });
+          } else {
+            let paneAgent: unknown = null;
+            try {
+              const live = await port.run(
+                ["agent", "get", lane.paneId!],
+                signal,
+              );
+              paneAgent = (live.result ?? live).agent ?? null;
+            } catch {
+              paneAgent = null;
+            }
+            if (paneAgent)
+              throw new Error(
+                "Agent start outcome is uncertain and the pane is occupied; inspect it and reconcile before retrying dispatch.",
+              );
+            await update((w) => {
+              delete w.lanes[i].agentStartAttemptedAt;
+            });
+          }
+          lane = workflow.lanes[i];
+        }
+        if (!lane.agentStartedAt && !lane.agentStartAttemptedAt) {
           await update((w) => {
             w.lanes[i].agentStartAttemptedAt = new Date().toISOString();
           });

@@ -48,7 +48,10 @@ test("codex launchArguments wires model, effort, notify, mcp env, and handshake"
 });
 
 test("codex preflight rejects foreign providers", () => {
-  const adapter = codexLaunchAdapter({ bridge: "/b.js", attestHelper: "/a.js" });
+  const adapter = codexLaunchAdapter({
+    bridge: "/b.js",
+    attestHelper: "/a.js",
+  });
   assert.throws(
     () => adapter.preflight({ ...profile, provider: "claude-code" }),
     /openai-codex subscription launch adapter/,
@@ -56,7 +59,10 @@ test("codex preflight rejects foreign providers", () => {
 });
 
 test("codex verifyStartup binds thread identity for id and path sessions", () => {
-  const adapter = codexLaunchAdapter({ bridge: "/b.js", attestHelper: "/a.js" });
+  const adapter = codexLaunchAdapter({
+    bridge: "/b.js",
+    attestHelper: "/a.js",
+  });
   const attestation = {
     paneId: "w17:p9",
     workspaceId: "w17",
@@ -186,9 +192,7 @@ test("codex notify helper attests thread identity and fails closed on binding mi
         let stderr = "";
         child.stderr.on("data", (chunk) => (stderr += chunk));
         child.on("close", (code) =>
-          code === 0
-            ? resolve()
-            : reject(new Error(stderr || `exit ${code}`)),
+          code === 0 ? resolve() : reject(new Error(stderr || `exit ${code}`)),
         );
       });
     await run(
