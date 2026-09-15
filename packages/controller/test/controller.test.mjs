@@ -48,6 +48,7 @@ async function createFixture({
   child = CHILD,
   piGoalPauseDetection = true,
   parentGoal,
+  settledRoot = true,
 } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "herdr-controller-"));
   const stateDir = join(directory, "state");
@@ -62,7 +63,31 @@ async function createFixture({
   await mkdir(dirname(manifestPath), { recursive: true, mode: 0o700 });
   const manifest = {
     version: 2,
-    ...(parentGoal ? { parentGoal } : {}),
+    ...(parentGoal
+      ? {
+          parentGoal: {
+            ...parentGoal,
+            ...(parentGoal.supervisor
+              ? {
+                  supervisor: {
+                    ...parentGoal.supervisor,
+                    ...(settledRoot
+                      ? {
+                          rootTurn: {
+                            state: "idle",
+                            runId: "settled-fixture-run",
+                            paneId: root.pane_id,
+                            workspaceId: root.workspace_id,
+                            updatedAt: "2026-09-14T00:00:00.000Z",
+                          },
+                        }
+                      : {}),
+                  },
+                }
+              : {}),
+          },
+        }
+      : {}),
     workflows: [
       {
         id: "herdr-bb029",
@@ -264,12 +289,21 @@ test("manifest has the required ID, compatible version floor, and supported even
     "utf8",
   );
   assert.match(startupScript, /volta" which node/);
-  assert.match(startupScript, /exec "\$\{node_bin\}" controller\.mjs supervisor/);
-  assert.deepEqual(manifest.actions, [{
-    id: "configure-sidebar",
-    title: "Install / repair Baa-ton sidebar rows",
-    command: ["sh", "-c", "node \"$HERDR_PLUGIN_ROOT/sidebar-configure.mjs\" --apply && herdr server reload-config"],
-  }]);
+  assert.match(
+    startupScript,
+    /exec "\$\{node_bin\}" controller\.mjs supervisor/,
+  );
+  assert.deepEqual(manifest.actions, [
+    {
+      id: "configure-sidebar",
+      title: "Install / repair Baa-ton sidebar rows",
+      command: [
+        "sh",
+        "-c",
+        'node "$HERDR_PLUGIN_ROOT/sidebar-configure.mjs" --apply && herdr server reload-config',
+      ],
+    },
+  ]);
   assert.deepEqual(manifest.events, [
     {
       on: "pane.agent_status_changed",
@@ -313,38 +347,143 @@ test("legacy v1 config migrates to one isolated orchestrator record", () => {
 test("isolated v2 records route wakes and root activity to only their own root", async () => {
   const fixture = await createFixture({
     parentGoal: {
-      version: 1, id: "parent-a", objective: "A", status: "active", nextAction: "A", signals: [],
-      supervisor: { version: 1, state: "running", intervalSeconds: 5, nudgeCount: 0, nextNudgeAt: null, createdAt: "2026-09-14T00:00:00.000Z", updatedAt: "2026-09-14T00:00:00.000Z" },
-      createdAt: "2026-09-14T00:00:00.000Z", updatedAt: "2026-09-14T00:00:00.000Z",
+      version: 1,
+      id: "parent-a",
+      objective: "A",
+      status: "active",
+      nextAction: "A",
+      signals: [],
+      supervisor: {
+        version: 1,
+        state: "running",
+        intervalSeconds: 5,
+        nudgeCount: 0,
+        nextNudgeAt: null,
+        createdAt: "2026-09-14T00:00:00.000Z",
+        updatedAt: "2026-09-14T00:00:00.000Z",
+      },
+      createdAt: "2026-09-14T00:00:00.000Z",
+      updatedAt: "2026-09-14T00:00:00.000Z",
     },
   });
-  const rootB = { target: "root-b", target_kind: "name", agent_kind: "pi", pane_id: "w-b:p1", workspace_id: "w-b" };
-  const childB = { lane_id: "lane-b", target: "child-b", target_kind: "name", pane_id: "w-b-child:p1", workspace_id: "w-b-child" };
+  const rootB = {
+    target: "root-b",
+    target_kind: "name",
+    agent_kind: "pi",
+    pane_id: "w-b:p1",
+    workspace_id: "w-b",
+  };
+  const childB = {
+    lane_id: "lane-b",
+    target: "child-b",
+    target_kind: "name",
+    pane_id: "w-b-child:p1",
+    workspace_id: "w-b-child",
+  };
   const secondManifestPath = join(fixture.directory, "second", "manifest.json");
   await mkdir(dirname(secondManifestPath), { recursive: true });
-  await writeFile(secondManifestPath, `${JSON.stringify({ version: 2, parentGoal: { version: 1, id: "parent-b", objective: "B", status: "active", nextAction: "B", signals: [], supervisor: { version: 1, state: "running", intervalSeconds: 5, nudgeCount: 0, nextNudgeAt: null, createdAt: "2026-09-14T00:00:00.000Z", updatedAt: "2026-09-14T00:00:00.000Z" }, createdAt: "2026-09-14T00:00:00.000Z", updatedAt: "2026-09-14T00:00:00.000Z" }, workflows: [{ id: "herdr-b", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: childB.lane_id, paneId: childB.pane_id, agentName: childB.target }] }] })}\n`);
+  await writeFile(
+    secondManifestPath,
+    `${JSON.stringify({ version: 2, parentGoal: { version: 1, id: "parent-b", objective: "B", status: "active", nextAction: "B", signals: [], supervisor: { version: 1, state: "running", intervalSeconds: 5, nudgeCount: 0, nextNudgeAt: null, createdAt: "2026-09-14T00:00:00.000Z", updatedAt: "2026-09-14T00:00:00.000Z" }, createdAt: "2026-09-14T00:00:00.000Z", updatedAt: "2026-09-14T00:00:00.000Z" }, workflows: [{ id: "herdr-b", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: childB.lane_id, paneId: childB.pane_id, agentName: childB.target }] }] })}\n`,
+  );
   const configPath = join(fixture.stateDir, "config.json");
-  await writeFile(configPath, `${JSON.stringify({ version: 2, owner: "herdr-orchestrator", orchestrators: [
-    { id: "a", root: ROOT, program: { id: "program-a", workspace_id: ROOT.workspace_id }, workflows: [{ workflow_id: "herdr-bb029", manifest_path: fixture.manifestPath, lanes: [CHILD] }] },
-    { id: "b", root: rootB, program: { id: "program-b", workspace_id: rootB.workspace_id }, workflows: [{ workflow_id: "herdr-b", manifest_path: secondManifestPath, lanes: [childB] }] },
-  ] }, null, 2)}\n`, { mode: 0o600 });
+  await writeFile(
+    configPath,
+    `${JSON.stringify(
+      {
+        version: 2,
+        owner: "herdr-orchestrator",
+        orchestrators: [
+          {
+            id: "a",
+            root: ROOT,
+            program: { id: "program-a", workspace_id: ROOT.workspace_id },
+            workflows: [
+              {
+                workflow_id: "herdr-bb029",
+                manifest_path: fixture.manifestPath,
+                lanes: [CHILD],
+              },
+            ],
+          },
+          {
+            id: "b",
+            root: rootB,
+            program: { id: "program-b", workspace_id: rootB.workspace_id },
+            workflows: [
+              {
+                workflow_id: "herdr-b",
+                manifest_path: secondManifestPath,
+                lanes: [childB],
+              },
+            ],
+          },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+    { mode: 0o600 },
+  );
   const prompts = [];
-  const herdr = { async request(method, params) {
-    if (method === "agent.get") {
-      const root = params.target === ROOT.target ? ROOT : rootB;
-      return { type: "agent_info", agent: { agent: "pi", name: root.target, pane_id: root.pane_id, workspace_id: root.workspace_id, agent_status: "idle" } };
-    }
-    if (method === "agent.prompt") { prompts.push(params.target); return {}; }
-    throw new Error(`Unexpected ${method}`);
-  } };
+  const herdr = {
+    async request(method, params) {
+      if (method === "agent.get") {
+        const root = params.target === ROOT.target ? ROOT : rootB;
+        return {
+          type: "agent_info",
+          agent: {
+            agent: "pi",
+            name: root.target,
+            pane_id: root.pane_id,
+            workspace_id: root.workspace_id,
+            agent_status: "idle",
+          },
+        };
+      }
+      if (method === "agent.prompt") {
+        prompts.push(params.target);
+        return {};
+      }
+      throw new Error(`Unexpected ${method}`);
+    },
+  };
   try {
-    await handleHook({ eventName: "pane.agent_status_changed", eventJson: statusEvent("done"), stateDir: fixture.stateDir, herdr });
-    assert.deepEqual(prompts, [ROOT.target], "a child event never wakes another root");
-    await handleHook({ eventName: "pane.agent_status_changed", eventJson: { event: "pane_agent_status_changed", data: { type: "pane_agent_status_changed", pane_id: rootB.pane_id, workspace_id: rootB.workspace_id, agent_status: "working" } }, stateDir: fixture.stateDir, herdr });
-    assert.equal((await fixture.manifest()).parentGoal.supervisor.rootActivity, undefined, "root B activity never mutates record A");
+    await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("done"),
+      stateDir: fixture.stateDir,
+      herdr,
+    });
+    assert.deepEqual(
+      prompts,
+      [ROOT.target],
+      "a child event never wakes another root",
+    );
+    await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: {
+        event: "pane_agent_status_changed",
+        data: {
+          type: "pane_agent_status_changed",
+          pane_id: rootB.pane_id,
+          workspace_id: rootB.workspace_id,
+          agent_status: "working",
+        },
+      },
+      stateDir: fixture.stateDir,
+      herdr,
+    });
+    assert.equal(
+      (await fixture.manifest()).parentGoal.supervisor.rootActivity,
+      undefined,
+      "root B activity never mutates record A",
+    );
     const second = JSON.parse(await readFile(secondManifestPath, "utf8"));
     assert.equal(second.parentGoal.supervisor.rootActivity.status, "working");
-  } finally { await fixture.cleanup(); }
+  } finally {
+    await fixture.cleanup();
+  }
 });
 
 test("socket validation accepts POSIX sockets and Windows named pipes", () => {
@@ -563,11 +702,25 @@ test("a new actionable lane event advances the thin parent goal once", async () 
     throw new Error(`Unexpected method: ${request.method}`);
   });
   try {
-    await handleHook({ eventName: "pane.agent_status_changed", eventJson: statusEvent("done"), stateDir: fixture.stateDir, herdr: client(mock) });
-    await handleHook({ eventName: "pane.agent_status_changed", eventJson: statusEvent("done"), stateDir: fixture.stateDir, herdr: client(mock) });
+    await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("done"),
+      stateDir: fixture.stateDir,
+      herdr: client(mock),
+    });
+    await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("done"),
+      stateDir: fixture.stateDir,
+      herdr: client(mock),
+    });
     const goal = (await fixture.manifest()).parentGoal;
     assert.equal(goal.status, "action-required");
-    assert.equal(goal.signals.length, 1, "duplicate hooks do not duplicate goal signals");
+    assert.equal(
+      goal.signals.length,
+      1,
+      "duplicate hooks do not duplicate goal signals",
+    );
     assert.equal(goal.signals[0].classification, "done");
     assert.match(goal.nextAction, /Review durable done event/);
     assert.equal(metadata.length, 1);
@@ -578,7 +731,8 @@ test("a new actionable lane event advances the thin parent goal once", async () 
       herdr_goal_status: "Goal: action required",
       herdr_goal_next_1: "Next: Review durable done",
       herdr_goal_next_2: "event",
-      herdr_goal_next_3: goal.nextAction.match(/event\s+([^\s]+)\s+for/)?.[1] ?? null,
+      herdr_goal_next_3:
+        goal.nextAction.match(/event\s+([^\s]+)\s+for/)?.[1] ?? null,
     });
     assert.deepEqual(metadata[0].state_labels, {
       idle: "Goal: action required",
@@ -613,20 +767,30 @@ test("a bootstrapped root supervises its parent manifest before any lane exists"
     },
   });
   const configPath = join(fixture.stateDir, "config.json");
-  await writeFile(configPath, `${JSON.stringify({
-    version: 2,
-    owner: "herdr-orchestrator",
-    orchestrators: [{
-      id: "bootstrap-root",
-      root: ROOT,
-      program: {
-        id: fixture.directory,
-        workspace_id: ROOT.workspace_id,
-        parent_manifest_path: fixture.manifestPath,
+  await writeFile(
+    configPath,
+    `${JSON.stringify(
+      {
+        version: 2,
+        owner: "herdr-orchestrator",
+        orchestrators: [
+          {
+            id: "bootstrap-root",
+            root: ROOT,
+            program: {
+              id: fixture.directory,
+              workspace_id: ROOT.workspace_id,
+              parent_manifest_path: fixture.manifestPath,
+            },
+            workflows: [],
+          },
+        ],
       },
-      workflows: [],
-    }],
-  }, null, 2)}\n`, { mode: 0o600 });
+      null,
+      2,
+    )}\n`,
+    { mode: 0o600 },
+  );
   const mock = await startHerdrMock((request) => {
     if (request.method === "agent.get") return rootAgentInfo();
     if (request.method === "agent.prompt") return { result: {} };
@@ -641,7 +805,10 @@ test("a bootstrapped root supervises its parent manifest before any lane exists"
     assert.deepEqual(result.results, [
       { manifestPath: fixture.manifestPath, status: "delivered" },
     ]);
-    assert.equal((await fixture.manifest()).parentGoal.supervisor.nudgeCount, 1);
+    assert.equal(
+      (await fixture.manifest()).parentGoal.supervisor.nudgeCount,
+      1,
+    );
   } finally {
     await mock.close();
     await fixture.cleanup();
@@ -674,9 +841,18 @@ test("the Herdr-owned supervisor nudges only a due running parent goal and recor
     if (request.method === "agent.get") return rootAgentInfo();
     if (request.method === "agent.prompt") {
       assert.equal(Object.hasOwn(request.params, "wait"), false);
-      assert.match(request.params.text, /Parent goal parent-bb029 remains active/);
-      assert.match(request.params.text, /Continue the active goal autonomously through as many safe local actions as needed/);
-      assert.doesNotMatch(request.params.text, /take at most one allowed parent action/);
+      assert.match(
+        request.params.text,
+        /Parent goal parent-bb029 remains active/,
+      );
+      assert.match(
+        request.params.text,
+        /Continue the active goal autonomously through as many safe local actions as needed/,
+      );
+      assert.doesNotMatch(
+        request.params.text,
+        /take at most one allowed parent action/,
+      );
       return { result: { type: "agent_prompted" } };
     }
     throw new Error(`Unexpected method: ${request.method}`);
@@ -693,13 +869,13 @@ test("the Herdr-owned supervisor nudges only a due running parent goal and recor
     const goal = (await fixture.manifest()).parentGoal;
     assert.equal(goal.supervisor.nudgeCount, 1);
     assert.equal(goal.supervisor.lastDelivery.status, "delivered");
-    assert.equal(goal.supervisor.nextNudgeAt, "2026-09-14T00:00:15.000Z");
+    assert.equal(goal.supervisor.nextNudgeAt, null);
     const second = await runSupervisorTick({
       stateDir: fixture.stateDir,
       herdr: client(mock),
       timestamp: "2026-09-14T00:00:01.000Z",
     });
-    assert.equal(second.results[0].status, "not-due");
+    assert.equal(second.results[0].status, "wake-suppressed");
     assert.equal(requestsFor(mock, "agent.prompt").length, 1);
   } finally {
     await mock.close();
@@ -707,7 +883,7 @@ test("the Herdr-owned supervisor nudges only a due running parent goal and recor
   }
 });
 
-test("the supervisor records root activity and defers a due nudge until the root is idle", async () => {
+test("live root activity can veto delivery even after an authoritative settled transition", async () => {
   const fixture = await createFixture({
     parentGoal: {
       version: 1,
@@ -762,10 +938,14 @@ test("the supervisor records root activity and defers a due nudge until the root
       herdr: client(mock),
     });
     assert.equal(rootActivity.rootActivity[0].status, "recorded");
-    assert.deepEqual(hookResponse(rootActivity), {
-      accepted: true,
-      rootActivity: rootActivity.rootActivity,
-    }, "a root-activity hook response never reads a lane record identity");
+    assert.deepEqual(
+      hookResponse(rootActivity),
+      {
+        accepted: true,
+        rootActivity: rootActivity.rootActivity,
+      },
+      "a root-activity hook response never reads a lane record identity",
+    );
     goal = (await fixture.manifest()).parentGoal;
     assert.equal(goal.supervisor.rootActivity.status, "idle");
 
@@ -780,6 +960,299 @@ test("the supervisor records root activity and defers a due nudge until the root
   } finally {
     await mock.close();
     await fixture.cleanup();
+  }
+});
+
+function dueParentGoal() {
+  const timestamp = "2026-09-14T00:00:00.000Z";
+  return {
+    version: 1,
+    id: "parent-recovery",
+    objective: "Recover once.",
+    status: "active",
+    nextAction: "Perform authorized work.",
+    signals: [],
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    supervisor: {
+      version: 1,
+      state: "running",
+      intervalSeconds: 5,
+      nudgeCount: 0,
+      nextNudgeAt: timestamp,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    },
+  };
+}
+
+async function patchSupervisor(fixture, patch) {
+  const manifest = await fixture.manifest();
+  Object.assign(manifest.parentGoal.supervisor, patch);
+  await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+}
+
+function recoveryApi() {
+  const api = {
+    prompts: 0,
+    gets: 0,
+    status: "idle",
+    available: true,
+    async request(method) {
+      if (method === "agent.get") {
+        api.gets += 1;
+        if (!api.available)
+          throw Object.assign(new Error("missing root"), {
+            code: "agent_not_found",
+          });
+        const info = rootAgentInfo().result;
+        info.agent.agent_status = api.status;
+        return info;
+      }
+      assert.equal(method, "agent.prompt");
+      api.prompts += 1;
+      return { type: "agent_prompted" };
+    },
+  };
+  return api;
+}
+
+const recoveryTick = (fixture, api, step) =>
+  runSupervisorTick({
+    stateDir: fixture.stateDir,
+    herdr: api,
+    timestamp: new Date(
+      Date.parse("2026-09-14T00:00:00.000Z") + step * 5000,
+    ).toISOString(),
+  });
+
+test("missing, active, unknown and mismatched root turns fail closed despite idle snapshots/hooks", async () => {
+  const fixture = await createFixture({
+    parentGoal: dueParentGoal(),
+    settledRoot: false,
+  });
+  const api = recoveryApi();
+  try {
+    for (const turn of [
+      undefined,
+      { state: "active", paneId: ROOT.pane_id, workspaceId: ROOT.workspace_id },
+      {
+        state: "unknown",
+        paneId: ROOT.pane_id,
+        workspaceId: ROOT.workspace_id,
+      },
+      { state: "idle", paneId: "wrong-pane", workspaceId: ROOT.workspace_id },
+      { state: "idle", paneId: ROOT.pane_id, workspaceId: "wrong-workspace" },
+    ]) {
+      if (turn)
+        await patchSupervisor(fixture, {
+          rootTurn: {
+            ...turn,
+            runId: "run-1",
+            updatedAt: "2026-09-14T00:00:00.000Z",
+          },
+        });
+      for (let step = 0; step < 5; step += 1) {
+        await handleHook({
+          stateDir: fixture.stateDir,
+          herdr: api,
+          eventName: "pane.agent_status_changed",
+          eventJson: rootStatusEvent("idle"),
+        });
+        assert.equal(
+          (await recoveryTick(fixture, api, step)).results[0].status,
+          "root-turn-not-idle",
+        );
+      }
+    }
+    assert.equal(api.prompts, 0);
+    assert.equal(
+      api.gets,
+      0,
+      "ticks never infer idle by repeatedly reading a busy/missing run",
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("concurrent overdue ticks and process-style restarts consume exactly one idle wake", async () => {
+  const fixture = await createFixture({ parentGoal: dueParentGoal() });
+  const api = recoveryApi();
+  try {
+    await Promise.all([
+      recoveryTick(fixture, api, 0),
+      recoveryTick(fixture, api, 0),
+    ]);
+    for (let step = 1; step < 8; step += 1)
+      await recoveryTick(fixture, api, step);
+    assert.equal(api.prompts, 1);
+    assert.equal(
+      (await fixture.manifest()).parentGoal.supervisor.nudgeCount,
+      1,
+    );
+    assert.equal(
+      (await fixture.manifest()).parentGoal.supervisor.nextNudgeAt,
+      null,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a settled but unseen done root gets one wake without requiring user focus", async () => {
+  const fixture = await createFixture({ parentGoal: dueParentGoal() });
+  const api = recoveryApi();
+  api.status = "done";
+  try {
+    assert.equal(
+      (await recoveryTick(fixture, api, 0)).results[0].status,
+      "delivered",
+    );
+    await recoveryTick(fixture, api, 1);
+    assert.equal(api.prompts, 1);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("legacy delivered/uncertain and interrupted sending receipts cannot be retried by ticks", async () => {
+  for (const status of ["delivered", "uncertain", "sending"]) {
+    const fixture = await createFixture({ parentGoal: dueParentGoal() });
+    const api = recoveryApi();
+    try {
+      await patchSupervisor(fixture, {
+        lastDelivery: { status, attemptedAt: "2026-09-14T00:00:00.000Z" },
+      });
+      for (let step = 0; step < 6; step += 1)
+        await recoveryTick(fixture, api, step);
+      assert.equal(api.prompts, 0, status);
+      const control = (await fixture.manifest()).parentGoal.supervisor;
+      assert.equal(
+        control.lastDelivery.status,
+        status === "sending" ? "uncertain" : status,
+      );
+      if (status === "sending") assert.equal(control.nextNudgeAt, null);
+    } finally {
+      await fixture.cleanup();
+    }
+  }
+});
+
+test("definite unavailable-root recovery retries once but ambiguous delivery stays latched", async () => {
+  const fixture = await createFixture({ parentGoal: dueParentGoal() });
+  const api = recoveryApi();
+  try {
+    api.available = false;
+    assert.equal(
+      (await recoveryTick(fixture, api, 0)).results[0].status,
+      "pending",
+    );
+    assert.equal(
+      (await fixture.manifest()).parentGoal.supervisor.nextNudgeAt,
+      "2026-09-14T00:00:05.000Z",
+    );
+    api.available = true;
+    assert.equal(
+      (await recoveryTick(fixture, api, 1)).results[0].status,
+      "delivered",
+    );
+    await recoveryTick(fixture, api, 2);
+    assert.equal(api.prompts, 1);
+    await patchSupervisor(fixture, {
+      lastDelivery: {
+        status: "pending",
+        attemptedAt: "2026-09-14T00:00:00.000Z",
+      },
+      nextNudgeAt: "2026-09-14T00:00:00.000Z",
+    });
+    const ambiguousApi = {
+      async request(method, params) {
+        if (method === "agent.prompt") {
+          api.prompts += 1;
+          throw new Error("reply lost after send");
+        }
+        return api.request(method, params);
+      },
+    };
+    assert.equal(
+      (await recoveryTick(fixture, ambiguousApi, 3)).results[0].status,
+      "uncertain",
+    );
+    for (let step = 4; step < 8; step += 1)
+      await recoveryTick(fixture, ambiguousApi, step);
+    assert.equal(
+      api.prompts,
+      2,
+      "an ambiguous accepted send must not be replayed",
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("live root identity and final pre-send status checks still veto a settled root", async () => {
+  for (const mode of ["mismatched", "busy-on-recheck"]) {
+    const fixture = await createFixture({ parentGoal: dueParentGoal() });
+    let gets = 0;
+    let prompts = 0;
+    const api = {
+      async request(method) {
+        if (method === "agent.prompt") {
+          prompts += 1;
+          return {};
+        }
+        gets += 1;
+        const info = rootAgentInfo().result;
+        if (mode === "mismatched") info.agent.pane_id = "wrong-pane";
+        else if (gets > 1) info.agent.agent_status = "working";
+        return info;
+      },
+    };
+    try {
+      assert.equal(
+        (await recoveryTick(fixture, api, 0)).results[0].status,
+        "pending",
+      );
+      assert.equal(prompts, 0);
+    } finally {
+      await fixture.cleanup();
+    }
+  }
+});
+
+test("malformed root-turn and acknowledgement fields fail strict manifest validation", async () => {
+  for (const patch of [
+    { rootTurn: { state: "idle" } },
+    {
+      rootTurn: {
+        state: "idle",
+        runId: "r",
+        paneId: ROOT.pane_id,
+        workspaceId: ROOT.workspace_id,
+        updatedAt: "invalid",
+      },
+    },
+    {
+      lastDelivery: {
+        status: "delivered",
+        attemptedAt: "now",
+        acknowledgedAt: 7,
+      },
+    },
+  ]) {
+    const fixture = await createFixture({ parentGoal: dueParentGoal() });
+    const api = recoveryApi();
+    try {
+      await patchSupervisor(fixture, patch);
+      await assert.rejects(
+        recoveryTick(fixture, api, 0),
+        /rootTurn|acknowledgedAt/,
+      );
+      assert.equal(api.prompts, 0);
+    } finally {
+      await fixture.cleanup();
+    }
   }
 });
 
@@ -843,74 +1316,86 @@ test("separate startup state directories still admit one live supervisor", async
   }
 });
 
-test("stopping keeps the supervisor lease through an in-flight tick", async () => {
-  const fixture = await createFixture({
-    parentGoal: {
-      version: 1,
-      id: "parent-bb029",
-      objective: "Complete BB-029 safely.",
-      status: "active",
-      nextAction: "Review the next dependency-ready lane.",
-      signals: [],
-      supervisor: {
+test(
+  "stopping keeps the supervisor lease through an in-flight tick",
+  async () => {
+    const fixture = await createFixture({
+      parentGoal: {
         version: 1,
-        state: "running",
-        intervalSeconds: 15,
-        nudgeCount: 0,
-        nextNudgeAt: new Date(Date.now() - 1_000).toISOString(),
+        id: "parent-bb029",
+        objective: "Complete BB-029 safely.",
+        status: "active",
+        nextAction: "Review the next dependency-ready lane.",
+        signals: [],
+        supervisor: {
+          version: 1,
+          state: "running",
+          intervalSeconds: 15,
+          nudgeCount: 0,
+          nextNudgeAt: new Date(Date.now() - 1_000).toISOString(),
+          createdAt: "2026-09-14T00:00:00.000Z",
+          updatedAt: "2026-09-14T00:00:00.000Z",
+        },
         createdAt: "2026-09-14T00:00:00.000Z",
         updatedAt: "2026-09-14T00:00:00.000Z",
       },
-      createdAt: "2026-09-14T00:00:00.000Z",
-      updatedAt: "2026-09-14T00:00:00.000Z",
-    },
-  });
-  let allowGet;
-  const getStarted = new Promise((resolveGetStarted) => {
-    allowGet = resolveGetStarted;
-  });
-  let releaseGet;
-  const getMayFinish = new Promise((resolveGetMayFinish) => {
-    releaseGet = resolveGetMayFinish;
-  });
-  const herdr = {
-    async request(method) {
-      if (method === "agent.get") {
-        allowGet();
-        await getMayFinish;
-        return rootAgentInfo().result;
-      }
-      if (method === "agent.prompt") return { type: "agent_prompted" };
-      throw new Error(`Unexpected method: ${method}`);
-    },
-  };
-  try {
-    const first = await runSupervisorLoop({
-      stateDir: fixture.stateDir,
-      configDir: fixture.stateDir,
-      herdr,
     });
-    await getStarted;
-    const stopping = first.stop();
-    const duplicate = await runSupervisorLoop({
-      stateDir: fixture.stateDir,
-      configDir: fixture.stateDir,
-      herdr,
+    let allowGet;
+    const getStarted = new Promise((resolveGetStarted) => {
+      allowGet = resolveGetStarted;
     });
-    assert.equal(duplicate.started, false, "restart cannot overlap an in-flight tick");
-    releaseGet();
-    await stopping;
-    const restarted = await runSupervisorLoop({
-      stateDir: fixture.stateDir,
-      configDir: fixture.stateDir,
-      herdr,
+    let releaseGet;
+    const getMayFinish = new Promise((resolveGetMayFinish) => {
+      releaseGet = resolveGetMayFinish;
     });
-    assert.equal(restarted.started, true, "lease releases only after the tick settles");
-    await restarted.stop();
-  } finally {
-    await fixture.cleanup();
-  }
-}, { timeout: 25_000 });
+    const herdr = {
+      async request(method) {
+        if (method === "agent.get") {
+          allowGet();
+          await getMayFinish;
+          return rootAgentInfo().result;
+        }
+        if (method === "agent.prompt") return { type: "agent_prompted" };
+        throw new Error(`Unexpected method: ${method}`);
+      },
+    };
+    try {
+      const first = await runSupervisorLoop({
+        stateDir: fixture.stateDir,
+        configDir: fixture.stateDir,
+        herdr,
+      });
+      await getStarted;
+      const stopping = first.stop();
+      const duplicate = await runSupervisorLoop({
+        stateDir: fixture.stateDir,
+        configDir: fixture.stateDir,
+        herdr,
+      });
+      assert.equal(
+        duplicate.started,
+        false,
+        "restart cannot overlap an in-flight tick",
+      );
+      releaseGet();
+      await stopping;
+      const restarted = await runSupervisorLoop({
+        stateDir: fixture.stateDir,
+        configDir: fixture.stateDir,
+        herdr,
+      });
+      assert.equal(
+        restarted.started,
+        true,
+        "lease releases only after the tick settles",
+      );
+      await restarted.stop();
+    } finally {
+      await fixture.cleanup();
+    }
+  },
+  { timeout: 25_000 },
+);
 
 test("the supervisor waits one normal interval after startup before nudging restored panes", async () => {
   const fixture = await createFixture({
@@ -939,7 +1424,12 @@ test("the supervisor waits one normal interval after startup before nudging rest
     const loop = await runSupervisorLoop({
       stateDir: fixture.stateDir,
       configDir: fixture.stateDir,
-      herdr: { async request() { calls += 1; throw new Error("must not run at startup"); } },
+      herdr: {
+        async request() {
+          calls += 1;
+          throw new Error("must not run at startup");
+        },
+      },
     });
     assert.equal(loop.started, true);
     assert.equal(calls, 0, "startup grants Herdr one full settle interval");
@@ -950,7 +1440,13 @@ test("the supervisor waits one normal interval after startup before nudging rest
 });
 
 test("the supervisor never overwrites waiting, paused, blocked, or completed parent goals", async () => {
-  for (const status of ["waiting-for-event", "paused", "blocked", "completed"]) {
+  for (const status of [
+    "waiting-for-event",
+    "action-required",
+    "paused",
+    "blocked",
+    "completed",
+  ]) {
     const fixture = await createFixture({
       parentGoal: {
         version: 1,
@@ -976,13 +1472,25 @@ test("the supervisor never overwrites waiting, paused, blocked, or completed par
     try {
       const result = await runSupervisorTick({
         stateDir: fixture.stateDir,
-        herdr: { async request() { throw new Error("terminal goals must not wake"); } },
+        herdr: {
+          async request() {
+            throw new Error("terminal goals must not wake");
+          },
+        },
         timestamp: "2026-09-14T00:00:00.000Z",
       });
       assert.equal(result.results[0].status, "not-active");
       const goal = (await fixture.manifest()).parentGoal;
-      assert.equal(goal.status, status, "a stale tick must not overwrite parent lifecycle state");
-      assert.equal(goal.supervisor.lastDelivery, undefined, "inactive goals are never nudged");
+      assert.equal(
+        goal.status,
+        status,
+        "a stale tick must not overwrite parent lifecycle state",
+      );
+      assert.equal(
+        goal.supervisor.lastDelivery,
+        undefined,
+        "inactive goals are never nudged",
+      );
     } finally {
       await fixture.cleanup();
     }

@@ -16,6 +16,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import net from "node:net";
+import { handleActivation } from "./activation.mjs";
 import { fileURLToPath } from "node:url";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -196,13 +197,12 @@ function validateRoot(root) {
 
 function validateLane(lane, index) {
   const label = `config.workflows[].lanes[${index}]`;
-  const value = assertObjectShape(lane, label, [
-    "lane_id",
-    "target",
-    "target_kind",
-    "pane_id",
-    "workspace_id",
-  ], ["relationship_id"]);
+  const value = assertObjectShape(
+    lane,
+    label,
+    ["lane_id", "target", "target_kind", "pane_id", "workspace_id"],
+    ["relationship_id"],
+  );
   const paneId = assertString(value.pane_id, `${label}.pane_id`);
   return {
     lane_id: assertString(value.lane_id, `${label}.lane_id`),
@@ -210,7 +210,12 @@ function validateLane(lane, index) {
     pane_id: paneId,
     workspace_id: assertString(value.workspace_id, `${label}.workspace_id`),
     ...(typeof value.relationship_id === "string"
-      ? { relationship_id: assertString(value.relationship_id, `${label}.relationship_id`) }
+      ? {
+          relationship_id: assertString(
+            value.relationship_id,
+            `${label}.relationship_id`,
+          ),
+        }
       : {}),
   };
 }
@@ -266,31 +271,63 @@ function validateWorkflowMapping(workflow, index) {
 
 export function validateOrchestrator(input, index) {
   const label = `config.orchestrators[${index}]`;
-  const value = assertObjectShape(input, label, ["id", "root", "program", "workflows"]);
+  const value = assertObjectShape(input, label, [
+    "id",
+    "root",
+    "program",
+    "workflows",
+  ]);
   const root = validateRoot(value.root);
-  const program = assertObjectShape(value.program, `${label}.program`, ["id", "workspace_id"], ["parent_manifest_path"]);
-  assert(Array.isArray(value.workflows), `${label}.workflows must be an array.`);
+  const program = assertObjectShape(
+    value.program,
+    `${label}.program`,
+    ["id", "workspace_id"],
+    ["parent_manifest_path"],
+  );
+  assert(
+    Array.isArray(value.workflows),
+    `${label}.workflows must be an array.`,
+  );
   const workflows = value.workflows.map(validateWorkflowMapping);
   assertString(value.id, `${label}.id`);
   assertString(program.id, `${label}.program.id`);
   assertString(program.workspace_id, `${label}.program.workspace_id`);
-  const parentManifestPath = "parent_manifest_path" in program
-    ? assertString(program.parent_manifest_path, `${label}.program.parent_manifest_path`)
-    : undefined;
+  const parentManifestPath =
+    "parent_manifest_path" in program
+      ? assertString(
+          program.parent_manifest_path,
+          `${label}.program.parent_manifest_path`,
+        )
+      : undefined;
   if (parentManifestPath)
-    assert(isAbsolute(parentManifestPath), `${label}.program.parent_manifest_path must be absolute.`);
-  assert(program.workspace_id === root.workspace_id, `${label}.program.workspace_id must equal its root workspace_id.`);
-  for (const workflow of workflows) for (const lane of workflow.lanes) {
-    assert(lane.pane_id !== root.pane_id, `${label}.root.pane_id must differ from every child lane pane_id.`);
-    assert(lane.target_kind !== root.target_kind || lane.target !== root.target, `${label}.root target must differ from every child lane target.`);
-  }
+    assert(
+      isAbsolute(parentManifestPath),
+      `${label}.program.parent_manifest_path must be absolute.`,
+    );
+  assert(
+    program.workspace_id === root.workspace_id,
+    `${label}.program.workspace_id must equal its root workspace_id.`,
+  );
+  for (const workflow of workflows)
+    for (const lane of workflow.lanes) {
+      assert(
+        lane.pane_id !== root.pane_id,
+        `${label}.root.pane_id must differ from every child lane pane_id.`,
+      );
+      assert(
+        lane.target_kind !== root.target_kind || lane.target !== root.target,
+        `${label}.root target must differ from every child lane target.`,
+      );
+    }
   return {
     id: value.id,
     root,
     program: {
       id: program.id,
       workspace_id: program.workspace_id,
-      ...(parentManifestPath ? { parent_manifest_path: resolve(parentManifestPath) } : {}),
+      ...(parentManifestPath
+        ? { parent_manifest_path: resolve(parentManifestPath) }
+        : {}),
     },
     workflows,
   };
@@ -303,24 +340,54 @@ export function validateConfig(input) {
   assert(isRecord(input), "config must be an object.");
   assert(input.owner === OWNER, `config.owner must be ${OWNER}.`);
   if (input.version === 1) {
-    const legacy = assertObjectShape(input, "config", ["version", "owner", "root", "workflows"]);
+    const legacy = assertObjectShape(input, "config", [
+      "version",
+      "owner",
+      "root",
+      "workflows",
+    ]);
     const root = validateRoot(legacy.root);
     const workflows = legacy.workflows.map(validateWorkflowMapping);
-    assert(Array.isArray(legacy.workflows) && workflows.length > 0, "config.workflows must be a non-empty array.");
-    return { version: 2, owner: OWNER, migratedFrom: 1, orchestrators: [{
-      id: `legacy:${root.workspace_id}:${root.pane_id}`,
-      root,
-      program: { id: "legacy-global", workspace_id: root.workspace_id },
-      workflows,
-    }] };
+    assert(
+      Array.isArray(legacy.workflows) && workflows.length > 0,
+      "config.workflows must be a non-empty array.",
+    );
+    return {
+      version: 2,
+      owner: OWNER,
+      migratedFrom: 1,
+      orchestrators: [
+        {
+          id: `legacy:${root.workspace_id}:${root.pane_id}`,
+          root,
+          program: { id: "legacy-global", workspace_id: root.workspace_id },
+          workflows,
+        },
+      ],
+    };
   }
-  const value = assertObjectShape(input, "config", ["version", "owner", "orchestrators"]);
+  const value = assertObjectShape(input, "config", [
+    "version",
+    "owner",
+    "orchestrators",
+  ]);
   assert(value.version === 2, "config.version must be 1 or 2.");
-  assert(Array.isArray(value.orchestrators) && value.orchestrators.length > 0, "config.orchestrators must be a non-empty array.");
+  assert(
+    Array.isArray(value.orchestrators) && value.orchestrators.length > 0,
+    "config.orchestrators must be a non-empty array.",
+  );
   const orchestrators = value.orchestrators.map(validateOrchestrator);
-  assert(new Set(orchestrators.map((item) => item.id)).size === orchestrators.length, "config cannot repeat orchestrator IDs.");
-  const workflowIds = orchestrators.flatMap((item) => item.workflows.map((workflow) => workflow.workflow_id));
-  assert(new Set(workflowIds).size === workflowIds.length, "config cannot repeat workflow_id values across orchestrators.");
+  assert(
+    new Set(orchestrators.map((item) => item.id)).size === orchestrators.length,
+    "config cannot repeat orchestrator IDs.",
+  );
+  const workflowIds = orchestrators.flatMap((item) =>
+    item.workflows.map((workflow) => workflow.workflow_id),
+  );
+  assert(
+    new Set(workflowIds).size === workflowIds.length,
+    "config cannot repeat workflow_id values across orchestrators.",
+  );
   return { version: 2, owner: OWNER, orchestrators };
 }
 
@@ -437,7 +504,9 @@ function configuredMappings(config) {
 
 function configuredParentManifests(config) {
   return config.orchestrators.flatMap((orchestrator) => {
-    const paths = new Set(orchestrator.workflows.map((workflow) => workflow.manifest_path));
+    const paths = new Set(
+      orchestrator.workflows.map((workflow) => workflow.manifest_path),
+    );
     if (orchestrator.program.parent_manifest_path)
       paths.add(orchestrator.program.parent_manifest_path);
     return [...paths].map((manifestPath) => ({
@@ -455,16 +524,16 @@ function locateMapping(config, event) {
   for (const orchestrator of config.orchestrators) {
     for (const workflow of orchestrator.workflows) {
       for (const lane of workflow.lanes) {
-      if (
-        lane.pane_id === event.data.pane_id &&
-        lane.workspace_id === event.data.workspace_id
-      ) {
-        // Protocol 22 event.data.agent is an agent *kind* (for example pi),
-        // never the configured Herdr agent name/prompt target.
-        matches.push({ orchestrator, workflow, lane });
+        if (
+          lane.pane_id === event.data.pane_id &&
+          lane.workspace_id === event.data.workspace_id
+        ) {
+          // Protocol 22 event.data.agent is an agent *kind* (for example pi),
+          // never the configured Herdr agent name/prompt target.
+          matches.push({ orchestrator, workflow, lane });
+        }
       }
     }
-  }
   }
   if (matches.length === 0) return undefined;
   assert(
@@ -524,18 +593,46 @@ function validateParentGoal(goal) {
   const value = assertObjectShape(
     goal,
     "manifest.parentGoal",
-    ["version", "id", "objective", "status", "nextAction", "signals", "createdAt", "updatedAt"],
+    [
+      "version",
+      "id",
+      "objective",
+      "status",
+      "nextAction",
+      "signals",
+      "createdAt",
+      "updatedAt",
+    ],
     ["supervisor"],
   );
   assert(value.version === 1, "manifest.parentGoal.version must be 1.");
-  for (const key of ["id", "objective", "status", "nextAction", "createdAt", "updatedAt"])
+  for (const key of [
+    "id",
+    "objective",
+    "status",
+    "nextAction",
+    "createdAt",
+    "updatedAt",
+  ])
     assertString(value[key], `manifest.parentGoal.${key}`);
-  assert(Array.isArray(value.signals), "manifest.parentGoal.signals must be an array.");
+  assert(
+    Array.isArray(value.signals),
+    "manifest.parentGoal.signals must be an array.",
+  );
   for (const signal of value.signals) {
     assert(isRecord(signal), "manifest.parentGoal contains an invalid signal.");
-    for (const key of ["identity", "workflowId", "laneId", "classification", "receivedAt"])
+    for (const key of [
+      "identity",
+      "workflowId",
+      "laneId",
+      "classification",
+      "receivedAt",
+    ])
       assertString(signal[key], `manifest.parentGoal.signals[].${key}`);
-    assert(ACTIONABLE_CLASSIFICATIONS.has(signal.classification), "manifest.parentGoal signal classification is invalid.");
+    assert(
+      ACTIONABLE_CLASSIFICATIONS.has(signal.classification),
+      "manifest.parentGoal signal classification is invalid.",
+    );
   }
   if ("supervisor" in value) validateSupervisor(value.supervisor);
   return value;
@@ -545,11 +642,32 @@ function validateSupervisor(supervisor) {
   const value = assertObjectShape(
     supervisor,
     "manifest.parentGoal.supervisor",
-    ["version", "state", "intervalSeconds", "nudgeCount", "nextNudgeAt", "createdAt", "updatedAt"],
-    ["pauseReason", "lastNudgeAt", "lastAttemptAt", "lastDelivery", "rootActivity"],
+    [
+      "version",
+      "state",
+      "intervalSeconds",
+      "nudgeCount",
+      "nextNudgeAt",
+      "createdAt",
+      "updatedAt",
+    ],
+    [
+      "pauseReason",
+      "lastNudgeAt",
+      "lastAttemptAt",
+      "lastDelivery",
+      "rootActivity",
+      "rootTurn",
+    ],
   );
-  assert(value.version === 1, "manifest.parentGoal.supervisor.version must be 1.");
-  assert(SUPERVISOR_STATES.has(value.state), "manifest.parentGoal.supervisor.state is invalid.");
+  assert(
+    value.version === 1,
+    "manifest.parentGoal.supervisor.version must be 1.",
+  );
+  assert(
+    SUPERVISOR_STATES.has(value.state),
+    "manifest.parentGoal.supervisor.state is invalid.",
+  );
   assert(
     Number.isSafeInteger(value.intervalSeconds) &&
       value.intervalSeconds >= MIN_NUDGE_INTERVAL_SECONDS &&
@@ -557,11 +675,20 @@ function validateSupervisor(supervisor) {
     `manifest.parentGoal.supervisor.intervalSeconds must be an integer from ${MIN_NUDGE_INTERVAL_SECONDS} to ${MAX_NUDGE_INTERVAL_SECONDS}.`,
   );
   assertSafeUInt(value.nudgeCount, "manifest.parentGoal.supervisor.nudgeCount");
-  assert(value.nextNudgeAt === null || typeof value.nextNudgeAt === "string", "manifest.parentGoal.supervisor.nextNudgeAt must be a string or null.");
-  for (const key of ["createdAt", "updatedAt"]) assertString(value[key], `manifest.parentGoal.supervisor.${key}`);
+  assert(
+    value.nextNudgeAt === null || typeof value.nextNudgeAt === "string",
+    "manifest.parentGoal.supervisor.nextNudgeAt must be a string or null.",
+  );
+  for (const key of ["createdAt", "updatedAt"])
+    assertString(value[key], `manifest.parentGoal.supervisor.${key}`);
   for (const key of ["pauseReason", "lastNudgeAt", "lastAttemptAt"])
-    if (key in value) assertString(value[key], `manifest.parentGoal.supervisor.${key}`);
-  if (value.state === "paused") assertString(value.pauseReason, "manifest.parentGoal.supervisor.pauseReason");
+    if (key in value)
+      assertString(value[key], `manifest.parentGoal.supervisor.${key}`);
+  if (value.state === "paused")
+    assertString(
+      value.pauseReason,
+      "manifest.parentGoal.supervisor.pauseReason",
+    );
   if ("rootActivity" in value) {
     const activity = assertObjectShape(
       value.rootActivity,
@@ -572,14 +699,60 @@ function validateSupervisor(supervisor) {
       AGENT_STATUSES.has(activity.status),
       "manifest.parentGoal.supervisor.rootActivity.status is invalid.",
     );
-    assertString(activity.observedAt, "manifest.parentGoal.supervisor.rootActivity.observedAt");
+    assertString(
+      activity.observedAt,
+      "manifest.parentGoal.supervisor.rootActivity.observedAt",
+    );
+  }
+  if ("rootTurn" in value) {
+    const turn = assertObjectShape(
+      value.rootTurn,
+      "manifest.parentGoal.supervisor.rootTurn",
+      ["state", "runId", "paneId", "workspaceId", "updatedAt"],
+    );
+    assert(
+      new Set(["active", "idle", "unknown"]).has(turn.state),
+      "manifest.parentGoal.supervisor.rootTurn.state is invalid.",
+    );
+    for (const key of ["runId", "paneId", "workspaceId", "updatedAt"])
+      assertString(turn[key], `manifest.parentGoal.supervisor.rootTurn.${key}`);
+    assert(
+      Number.isFinite(Date.parse(turn.updatedAt)),
+      "manifest.parentGoal.supervisor.rootTurn.updatedAt is invalid.",
+    );
   }
   if ("lastDelivery" in value) {
-    const delivery = assertObjectShape(value.lastDelivery, "manifest.parentGoal.supervisor.lastDelivery", ["status", "attemptedAt"], ["deliveredAt", "reason"]);
-    assert(new Set(["sending", "delivered", "pending", "uncertain"]).has(delivery.status), "manifest.parentGoal.supervisor.lastDelivery.status is invalid.");
-    assertString(delivery.attemptedAt, "manifest.parentGoal.supervisor.lastDelivery.attemptedAt");
-    if ("deliveredAt" in delivery) assertString(delivery.deliveredAt, "manifest.parentGoal.supervisor.lastDelivery.deliveredAt");
-    if ("reason" in delivery) assertString(delivery.reason, "manifest.parentGoal.supervisor.lastDelivery.reason");
+    const delivery = assertObjectShape(
+      value.lastDelivery,
+      "manifest.parentGoal.supervisor.lastDelivery",
+      ["status", "attemptedAt"],
+      ["deliveredAt", "acknowledgedAt", "reason"],
+    );
+    assert(
+      new Set(["sending", "delivered", "pending", "uncertain"]).has(
+        delivery.status,
+      ),
+      "manifest.parentGoal.supervisor.lastDelivery.status is invalid.",
+    );
+    assertString(
+      delivery.attemptedAt,
+      "manifest.parentGoal.supervisor.lastDelivery.attemptedAt",
+    );
+    if ("deliveredAt" in delivery)
+      assertString(
+        delivery.deliveredAt,
+        "manifest.parentGoal.supervisor.lastDelivery.deliveredAt",
+      );
+    if ("acknowledgedAt" in delivery)
+      assertString(
+        delivery.acknowledgedAt,
+        "manifest.parentGoal.supervisor.lastDelivery.acknowledgedAt",
+      );
+    if ("reason" in delivery)
+      assertString(
+        delivery.reason,
+        "manifest.parentGoal.supervisor.lastDelivery.reason",
+      );
   }
   return value;
 }
@@ -588,7 +761,11 @@ function signalParentGoal(manifest, record) {
   if (!("parentGoal" in manifest)) return;
   const goal = validateParentGoal(manifest.parentGoal);
   if (!ACTIONABLE_CLASSIFICATIONS.has(record.classification)) return;
-  if (!goal.signals.some((signal) => isRecord(signal) && signal.identity === record.identity)) {
+  if (
+    !goal.signals.some(
+      (signal) => isRecord(signal) && signal.identity === record.identity,
+    )
+  ) {
     goal.signals.push({
       identity: record.identity,
       workflowId: record.workflow_id,
@@ -605,7 +782,7 @@ function signalParentGoal(manifest, record) {
     goal.status !== "paused"
   )
     goal.status = "action-required";
-  goal.nextAction = `Review durable ${record.classification} event ${record.identity} for ${record.workflow_id}/${record.lane_id}; take one allowed parent action or wait.`;
+  goal.nextAction = `Review durable ${record.classification} event ${record.identity} for ${record.workflow_id}/${record.lane_id}; continue authorized safe local work or persist a truthful waiting/blocked state.`;
   goal.updatedAt = now();
 }
 
@@ -869,7 +1046,8 @@ function rootAgent(result, root) {
     agent.workspace_id !== root.workspace_id
   )
     return undefined;
-  if (root.target_kind === "name" && agent.name !== root.target) return undefined;
+  if (root.target_kind === "name" && agent.name !== root.target)
+    return undefined;
   if (root.target_kind === "pane_id" && root.target !== root.pane_id)
     return undefined;
   if (root.agent_kind !== undefined && agent.agent !== root.agent_kind)
@@ -1018,9 +1196,15 @@ async function deliverSupervisorNudge(goal, root, herdr) {
     const rootInfo = await herdr.request("agent.get", { target: root.target });
     const agent = rootAgent(rootInfo, root);
     if (!agent)
-      return { status: "pending", reason: "recorded_root_unavailable_or_mismatched" };
-    if (agent.agent_status !== "idle")
-      return { status: "pending", reason: `root_not_idle:${String(agent.agent_status)}` };
+      return {
+        status: "pending",
+        reason: "recorded_root_unavailable_or_mismatched",
+      };
+    if (agent.agent_status !== "idle" && agent.agent_status !== "done")
+      return {
+        status: "pending",
+        reason: `root_not_idle:${String(agent.agent_status)}`,
+      };
   } catch (error) {
     if (unavailable(error))
       return { status: "pending", reason: `root_unavailable:${error.code}` };
@@ -1061,7 +1245,10 @@ async function observeRootActivity(root, herdr, timestamp) {
     const result = await herdr.request("agent.get", { target: root.target });
     const agent = rootAgent(result, root);
     if (!agent)
-      return { available: false, reason: "recorded_root_unavailable_or_mismatched" };
+      return {
+        available: false,
+        reason: "recorded_root_unavailable_or_mismatched",
+      };
     if (!AGENT_STATUSES.has(agent.agent_status))
       return { available: false, reason: "root_status_invalid" };
     return {
@@ -1104,7 +1291,11 @@ export async function runSupervisorTick({
       // Do not schedule against an unowned or stale registration merely because
       // it shares a manifest with a valid workflow in this orchestrator.
       for (const candidate of workflows)
-        validateMappedWorkflow(manifest, { workflow: candidate, lane: candidate.lanes[0] }, config.owner);
+        validateMappedWorkflow(
+          manifest,
+          { workflow: candidate, lane: candidate.lanes[0] },
+          config.owner,
+        );
       if (!("parentGoal" in manifest)) {
         results.push({ manifestPath, status: "no-parent-goal" });
         continue;
@@ -1134,24 +1325,63 @@ export async function runSupervisorTick({
         results.push({ manifestPath, status: "uncertain" });
         continue;
       }
+      // A successful or ambiguous send consumes this wake authorization forever,
+      // including old manifests that still contain a periodic nextNudgeAt.
+      if (
+        ["delivered", "uncertain"].includes(supervisor.lastDelivery?.status)
+      ) {
+        results.push({ manifestPath, status: "wake-suppressed" });
+        continue;
+      }
       if (!nudgeDue(supervisor, timestamp)) {
         results.push({ manifestPath, status: "not-due" });
         continue;
       }
-      const activity = await observeRootActivity(orchestrator.root, api, timestamp);
+      const turn = supervisor.rootTurn;
+      if (
+        !turn ||
+        turn.state !== "idle" ||
+        turn.paneId !== orchestrator.root.pane_id ||
+        turn.workspaceId !== orchestrator.root.workspace_id ||
+        orchestrator.root.agent_kind !== "pi"
+      ) {
+        results.push({ manifestPath, status: "root-turn-not-idle" });
+        continue;
+      }
+      // Live Herdr status can veto delivery, but can never create idle authority.
+      const activity = await observeRootActivity(
+        orchestrator.root,
+        api,
+        timestamp,
+      );
       if (!activity.available) {
         supervisor.lastAttemptAt = timestamp;
-        supervisor.lastDelivery = { status: "pending", attemptedAt: timestamp, reason: activity.reason };
-        supervisor.nextNudgeAt = nextNudgeAt(timestamp, supervisor.intervalSeconds);
+        supervisor.lastDelivery = {
+          status: "pending",
+          attemptedAt: timestamp,
+          reason: activity.reason,
+        };
+        supervisor.nextNudgeAt = nextNudgeAt(
+          timestamp,
+          supervisor.intervalSeconds,
+        );
         supervisor.updatedAt = timestamp;
         goal.updatedAt = timestamp;
         await atomicWriteJson(manifestPath, manifest);
         results.push({ manifestPath, status: "pending" });
         continue;
       }
-      supervisor.rootActivity = { status: activity.status, observedAt: activity.observedAt };
-      if (activity.status !== "idle") {
-        supervisor.nextNudgeAt = nextNudgeAt(timestamp, supervisor.intervalSeconds);
+      supervisor.rootActivity = {
+        status: activity.status,
+        observedAt: activity.observedAt,
+      };
+      // Herdr's done is an unseen completion, also ready for input. The Pi
+      // settled proof above is still mandatory for either ready state.
+      if (activity.status !== "idle" && activity.status !== "done") {
+        supervisor.nextNudgeAt = nextNudgeAt(
+          timestamp,
+          supervisor.intervalSeconds,
+        );
         supervisor.updatedAt = timestamp;
         goal.updatedAt = timestamp;
         await atomicWriteJson(manifestPath, manifest);
@@ -1161,24 +1391,32 @@ export async function runSupervisorTick({
       const attemptedAt = timestamp;
       supervisor.lastAttemptAt = attemptedAt;
       supervisor.lastDelivery = { status: "sending", attemptedAt };
-      supervisor.nextNudgeAt = nextNudgeAt(timestamp, supervisor.intervalSeconds);
+      supervisor.nextNudgeAt = null;
       supervisor.updatedAt = timestamp;
       goal.updatedAt = timestamp;
       await atomicWriteJson(manifestPath, manifest);
-      const outcome = await deliverSupervisorNudge(goal, orchestrator.root, api);
+      const outcome = await deliverSupervisorNudge(
+        goal,
+        orchestrator.root,
+        api,
+      );
       supervisor.lastDelivery = {
         status: outcome.status,
         attemptedAt,
-        ...(outcome.status === "delivered" ? { deliveredAt: now() } : {}),
+        ...(outcome.status === "delivered" ? { deliveredAt: timestamp } : {}),
         reason: outcome.reason,
       };
       if (outcome.status === "delivered") {
         supervisor.nudgeCount += 1;
         supervisor.lastNudgeAt = supervisor.lastDelivery.deliveredAt;
-      } else if (outcome.status === "uncertain") {
-        supervisor.nextNudgeAt = null;
+      } else if (outcome.status === "pending") {
+        // Only a definite pre-delivery failure is retryable.
+        supervisor.nextNudgeAt = nextNudgeAt(
+          timestamp,
+          supervisor.intervalSeconds,
+        );
       }
-      supervisor.updatedAt = now();
+      supervisor.updatedAt = timestamp;
       goal.updatedAt = supervisor.updatedAt;
       await atomicWriteJson(manifestPath, manifest);
       results.push({ manifestPath, status: outcome.status });
@@ -1202,7 +1440,9 @@ function newRecord(event, mapping, classification) {
     pane_id: mapping.lane.pane_id,
     workspace_id: mapping.lane.workspace_id,
     agent_target: mapping.lane.target,
-    ...(mapping.lane.relationship_id ? { relationship_id: mapping.lane.relationship_id } : {}),
+    ...(mapping.lane.relationship_id
+      ? { relationship_id: mapping.lane.relationship_id }
+      : {}),
     classification: classification.classification,
     source: classification.source,
     wake: {
@@ -1238,12 +1478,21 @@ async function recordRootActivity(config, event) {
         "Parent manifest",
       );
       for (const candidate of workflows)
-        validateMappedWorkflow(manifest, { workflow: candidate, lane: candidate.lanes[0] }, config.owner);
-      if (!("parentGoal" in manifest) || !("supervisor" in manifest.parentGoal)) {
+        validateMappedWorkflow(
+          manifest,
+          { workflow: candidate, lane: candidate.lanes[0] },
+          config.owner,
+        );
+      if (
+        !("parentGoal" in manifest) ||
+        !("supervisor" in manifest.parentGoal)
+      ) {
         results.push({ manifestPath, status: "no-supervisor" });
         continue;
       }
       const goal = validateParentGoal(manifest.parentGoal);
+      // Detection hooks are telemetry, not Pi run boundaries. In particular an
+      // idle/done event between tool calls must not release rootTurn or a wake.
       goal.supervisor.rootActivity = {
         status: event.data.agent_status,
         observedAt: timestamp,
@@ -1293,8 +1542,19 @@ export async function handleHook({
   // A linked plugin sees every pane status transition. Root transitions are
   // durable activity evidence for idle-only nudging; other panes are inert.
   if (!mapping) {
-    if (config.orchestrators.some((orchestrator) => rootEventMatches(event, orchestrator.root)))
+    if (
+      config.orchestrators.some((orchestrator) =>
+        rootEventMatches(event, orchestrator.root),
+      )
+    ) {
+      const activation = await handleActivation(
+        configDir,
+        event,
+        herdr ?? new JsonLineHerdrClient(),
+      );
+      if (activation) return activation;
       return recordRootActivity(config, event);
+    }
     return { accepted: true, ignored: true, reason: "unmapped_event" };
   }
   const api = herdr ?? new JsonLineHerdrClient();
@@ -1382,7 +1642,9 @@ async function supervisorLeaseDirectory(configDir) {
     throw error;
   });
   assert(
-    details.isDirectory() && !details.isSymbolicLink() && (details.mode & 0o022) === 0,
+    details.isDirectory() &&
+      !details.isSymbolicLink() &&
+      (details.mode & 0o022) === 0,
     `Controller config directory must be a private real directory: ${directory}`,
   );
   return directory;
@@ -1406,9 +1668,16 @@ async function acquireSupervisorLease(leaseDirectory) {
       if (error.code !== "EEXIST") throw error;
       try {
         const owner = JSON.parse(
-          await readRegularFile(join(leasePath, "owner.json"), "Supervisor lease"),
+          await readRegularFile(
+            join(leasePath, "owner.json"),
+            "Supervisor lease",
+          ),
         );
-        if (Number.isSafeInteger(owner.pid) && owner.pid > 0 && !processIsAlive(owner.pid)) {
+        if (
+          Number.isSafeInteger(owner.pid) &&
+          owner.pid > 0 &&
+          !processIsAlive(owner.pid)
+        ) {
           await rm(leasePath, { recursive: true, force: true });
           continue;
         }
@@ -1435,7 +1704,11 @@ export async function runSupervisorLoop({
   const resolvedConfigDir = await supervisorLeaseDirectory(configDir);
   const releaseLease = await acquireSupervisorLease(resolvedConfigDir);
   if (!releaseLease)
-    return { started: false, reason: "supervisor_already_running", stop: async () => {} };
+    return {
+      started: false,
+      reason: "supervisor_already_running",
+      stop: async () => {},
+    };
   let stopping = false;
   let ticking = false;
   let timer;
@@ -1463,7 +1736,9 @@ export async function runSupervisorLoop({
           herdr,
         });
       } catch (error) {
-        process.stderr.write(`herdr-orchestrator-controller supervisor: ${error instanceof Error ? error.message : String(error)}\n`);
+        process.stderr.write(
+          `herdr-orchestrator-controller supervisor: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
       } finally {
         ticking = false;
       }
