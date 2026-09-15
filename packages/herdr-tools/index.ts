@@ -3428,9 +3428,45 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       await release?.();
     }
   }
+  // acknowledgeActivation() is idempotent and cheap when nothing is pending
+  // (a local file read that returns undefined), so it is safe to attempt on
+  // every agent_start. session_start does not fire on /reload, so it alone
+  // can never observe the reload it is meant to acknowledge; agent_start
+  // fires on every subsequent turn, including the one that follows a
+  // reload, and is the hook that actually closes this loop.
+  async function attemptActivationAck(ctx: {
+    sessionManager: { getSessionFile(): string | undefined };
+    signal?: AbortSignal;
+  }): Promise<void> {
+    if (!isRootOrchestrator()) return;
+    const activation = await acknowledgeActivation(
+      dirname(rootConfigPath()),
+      {
+        paneId: process.env.HERDR_PANE_ID,
+        workspaceId: process.env.HERDR_WORKSPACE_ID,
+        sessionPath: ctx.sessionManager.getSessionFile(),
+        source: await realpath(fileURLToPath(import.meta.url)),
+      },
+      async (paneId: string) =>
+        responseRecord(
+          await runHerdr(["agent", "get", paneId], ctx.signal),
+          "activation root",
+        ).agent,
+    );
+    if (activation)
+      pi.sendMessage(
+        {
+          customType: "herdr-runtime-activated",
+          display: true,
+          content: `Authorized runtime activation ${activation.id} verified in ${activation.workspaceId}. Continue the existing task: verify the live subscription/profile, then plan and dispatch bounded Luna work in this workspace only. Do not ask for activation approval again.`,
+        },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+  }
   pi.on("agent_start", async (_event, ctx) => {
     rootRunId = randomUUID();
     await persistRootTurn(ctx, "active");
+    await attemptActivationAck(ctx);
   });
   pi.on("agent_settled", async (_event, ctx) => {
     await persistRootTurn(ctx, "idle");
@@ -3474,30 +3510,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       await writeFile(temporary, jsonText(ready), { mode: 0o600 });
       await rename(temporary, `${startupPath}.ready`);
     }
-    if (!isRootOrchestrator()) return;
-    const activation = await acknowledgeActivation(
-      dirname(rootConfigPath()),
-      {
-        paneId: process.env.HERDR_PANE_ID,
-        workspaceId: process.env.HERDR_WORKSPACE_ID,
-        sessionPath: ctx.sessionManager.getSessionFile(),
-        source: await realpath(fileURLToPath(import.meta.url)),
-      },
-      async (paneId: string) =>
-        responseRecord(
-          await runHerdr(["agent", "get", paneId], ctx.signal),
-          "activation root",
-        ).agent,
-    );
-    if (activation)
-      pi.sendMessage(
-        {
-          customType: "herdr-runtime-activated",
-          display: true,
-          content: `Authorized runtime activation ${activation.id} verified in ${activation.workspaceId}. Continue the existing task: verify the live subscription/profile, then plan and dispatch bounded Luna work in this workspace only. Do not ask for activation approval again.`,
-        },
-        { triggerTurn: true, deliverAs: "followUp" },
-      );
+    await attemptActivationAck(ctx);
     if (!ctx.hasUI) return;
     const manifest = await loadManifest(ctx.cwd);
     if (manifest.parentGoal)

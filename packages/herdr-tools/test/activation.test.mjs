@@ -6,14 +6,20 @@ import {
   writeFile,
   readFile,
   readlink,
+  realpath,
   symlink,
   rm,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { activateTask } from "../activate-task.mjs";
 import { handleActivation } from "../../controller/activation.mjs";
 import { acknowledgeActivation } from "../activation-ack.mjs";
+const require = createRequire(import.meta.url);
+const jiti = require("jiti")(import.meta.url);
+const { default: extension } = await jiti.import("../index.ts");
 
 test("authorized isolated task migration preserves other mappings and is idempotent", async () => {
   const directory = await mkdtemp(join(tmpdir(), "baa-activation-"));
@@ -180,3 +186,118 @@ for (const lostResponse of [false, true])
       await rm(configDir, { recursive: true, force: true });
     }
   });
+
+test("a pending reload activation is acknowledged on agent_start, since session_start never fires on /reload", async () => {
+  const configDir = await mkdtemp(join(tmpdir(), "baa-reload-ack-"));
+  const saved = Object.fromEntries(
+    [
+      "HERDR_ENV",
+      "HERDR_PANE_ID",
+      "HERDR_WORKSPACE_ID",
+      "HERDR_PLUGIN_CONFIG_DIR",
+    ].map((key) => [key, process.env[key]]),
+  );
+  try {
+    const source = await realpath(
+      fileURLToPath(new URL("../index.ts", import.meta.url)),
+    );
+    const identity = {
+      paneId: "w1:p1",
+      workspaceId: "w1",
+      sessionPath: "/sessions/astra",
+      source,
+    };
+    await writeFile(
+      join(configDir, "config.json"),
+      JSON.stringify({
+        version: 2,
+        owner: "herdr-orchestrator",
+        orchestrators: [
+          {
+            id: "root-1",
+            root: {
+              target: "root-name",
+              target_kind: "name",
+              pane_id: identity.paneId,
+              workspace_id: identity.workspaceId,
+              agent_kind: "pi",
+            },
+            program: { id: "/prog", workspace_id: identity.workspaceId },
+            workflows: [],
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+    await writeFile(
+      join(configDir, "activation.json"),
+      JSON.stringify({
+        version: 1,
+        id: "reload-ack-test",
+        operation: "reload-pi-runtime",
+        status: "sending",
+        ...identity,
+      }),
+      { mode: 0o600 },
+    );
+    Object.assign(process.env, {
+      HERDR_ENV: "1",
+      HERDR_PANE_ID: identity.paneId,
+      HERDR_WORKSPACE_ID: identity.workspaceId,
+      HERDR_PLUGIN_CONFIG_DIR: configDir,
+    });
+    const handlers = new Map();
+    const messages = [];
+    extension({
+      on: (event, handler) => handlers.set(event, handler),
+      registerTool() {},
+      registerCommand() {},
+      sendMessage: (message) => messages.push(message),
+      getActiveTools: () => [],
+      async exec(_command, args) {
+        if (args[0] === "agent" && args[1] === "get")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                type: "agent_info",
+                agent: {
+                  agent: "pi",
+                  pane_id: identity.paneId,
+                  workspace_id: identity.workspaceId,
+                  agent_status: "idle",
+                  agent_session: { kind: "path", value: identity.sessionPath },
+                },
+              },
+            }),
+          };
+        throw new Error(`unexpected herdr ${args.join(" ")}`);
+      },
+    });
+    const ctx = {
+      cwd: join(configDir, "unmapped-cwd"),
+      hasUI: false,
+      sessionManager: { getSessionFile: () => identity.sessionPath },
+    };
+    // The reload path: no session_start fires at all, only the agent_start
+    // that begins the first turn after the reloaded runtime comes back up.
+    await handlers.get("agent_start")({}, ctx);
+    const journal = JSON.parse(
+      await readFile(join(configDir, "activation.json"), "utf8"),
+    );
+    assert.equal(journal.status, "acknowledged");
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].customType, "herdr-runtime-activated");
+    // Idempotent: a later agent_start (the next ordinary turn) must not
+    // re-acknowledge or resend the activation message.
+    await handlers.get("agent_start")({}, ctx);
+    assert.equal(messages.length, 1);
+  } finally {
+    for (const [key, value] of Object.entries(saved))
+      value === undefined
+        ? delete process.env[key]
+        : (process.env[key] = value);
+    await rm(configDir, { recursive: true, force: true });
+  }
+});
