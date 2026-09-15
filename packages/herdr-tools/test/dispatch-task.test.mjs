@@ -60,6 +60,7 @@ async function fixture(options = {}) {
     directory,
     source: "/source/index.ts",
     adapter: (kind) => registry.resolve(kind),
+    busyRetryDelayMs: 1,
     update: async (_id, change) => {
       change(state);
       return structuredClone(state);
@@ -109,6 +110,26 @@ async function fixture(options = {}) {
           },
         };
       }
+      if (args[0] === "pane" && args[1] === "process-info") {
+        const p = panes.get(args[3]);
+        p.processInfoCalls = (p.processInfoCalls ?? 0) + 1;
+        if (p.processInfoCalls <= (options.shellInits ?? 0))
+          return {
+            result: {
+              process_info: {
+                foreground_processes: [{ pid: 999, name: "bash" }],
+              },
+            },
+          };
+        return {
+          result: {
+            process_info: {
+              shell_pid: 123,
+              foreground_processes: [{ pid: 123, name: "zsh" }],
+            },
+          },
+        };
+      }
       if (args[0] === "agent" && args[1] === "start") {
         assert.equal(
           registered,
@@ -129,6 +150,7 @@ async function fixture(options = {}) {
           options.busy = false;
           throw new Error("agent_pane_busy");
         }
+        if (options.busyAlways) throw new Error("agent_pane_busy");
         const intent = JSON.parse(await readFile(p.intentPath, "utf8"));
         const hello = {
           nonce: intent.nonce,
@@ -178,6 +200,7 @@ async function fixture(options = {}) {
     },
   };
   return {
+    options,
     get state() {
       return state;
     },
@@ -207,12 +230,28 @@ test("opaque IDs and different checkout still produce only tabs in one designate
     await f.close();
   }
 });
-test("native busy rejection retries in the same tabs without spawning a workspace", async () => {
-  const f = await fixture({ busy: true });
+test("shell-init race and a busy rejection self-heal within one dispatch", async () => {
+  const f = await fixture({ busy: true, shellInits: 3 });
+  try {
+    assert.equal((await f.run()).dispatched, true);
+    assert.equal(f.state.ownership.paneIds.length, 2);
+    assert.equal(
+      f.calls.filter((c) => c[0] === "tab" && c[1] === "create").length,
+      2,
+    );
+    assert.equal(f.calls.filter((c) => c[1] === "prompt").length, 2);
+  } finally {
+    await f.close();
+  }
+});
+test("persistent busy still fails closed and remains retryable in the same tabs", async () => {
+  const f = await fixture({ busyAlways: true });
   try {
     await assert.rejects(f.run(), /agent_pane_busy/);
+    assert.equal(f.calls.some((c) => c[1] === "prompt"), false);
     const ids = [...f.state.ownership.paneIds];
-    await f.run();
+    f.options.busyAlways = false;
+    assert.equal((await f.run()).dispatched, true);
     assert.deepEqual(f.state.ownership.paneIds, ids);
     assert.equal(
       f.calls.filter((c) => c[0] === "tab" && c[1] === "create").length,

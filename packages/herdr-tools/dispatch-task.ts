@@ -1,4 +1,5 @@
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { Workflow, Lane } from "./index.js";
@@ -15,7 +16,38 @@ export type DispatchPorts = {
   authorize(workflow: Workflow): Promise<boolean>;
   register(workflow: Workflow): Promise<void>;
   contract(workflow: Workflow, lane: Lane): string;
+  busyRetryDelayMs?: number;
 };
+
+/** Herdr has no native wait-for-shell command. `pane process-info` is the
+ * native readiness signal: a pane is startable when its interactive shell is
+ * the only foreground process (shell_pid set and matching). Gating on it
+ * removes the tab-create/agent-start race without prompt-string matching. */
+async function waitForShellReady(
+  port: DispatchPorts,
+  paneId: string,
+  signal?: AbortSignal,
+) {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const raw = await port.run(
+      ["pane", "process-info", "--pane", paneId],
+      signal,
+    );
+    const info = (raw.result ?? raw).process_info;
+    if (
+      info?.shell_pid &&
+      Array.isArray(info.foreground_processes) &&
+      info.foreground_processes.length === 1 &&
+      info.foreground_processes[0]?.pid === info.shell_pid
+    )
+      return;
+    await delay(300, { signal });
+  }
+  throw new Error(
+    `Pane ${paneId} shell did not become ready for agent start; inspect it before retrying.`,
+  );
+}
 
 /** The only dispatch implementation. Never creates, moves, replaces or closes a workspace. */
 export async function dispatchTask(
@@ -192,31 +224,39 @@ export async function dispatchTask(
         await update((w) => {
           w.lanes[i].agentStartAttemptedAt = new Date().toISOString();
         });
-        try {
-          await port.run(
-            [
-              "agent",
-              "start",
-              lane.agentName!,
-              "--kind",
-              lane.agentKind,
-              "--pane",
-              lane.paneId!,
-              "--timeout",
-              "60000",
-              "--",
-              ...adapters[i].launchArguments(profile, port.source),
-            ],
-            signal,
-            65_000,
-          );
-        } catch (error) {
-          // Native busy rejection is before launch, unlike timeout after submission.
-          if (/agent_pane_busy/.test(String(error)))
-            await update((w) => {
-              delete w.lanes[i].agentStartAttemptedAt;
-            });
-          throw error;
+        await waitForShellReady(port, lane.paneId!, signal);
+        for (let attempt = 0; ; attempt++) {
+          try {
+            await port.run(
+              [
+                "agent",
+                "start",
+                lane.agentName!,
+                "--kind",
+                lane.agentKind,
+                "--pane",
+                lane.paneId!,
+                "--timeout",
+                "60000",
+                "--",
+                ...adapters[i].launchArguments(profile, port.source),
+              ],
+              signal,
+              65_000,
+            );
+            break;
+          } catch (error) {
+            // Native busy rejection is before launch, unlike timeout after submission.
+            if (attempt < 2 && /agent_pane_busy/.test(String(error))) {
+              await delay(port.busyRetryDelayMs ?? 1_500, { signal });
+              continue;
+            }
+            if (/agent_pane_busy/.test(String(error)))
+              await update((w) => {
+                delete w.lanes[i].agentStartAttemptedAt;
+              });
+            throw error;
+          }
         }
         await update((w) => {
           w.lanes[i].agentStartedAt = new Date().toISOString();
