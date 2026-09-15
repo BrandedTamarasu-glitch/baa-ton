@@ -12,7 +12,15 @@ const serverPath = join(here, "..", "mcp-server.mjs");
 async function withMcpServer(env, run) {
   const child = spawn(process.execPath, [serverPath], {
     cwd: here,
-    env: { ...process.env, ...env },
+    // Pin a neutral Herdr identity so behavior is identical whether the
+    // suite runs from a lane pane or from the registered root pane; callers
+    // may still override via `env`.
+    env: {
+      ...process.env,
+      HERDR_PANE_ID: "w-test:p1",
+      HERDR_WORKSPACE_ID: "w-test",
+      ...env,
+    },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let stderr = "";
