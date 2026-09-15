@@ -46,7 +46,11 @@ export interface HarnessLaunchAdapter {
   /** Honest lifecycle reporting: native, screen-derived, or unavailable. */
   lifecycle: HarnessLifecycle;
   preflight(profile: LaunchProfile): void | Promise<void>;
-  launchArguments(profile: LaunchProfile, source: string): string[];
+  launchArguments(
+    profile: LaunchProfile,
+    source: string,
+    context?: LaunchContext,
+  ): string[];
   /** Must compare native identity with the harness's startup attestation.
    * Screen-derived idle alone is never startup attestation. */
   verifyStartup(nativeAgent: unknown, attestation: unknown): StartupProof;
@@ -56,6 +60,12 @@ export const REQUIRED_ADAPTER_CAPABILITIES = [
   "startupAttestation",
   "supportsSessionPersistence",
 ] as const;
+
+/** Extra per-lane launch facts adapters may need. Optional so existing v1
+ * adapters are unaffected; versioned with the contract. */
+export type LaunchContext = {
+  startupIntentPath?: string;
+};
 
 export type RequiredAdapterCapability =
   (typeof REQUIRED_ADAPTER_CAPABILITIES)[number];

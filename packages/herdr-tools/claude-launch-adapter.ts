@@ -99,8 +99,14 @@ export function claudeLaunchAdapter(
     launchArguments(profile: LaunchProfile): string[] {
       mkdirSync(paths.scratchDirectory, { recursive: true, mode: 0o700 });
       const tag = randomUUID().slice(0, 8);
-      const settingsPath = join(paths.scratchDirectory, `claude-settings-${tag}.json`);
-      const mcpConfigPath = join(paths.scratchDirectory, `claude-mcp-${tag}.json`);
+      const settingsPath = join(
+        paths.scratchDirectory,
+        `claude-settings-${tag}.json`,
+      );
+      const mcpConfigPath = join(
+        paths.scratchDirectory,
+        `claude-mcp-${tag}.json`,
+      );
       const settings = {
         hooks: {
           SessionStart: [
@@ -156,9 +162,7 @@ export function claudeLaunchAdapter(
         sessionId?: string;
       };
       if (!agent || !hello || agent.agent !== "claude")
-        throw new Error(
-          "Claude native identity mismatch; no work assigned.",
-        );
+        throw new Error("Claude native identity mismatch; no work assigned.");
       const kind = agent.agent_session?.kind;
       const value = agent.agent_session?.value;
       if (kind !== "path" && kind !== "id")
@@ -178,10 +182,10 @@ export function claudeLaunchAdapter(
         agent.pane_id !== hello.paneId ||
         agent.workspace_id !== hello.workspaceId
       )
-        throw new Error(
-          "Claude startup binding mismatch; no work assigned.",
-        );
-      const knownOperations = new Set<string>(Object.values(PROTOCOL_OPERATIONS));
+        throw new Error("Claude startup binding mismatch; no work assigned.");
+      const knownOperations = new Set<string>(
+        Object.values(PROTOCOL_OPERATIONS),
+      );
       const operations = (hello.operations ?? []).filter(
         (operation): operation is ProtocolOperation =>
           typeof operation === "string" && knownOperations.has(operation),

@@ -37,7 +37,9 @@ async function withMcpServer(env, run) {
     new Promise((resolve) => {
       const id = ++nextId;
       pending.set(id, resolve);
-      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+      child.stdin.write(
+        `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`,
+      );
     });
   const timeout = setTimeout(() => child.kill(), 15000);
   try {
@@ -61,7 +63,10 @@ test("tools/call rejects arguments outside a tool's declared schema before it re
       arguments: { action: "not-a-schema-action" },
     });
     assert.equal(invalid.result.isError, true);
-    assert.match(invalid.result.content[0].text, /Invalid arguments for herdr_goal/);
+    assert.match(
+      invalid.result.content[0].text,
+      /Invalid arguments for herdr_goal/,
+    );
 
     // A schema-valid action must still reach the real implementation (and
     // be rejected there, for an unrelated authorization reason, proving
@@ -96,7 +101,10 @@ test("tools/call outside a Herdr session and unknown tools still fail predictabl
       arguments: { action: "status" },
     });
     assert.equal(outside.result.isError, true);
-    assert.match(outside.result.content[0].text, /only inside a HERDR_ENV=1 session/);
+    assert.match(
+      outside.result.content[0].text,
+      /only inside a HERDR_ENV=1 session/,
+    );
   });
   await withMcpServer({ HERDR_ENV: "1" }, async (rpc) => {
     const unknown = await rpc("tools/call", {

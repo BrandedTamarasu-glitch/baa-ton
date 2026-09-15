@@ -43,8 +43,12 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
       settings.hooks.SessionStart[0].hooks[0].command,
       /claude-startup-attest\.mjs/,
     );
-    assert.ok(settings.permissions.deny.some((rule) => /^Bash\(git push/.test(rule)));
-    assert.ok(settings.permissions.deny.some((rule) => /^Bash\(git merge/.test(rule)));
+    assert.ok(
+      settings.permissions.deny.some((rule) => /^Bash\(git push/.test(rule)),
+    );
+    assert.ok(
+      settings.permissions.deny.some((rule) => /^Bash\(git merge/.test(rule)),
+    );
     assert.equal(
       mcp.mcpServers["herdr-orchestrator"].args[0],
       "/bridge/mcp-server.mjs",
@@ -140,9 +144,7 @@ test("SessionStart helper merges lane identity and preserves bridge operations",
         }),
       );
     });
-    const ready = JSON.parse(
-      await readFile(`${intentPath}.ready`, "utf8"),
-    );
+    const ready = JSON.parse(await readFile(`${intentPath}.ready`, "utf8"));
     assert.equal(ready.sessionPath, "/claude/projects/p/abc.jsonl");
     assert.equal(ready.sessionId, "abc");
     assert.equal(ready.nonce, "nonce-1");

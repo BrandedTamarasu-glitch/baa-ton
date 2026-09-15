@@ -24,6 +24,8 @@ import { dispatchTask } from "./dispatch-task.js";
 import { type LaunchProfile, validateLaunchProfile } from "./launch-profile.js";
 import { piLaunchAdapter, verifyActualProfile } from "./pi-launch-adapter.js";
 import { claudeLaunchAdapter } from "./claude-launch-adapter.js";
+import { codexLaunchAdapter } from "./codex-launch-adapter.js";
+import { opencodeLaunchAdapter } from "./opencode-launch-adapter.js";
 import {
   HarnessAdapterRegistry,
   type NativeSessionRef,
@@ -2596,6 +2598,19 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         attestHelper: fileURLToPath(
           new URL("./claude-startup-attest.mjs", import.meta.url),
         ),
+        scratchDirectory: dirname(manifestPath(cwd)),
+      }),
+    );
+    adapters.register(
+      codexLaunchAdapter({
+        bridge: fileURLToPath(new URL("./mcp-server.mjs", import.meta.url)),
+        attestHelper: fileURLToPath(
+          new URL("./codex-startup-attest.mjs", import.meta.url),
+        ),
+      }),
+    );
+    adapters.register(
+      opencodeLaunchAdapter({
         scratchDirectory: dirname(manifestPath(cwd)),
       }),
     );

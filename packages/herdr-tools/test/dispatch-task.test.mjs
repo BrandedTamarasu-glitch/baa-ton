@@ -11,10 +11,9 @@ const { piLaunchAdapter } = await jiti.import("../pi-launch-adapter.ts");
 const { claudeLaunchAdapter } = await jiti.import(
   "../claude-launch-adapter.ts",
 );
-const {
-  HarnessAdapterRegistry,
-  PROTOCOL_OPERATIONS,
-} = await jiti.import("../harness-adapter.ts");
+const { HarnessAdapterRegistry, PROTOCOL_OPERATIONS } = await jiti.import(
+  "../harness-adapter.ts",
+);
 const profile = {
   provider: "openai-codex",
   model: "gpt-5.6-luna",
@@ -150,10 +149,7 @@ async function fixture(options = {}) {
           );
         for (const flag of ["--thinking", "--effort"])
           if (args.includes(flag))
-            assert.equal(
-              args[args.indexOf(flag) + 1],
-              launchProfile.thinking,
-            );
+            assert.equal(args[args.indexOf(flag) + 1], launchProfile.thinking);
         const p = panes.get(args[args.indexOf("--pane") + 1]);
         if (options.busy) {
           options.busy = false;
@@ -174,9 +170,11 @@ async function fixture(options = {}) {
           source: ports.source,
           sessionPath: `/sessions/${p.paneId}.jsonl`,
           profile: launchProfile,
-          tools:
-            options.nativeTools ??
-            ["herdr_complete", "herdr_plan", "herdr_dispatch"],
+          tools: options.nativeTools ?? [
+            "herdr_complete",
+            "herdr_plan",
+            "herdr_dispatch",
+          ],
         };
         options.changeHello?.(hello);
         p.session = hello.sessionId ?? hello.sessionPath;
@@ -502,13 +500,14 @@ test("startup-blocked lane is adopted on retry once its attestation appears", as
   const f = await fixture({ notReadyOnce: true });
   try {
     await assert.rejects(f.run(), /agent_not_ready/);
-    assert.equal(f.calls.some((c) => c[1] === "prompt"), false);
+    assert.equal(
+      f.calls.some((c) => c[1] === "prompt"),
+      false,
+    );
     // Operator unblocks the harness; its SessionStart hook writes the
     // attestation for the blocked lane and its native session appears.
     const blocked = f.state.lanes[0];
-    const pane = [...f.panes.values()].find(
-      (p) => p.paneId === blocked.paneId,
-    );
+    const pane = [...f.panes.values()].find((p) => p.paneId === blocked.paneId);
     const intent = JSON.parse(
       await readFile(blocked.startupIntentPath, "utf8"),
     );

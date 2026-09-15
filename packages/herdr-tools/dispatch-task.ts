@@ -262,7 +262,9 @@ export async function dispatchTask(
                   "--timeout",
                   "60000",
                   "--",
-                  ...adapters[i].launchArguments(profile, port.source),
+                  ...adapters[i].launchArguments(profile, port.source, {
+                    startupIntentPath: lane.startupIntentPath!,
+                  }),
                 ],
                 signal,
                 65_000,
@@ -290,13 +292,22 @@ export async function dispatchTask(
       lane = workflow.lanes[i];
       const raw = await port.run(["agent", "get", lane.paneId!], signal);
       const agent = (raw.result ?? raw).agent;
-      const hello = JSON.parse(
-        await readFile(`${lane.startupIntentPath}.ready`, "utf8").catch(() => {
-          throw new Error(
-            "Startup handshake not available; no work assigned. Observe before retrying dispatch.",
-          );
-        }),
-      );
+      // Some harnesses attest asynchronously (e.g. a handshake turn completing,
+      // or an MCP server merging operations). Bounded readiness gate, like the
+      // shell gate — never an unbounded loop, never an instant give-up.
+      let hello: any = null;
+      const attestationDeadline = Date.now() + 90_000;
+      while (Date.now() < attestationDeadline) {
+        hello = await readFile(`${lane.startupIntentPath}.ready`, "utf8")
+          .then((text) => JSON.parse(text))
+          .catch(() => null);
+        if (hello) break;
+        await delay(500, { signal });
+      }
+      if (!hello)
+        throw new Error(
+          "Startup handshake not available; no work assigned. Observe before retrying dispatch.",
+        );
       const proof = adapters[i].verifyStartup(agent, hello);
       if (
         agent?.pane_id !== lane.paneId ||
