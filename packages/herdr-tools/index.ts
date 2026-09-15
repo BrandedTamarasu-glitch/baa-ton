@@ -13,11 +13,22 @@ import { randomUUID } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { setTimeout as lockRetryDelay } from "node:timers/promises";
 import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { blocksUnmanagedAgentCommand } from "./command-policy.js";
+import { dispatchTask } from "./dispatch-task.js";
+import { type LaunchProfile, validateLaunchProfile } from "./launch-profile.js";
+import { piLaunchAdapter, verifyActualProfile } from "./pi-launch-adapter.js";
+import {
+  HarnessAdapterRegistry,
+  type NativeSessionRef,
+} from "./harness-adapter.js";
+import { fileURLToPath } from "node:url";
+import { acknowledgeActivation } from "../controller/activation.mjs";
 
 const MANIFEST_DIR = ".pi/herdr-orchestrator";
 const MANIFEST_NAME = "manifest.json";
@@ -106,6 +117,11 @@ type ParentQuestionRequest = {
   question: string;
   answer?: string;
   answeredAt?: string;
+  delivery?: {
+    status: "pending" | "sending" | "delivered" | "uncertain";
+    updatedAt: string;
+    reason?: string;
+  };
 };
 type GoalPauseRecord = {
   status: "goal-paused";
@@ -165,7 +181,17 @@ type EventControllerRegistration = {
   root?: ControllerRootMapping;
   workflow?: ControllerWorkflowMapping;
 };
-type Lane = {
+export type Lane = {
+  nativeSession?: NativeSessionRef;
+  completionReceipt?: {
+    id: string;
+    summary: string;
+    delivery: "pending" | "sending" | "delivered" | "uncertain";
+  };
+  startupIntentPath?: string;
+  startupNonce?: string;
+  tabCreateAttemptedAt?: string;
+  agentStartAttemptedAt?: string;
   id: string;
   objective: string;
   readOnly: boolean;
@@ -204,7 +230,13 @@ type WorktreeBinding = {
 type LaneInput =
   | string
   | { objective: string; readOnly?: boolean; agentKind?: AgentKind };
-type Workflow = {
+export type Workflow = {
+  taskBinding?: {
+    workspaceId: string;
+    rootPaneId: string;
+    rootSessionPath: string;
+  };
+  launchProfile?: LaunchProfile;
   id: string;
   objective: string;
   outcome: "planned" | "running" | "completed" | "closed" | "unknown";
@@ -247,7 +279,13 @@ type Workflow = {
   closeRequestedAt?: string;
   closedAt?: string;
 };
-type ParentGoalStatus = "active" | "waiting-for-event" | "action-required" | "blocked" | "completed" | "paused";
+type ParentGoalStatus =
+  | "active"
+  | "waiting-for-event"
+  | "action-required"
+  | "blocked"
+  | "completed"
+  | "paused";
 type ParentGoalSignal = {
   identity: string;
   workflowId: string;
@@ -256,6 +294,13 @@ type ParentGoalSignal = {
   receivedAt: string;
 };
 type ParentGoalSupervisorState = "running" | "stopped" | "paused";
+type RootTurn = {
+  state: "active" | "idle" | "unknown";
+  runId: string;
+  paneId: string;
+  workspaceId: string;
+  updatedAt: string;
+};
 type ParentGoalSupervisor = {
   version: 1;
   state: ParentGoalSupervisorState;
@@ -271,8 +316,11 @@ type ParentGoalSupervisor = {
     status: "sending" | "delivered" | "pending" | "uncertain";
     attemptedAt: string;
     deliveredAt?: string;
+    acknowledgedAt?: string;
     reason?: string;
   };
+  // Only the root Pi lifecycle writer may authorize idle; Herdr snapshots are telemetry.
+  rootTurn?: RootTurn;
   rootActivity?: {
     status: "idle" | "working" | "blocked" | "done" | "unknown";
     observedAt: string;
@@ -302,7 +350,6 @@ type ExecResult = {
   killed?: boolean;
 };
 
-const AGENT_START_TIMEOUT_MS = 60_000;
 const HERDR_COMMAND_TIMEOUT_MS = 35_000;
 const RECENT_AGENT_OUTPUT_LINES = 120;
 const GOAL_PAUSE_OUTPUT_LIMIT = 6000;
@@ -325,8 +372,12 @@ async function rootBootstrapPrompt(cwd: string): Promise<string> {
     : "No registered parent goal.";
   const active = manifest.workflows
     .filter((workflow) => workflow.status !== "closed")
-    .map((workflow) => ({ id: workflow.id, status: workflow.status, lanes: workflow.lanes.length }));
-  return `\n\nHerdr parent-root bootstrap: you are the sole parent executor. Registered parent goal: ${rootGoal}. Herdr's durable manifest at ${manifestPath(cwd)} is authoritative; current workflows: ${jsonText(active)}. You may use herdr_plan, herdr_dispatch, herdr_observe, herdr_resume, and herdr_close only through their documented parent/root paths. Treat controller-delivered lane lifecycle, parent-question-required, parent-approval-required, and blocker records as one-turn work signals: read the durable record, take one allowed parent action or persist the next decision, then stop. Never ask the user to operate a child pane or Pi goal UI; children persist requests and Herdr wakes you. Do not poll or create detached agents. Do not push, merge, create PRs, deploy, mutate production, or close resources without explicit user approval.`;
+    .map((workflow) => ({
+      id: workflow.id,
+      status: workflow.status,
+      lanes: workflow.lanes.length,
+    }));
+  return `\n\nHerdr parent-root bootstrap: you are the sole parent executor. Registered parent goal: ${rootGoal}. Herdr's durable manifest at ${manifestPath(cwd)} is authoritative; current workflows: ${jsonText(active)}. You may use herdr_plan, herdr_dispatch, herdr_observe, herdr_resume, and herdr_close only through their documented parent/root paths. Treat controller-delivered lane lifecycle, parent-question-required, parent-approval-required, and blocker records as durable work signals: read the record and continue through safe local actions under existing authorization. Persist a truthful state when waiting for an external event, blocked, paused, or complete; do not stop merely because one tool or parent action finished. Never ask the user to operate a child pane or Pi goal UI; children persist requests and Herdr wakes you. Do not poll or create detached agents. Do not push, merge, create PRs, deploy, mutate production, or close resources without explicit user approval.`;
 }
 
 function pausedGoalIds(output: string): string[] {
@@ -373,32 +424,49 @@ async function saveManifest(cwd: string, manifest: Manifest): Promise<void> {
   await rename(temporary, path);
 }
 
-async function acquireManifestLock(cwd: string): Promise<() => Promise<void>> {
+async function acquireManifestLock(
+  cwd: string,
+  waitMs = 0,
+): Promise<() => Promise<void>> {
   const path = manifestPath(cwd);
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const lockPath = join(
     dirname(path),
     `.${MANIFEST_NAME}.herdr-orchestrator.lock`,
   );
-  try {
-    await mkdir(lockPath, { mode: 0o700 });
-    await writeFile(
-      join(lockPath, "owner.json"),
-      `${jsonText({ pid: process.pid, createdAt: now() })}\n`,
-      { mode: 0o600 },
-    );
-    return async () => rm(lockPath, { recursive: true, force: true });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST")
-      throw new Error(
-        `Herdr manifest is busy: ${path}. Wait for the active controller operation, then retry.`,
+  const deadline = Date.now() + waitMs;
+  while (true) {
+    try {
+      await mkdir(lockPath, { mode: 0o700 });
+      await writeFile(
+        join(lockPath, "owner.json"),
+        `${jsonText({ pid: process.pid, createdAt: now() })}\n`,
+        { mode: 0o600 },
       );
-    throw error;
+      return async () => rm(lockPath, { recursive: true, force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        if (Date.now() < deadline) {
+          // Bounded contention on the shared filesystem lock, never agent polling.
+          await lockRetryDelay(10);
+          continue;
+        }
+        throw new Error(
+          `Herdr manifest is busy: ${path}. Wait for the active controller operation, then retry.`,
+        );
+      }
+      throw error;
+    }
   }
 }
 
 const PARENT_GOAL_STATUSES = new Set<ParentGoalStatus>([
-  "active", "waiting-for-event", "action-required", "blocked", "completed", "paused",
+  "active",
+  "waiting-for-event",
+  "action-required",
+  "blocked",
+  "completed",
+  "paused",
 ]);
 const MIN_PARENT_GOAL_NUDGE_INTERVAL_SECONDS = 5;
 const MAX_PARENT_GOAL_NUDGE_INTERVAL_SECONDS = 86_400;
@@ -419,7 +487,9 @@ function parentGoalNudgeInterval(value: number | undefined): number {
 function requireRootGoalExecutor(): void {
   requireHerdr();
   if (!isRootOrchestrator())
-    throw new Error("Only the verified controller-mapped root may create or update the parent goal.");
+    throw new Error(
+      "Only the verified controller-mapped root may create or update the parent goal.",
+    );
 }
 
 async function parentGoal(
@@ -430,99 +500,147 @@ async function parentGoal(
   nextAction?: string,
   nudgeIntervalSeconds?: number,
   pauseReason?: string,
+  rootTurn?: RootTurn,
 ): Promise<ParentGoal> {
   requireRootGoalExecutor();
   const release = await acquireManifestLock(cwd);
   try {
-  const manifest = await loadManifest(cwd);
-  if (action === "status") {
-    if (!manifest.parentGoal) throw new Error("No parent goal is registered.");
-    return manifest.parentGoal;
-  }
-  if (action === "initialize") {
-    if (manifest.parentGoal) throw new Error("A parent goal is already registered; use set-state.");
-    if (!objective?.trim()) throw new Error("objective is required to initialize a parent goal.");
-    const timestamp = now();
-    manifest.parentGoal = {
-      version: 1,
-      id: `parent-goal-${randomUUID().slice(0, 12)}`,
-      objective: objective.trim(),
-      status: "active",
-      nextAction: nextAction?.trim() || "Choose one dependency-ready Herdr action or wait for a durable event.",
-      signals: [],
-      supervisor: {
+    const manifest = await loadManifest(cwd);
+    if (action === "status") {
+      if (!manifest.parentGoal)
+        throw new Error("No parent goal is registered.");
+      return manifest.parentGoal;
+    }
+    if (action === "initialize") {
+      if (manifest.parentGoal)
+        throw new Error("A parent goal is already registered; use set-state.");
+      if (!objective?.trim())
+        throw new Error("objective is required to initialize a parent goal.");
+      const timestamp = now();
+      manifest.parentGoal = {
         version: 1,
-        state: "stopped",
-        intervalSeconds: parentGoalNudgeInterval(nudgeIntervalSeconds),
-        nudgeCount: 0,
-        nextNudgeAt: null,
-        rootActivity: { status: "unknown", observedAt: timestamp },
+        id: `parent-goal-${randomUUID().slice(0, 12)}`,
+        objective: objective.trim(),
+        status: "active",
+        nextAction:
+          nextAction?.trim() ||
+          "Choose one dependency-ready Herdr action or wait for a durable event.",
+        signals: [],
+        supervisor: {
+          version: 1,
+          state: "stopped",
+          intervalSeconds: parentGoalNudgeInterval(nudgeIntervalSeconds),
+          nudgeCount: 0,
+          nextNudgeAt: null,
+          rootActivity: { status: "unknown", observedAt: timestamp },
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        },
         createdAt: timestamp,
         updatedAt: timestamp,
-      },
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    };
-  } else {
-    const goal = manifest.parentGoal;
-    if (!goal) throw new Error("No parent goal is registered; initialize one first.");
-    const timestamp = now();
-    const supervisor = () =>
-      (goal.supervisor ??= {
-        version: 1,
-        state: "stopped",
-        intervalSeconds: parentGoalNudgeInterval(undefined),
-        nudgeCount: 0,
-        nextNudgeAt: null,
-        rootActivity: { status: "unknown", observedAt: timestamp },
-        createdAt: timestamp,
-        updatedAt: timestamp,
-      });
-    if (action === "set-state") {
-      if (!status || !PARENT_GOAL_STATUSES.has(status as ParentGoalStatus))
-        throw new Error(`status must be one of: ${[...PARENT_GOAL_STATUSES].join(", ")}.`);
-      if (status === "paused")
-        throw new Error("Use action=pause with a non-empty pauseReason.");
-      goal.status = status as ParentGoalStatus;
-      if (objective?.trim()) goal.objective = objective.trim();
-      if (nextAction?.trim()) goal.nextAction = nextAction.trim();
-      if (status === "completed" || status === "blocked") {
+      };
+    } else {
+      const goal = manifest.parentGoal;
+      if (!goal)
+        throw new Error("No parent goal is registered; initialize one first.");
+      const timestamp = now();
+      const supervisor = () =>
+        (goal.supervisor ??= {
+          version: 1,
+          state: "stopped",
+          intervalSeconds: parentGoalNudgeInterval(undefined),
+          nudgeCount: 0,
+          nextNudgeAt: null,
+          rootActivity: { status: "unknown", observedAt: timestamp },
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        });
+      const previousWork = JSON.stringify([
+        goal.status,
+        goal.objective,
+        goal.nextAction,
+      ]);
+      const previousSupervisorState = goal.supervisor?.state;
+      if (action === "set-state") {
+        if (!status || !PARENT_GOAL_STATUSES.has(status as ParentGoalStatus))
+          throw new Error(
+            `status must be one of: ${[...PARENT_GOAL_STATUSES].join(", ")}.`,
+          );
+        if (status === "paused")
+          throw new Error("Use action=pause with a non-empty pauseReason.");
+        goal.status = status as ParentGoalStatus;
+        if (objective?.trim()) goal.objective = objective.trim();
+        if (nextAction?.trim()) goal.nextAction = nextAction.trim();
+        if (status === "completed" || status === "blocked") {
+          const control = supervisor();
+          control.state = "stopped";
+          control.nextNudgeAt = null;
+          control.updatedAt = timestamp;
+        }
+      } else if (action === "start") {
+        if (goal.status === "completed" || goal.status === "blocked")
+          throw new Error(
+            "A completed or blocked parent goal cannot be started.",
+          );
+        const control = supervisor();
+        control.state = "running";
+        control.intervalSeconds = parentGoalNudgeInterval(
+          nudgeIntervalSeconds ?? control.intervalSeconds,
+        );
+        // Repeating start on a running supervisor is not a new wake authorization.
+        if (previousSupervisorState !== "running") {
+          control.nextNudgeAt = new Date(
+            Date.parse(timestamp) + control.intervalSeconds * 1000,
+          ).toISOString();
+          delete control.lastDelivery;
+        }
+        delete control.pauseReason;
+        control.updatedAt = timestamp;
+        if (goal.status === "paused") goal.status = "active";
+        if (nextAction?.trim()) goal.nextAction = nextAction.trim();
+      } else if (action === "stop") {
         const control = supervisor();
         control.state = "stopped";
         control.nextNudgeAt = null;
         control.updatedAt = timestamp;
+      } else if (action === "pause") {
+        if (!pauseReason?.trim())
+          throw new Error("pauseReason is required when action=pause.");
+        const control = supervisor();
+        control.state = "paused";
+        control.pauseReason = pauseReason.trim();
+        control.nextNudgeAt = null;
+        control.updatedAt = timestamp;
+        goal.status = "paused";
       }
-    } else if (action === "start") {
-      if (goal.status === "completed" || goal.status === "blocked")
-        throw new Error("A completed or blocked parent goal cannot be started.");
-      const control = supervisor();
-      control.state = "running";
-      control.intervalSeconds = parentGoalNudgeInterval(nudgeIntervalSeconds ?? control.intervalSeconds);
-      control.nextNudgeAt = timestamp;
-      delete control.pauseReason;
-      delete control.lastDelivery;
-      control.updatedAt = timestamp;
-      if (goal.status === "paused") goal.status = "active";
-      if (nextAction?.trim()) goal.nextAction = nextAction.trim();
-    } else if (action === "stop") {
-      const control = supervisor();
-      control.state = "stopped";
-      control.nextNudgeAt = null;
-      control.updatedAt = timestamp;
-    } else if (action === "pause") {
-      if (!pauseReason?.trim())
-        throw new Error("pauseReason is required when action=pause.");
-      const control = supervisor();
-      control.state = "paused";
-      control.pauseReason = pauseReason.trim();
-      control.nextNudgeAt = null;
-      control.updatedAt = timestamp;
-      goal.status = "paused";
+      const control = goal.supervisor;
+      if (
+        control &&
+        previousWork !==
+          JSON.stringify([goal.status, goal.objective, goal.nextAction])
+      ) {
+        // An explicit material work transition can re-arm a delivered wake, but
+        // never silently retry an ambiguous send. Stop/start is the review path.
+        if (
+          control.lastDelivery?.status !== "sending" &&
+          control.lastDelivery?.status !== "uncertain"
+        ) {
+          delete control.lastDelivery;
+          control.nextNudgeAt =
+            goal.status === "active" && control.state === "running"
+              ? new Date(
+                  Date.parse(timestamp) + control.intervalSeconds * 1000,
+                ).toISOString()
+              : null;
+        }
+        control.updatedAt = timestamp;
+      }
+      goal.updatedAt = timestamp;
     }
-    goal.updatedAt = timestamp;
-  }
-  await saveManifest(cwd, manifest);
-  return manifest.parentGoal!;
+    if (rootTurn && manifest.parentGoal?.supervisor)
+      manifest.parentGoal.supervisor.rootTurn = rootTurn;
+    await saveManifest(cwd, manifest);
+    return manifest.parentGoal!;
   } finally {
     await release();
   }
@@ -676,13 +794,12 @@ function validateControllerLane(
   input: unknown,
   label: string,
 ): ControllerLaneMapping {
-  const value = controllerObject(input, label, [
-    "lane_id",
-    "target",
-    "target_kind",
-    "pane_id",
-    "workspace_id",
-  ], ["relationship_id"]);
+  const value = controllerObject(
+    input,
+    label,
+    ["lane_id", "target", "target_kind", "pane_id", "workspace_id"],
+    ["relationship_id"],
+  );
   const paneId = controllerString(value.pane_id, `${label}.pane_id`);
   return {
     lane_id: controllerString(value.lane_id, `${label}.lane_id`),
@@ -690,7 +807,12 @@ function validateControllerLane(
     pane_id: paneId,
     workspace_id: controllerString(value.workspace_id, `${label}.workspace_id`),
     ...(typeof value.relationship_id === "string"
-      ? { relationship_id: controllerString(value.relationship_id, `${label}.relationship_id`) }
+      ? {
+          relationship_id: controllerString(
+            value.relationship_id,
+            `${label}.relationship_id`,
+          ),
+        }
       : {}),
   };
 }
@@ -745,48 +867,108 @@ function validateControllerConfig(input: unknown): ControllerConfig {
     throw new Error(`controller config.owner must be ${OWNER}.`);
   // Read v1 as one isolated legacy record. The next registration writes v2.
   if (input.version === 1) {
-    const legacy = controllerObject(input, "controller config", ["version", "owner", "root", "workflows"]);
+    const legacy = controllerObject(input, "controller config", [
+      "version",
+      "owner",
+      "root",
+      "workflows",
+    ]);
     const root = validateControllerRoot(legacy.root);
     if (!Array.isArray(legacy.workflows) || legacy.workflows.length === 0)
       throw new Error("controller config.workflows must be a non-empty array.");
-    return { version: 2, owner: OWNER, orchestrators: [{
-      id: `legacy:${root.workspace_id}:${root.pane_id}`,
-      root,
-      program: { id: "legacy-global", workspace_id: root.workspace_id },
-      workflows: legacy.workflows.map((item, index) => validateControllerWorkflow(item, `controller config.workflows[${index}]`)),
-    }] };
+    return {
+      version: 2,
+      owner: OWNER,
+      orchestrators: [
+        {
+          id: `legacy:${root.workspace_id}:${root.pane_id}`,
+          root,
+          program: { id: "legacy-global", workspace_id: root.workspace_id },
+          workflows: legacy.workflows.map((item, index) =>
+            validateControllerWorkflow(
+              item,
+              `controller config.workflows[${index}]`,
+            ),
+          ),
+        },
+      ],
+    };
   }
-  const value = controllerObject(input, "controller config", ["version", "owner", "orchestrators"]);
-  if (value.version !== 2) throw new Error("controller config.version must be 1 or 2.");
+  const value = controllerObject(input, "controller config", [
+    "version",
+    "owner",
+    "orchestrators",
+  ]);
+  if (value.version !== 2)
+    throw new Error("controller config.version must be 1 or 2.");
   if (!Array.isArray(value.orchestrators) || value.orchestrators.length === 0)
-    throw new Error("controller config.orchestrators must be a non-empty array.");
+    throw new Error(
+      "controller config.orchestrators must be a non-empty array.",
+    );
   const orchestrators = value.orchestrators.map((item, index) => {
-    const record = controllerObject(item, `controller config.orchestrators[${index}]`, ["id", "root", "program", "workflows"]);
+    const record = controllerObject(
+      item,
+      `controller config.orchestrators[${index}]`,
+      ["id", "root", "program", "workflows"],
+    );
     const root = validateControllerRoot(record.root);
-    const program = controllerObject(record.program, `controller config.orchestrators[${index}].program`, ["id", "workspace_id"], ["parent_manifest_path"]);
-    if (!Array.isArray(record.workflows)) throw new Error("controller orchestrator.workflows must be an array.");
+    const program = controllerObject(
+      record.program,
+      `controller config.orchestrators[${index}].program`,
+      ["id", "workspace_id"],
+      ["parent_manifest_path"],
+    );
+    if (!Array.isArray(record.workflows))
+      throw new Error("controller orchestrator.workflows must be an array.");
     const programId = controllerString(program.id, "controller program.id");
-    const workspaceId = controllerString(program.workspace_id, "controller program.workspace_id");
-    if (workspaceId !== root.workspace_id) throw new Error("controller program workspace must match root workspace.");
-    const parentManifestPath = "parent_manifest_path" in program
-      ? controllerString(program.parent_manifest_path, "controller program.parent_manifest_path")
-      : undefined;
+    const workspaceId = controllerString(
+      program.workspace_id,
+      "controller program.workspace_id",
+    );
+    if (workspaceId !== root.workspace_id)
+      throw new Error(
+        "controller program workspace must match root workspace.",
+      );
+    const parentManifestPath =
+      "parent_manifest_path" in program
+        ? controllerString(
+            program.parent_manifest_path,
+            "controller program.parent_manifest_path",
+          )
+        : undefined;
     if (parentManifestPath && !isAbsolute(parentManifestPath))
-      throw new Error("controller program.parent_manifest_path must be absolute.");
+      throw new Error(
+        "controller program.parent_manifest_path must be absolute.",
+      );
     return {
       id: controllerString(record.id, "controller orchestrator.id"),
       root,
       program: {
         id: programId,
         workspace_id: workspaceId,
-        ...(parentManifestPath ? { parent_manifest_path: resolve(parentManifestPath) } : {}),
+        ...(parentManifestPath
+          ? { parent_manifest_path: resolve(parentManifestPath) }
+          : {}),
       },
-      workflows: record.workflows.map((workflow, workflowIndex) => validateControllerWorkflow(workflow, `controller config.orchestrators[${index}].workflows[${workflowIndex}]`)),
+      workflows: record.workflows.map((workflow, workflowIndex) =>
+        validateControllerWorkflow(
+          workflow,
+          `controller config.orchestrators[${index}].workflows[${workflowIndex}]`,
+        ),
+      ),
     };
   });
-  if (new Set(orchestrators.map((item) => item.id)).size !== orchestrators.length) throw new Error("controller config cannot repeat orchestrator IDs.");
-  const workflowIds = orchestrators.flatMap((item) => item.workflows.map((workflow) => workflow.workflow_id));
-  if (new Set(workflowIds).size !== workflowIds.length) throw new Error("controller config cannot repeat workflow IDs across orchestrators.");
+  if (
+    new Set(orchestrators.map((item) => item.id)).size !== orchestrators.length
+  )
+    throw new Error("controller config cannot repeat orchestrator IDs.");
+  const workflowIds = orchestrators.flatMap((item) =>
+    item.workflows.map((workflow) => workflow.workflow_id),
+  );
+  if (new Set(workflowIds).size !== workflowIds.length)
+    throw new Error(
+      "controller config cannot repeat workflow IDs across orchestrators.",
+    );
   return { version: 2, owner: OWNER, orchestrators };
 }
 
@@ -794,16 +976,26 @@ function controllerRecordId(root: ControllerRootMapping, cwd: string): string {
   return `orchestrator:${root.workspace_id}:${root.pane_id}:${resolve(cwd)}`;
 }
 
-function findControllerRecord(config: ControllerConfig, root: ControllerRootMapping, cwd: string): ControllerOrchestrator | undefined {
+function findControllerRecord(
+  config: ControllerConfig,
+  root: ControllerRootMapping,
+  cwd: string,
+): ControllerOrchestrator | undefined {
   const id = controllerRecordId(root, cwd);
   return config.orchestrators.find((record) => record.id === id);
 }
 
-function recordForRegistration(config: ControllerConfig, registration: EventControllerRegistration): ControllerOrchestrator | undefined {
+function recordForRegistration(
+  config: ControllerConfig,
+  registration: EventControllerRegistration,
+): ControllerOrchestrator | undefined {
   if (!registration.root || !registration.workflow) return undefined;
-  return config.orchestrators.find((record) =>
-    sameControllerRoot(record.root, registration.root!) &&
-    record.workflows.some((workflow) => sameControllerWorkflow(workflow, registration.workflow!)),
+  return config.orchestrators.find(
+    (record) =>
+      sameControllerRoot(record.root, registration.root!) &&
+      record.workflows.some((workflow) =>
+        sameControllerWorkflow(workflow, registration.workflow!),
+      ),
   );
 }
 
@@ -1091,69 +1283,6 @@ function deepState(value: unknown): string | undefined {
   return deepString(value, ["agent_status", "state", "agent_state", "status"]);
 }
 
-function deepNumber(value: unknown, keys: string[]): number | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const object = value as Record<string, unknown>;
-  for (const key of keys)
-    if (typeof object[key] === "number" && Number.isFinite(object[key]))
-      return object[key] as number;
-  for (const child of Object.values(object)) {
-    const found = deepNumber(child, keys);
-    if (found !== undefined) return found;
-  }
-  return undefined;
-}
-
-function deepBoolean(value: unknown, keys: string[]): boolean | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const object = value as Record<string, unknown>;
-  for (const key of keys)
-    if (typeof object[key] === "boolean") return object[key] as boolean;
-  for (const child of Object.values(object)) {
-    const found = deepBoolean(child, keys);
-    if (found !== undefined) return found;
-  }
-  return undefined;
-}
-
-function shellIsForeground(processInfo: unknown): boolean {
-  const shellPid = deepNumber(processInfo, ["shell_pid"]);
-  const foregroundProcessGroupId = deepNumber(processInfo, [
-    "foreground_process_group_id",
-  ]);
-  return shellPid !== undefined && shellPid === foregroundProcessGroupId;
-}
-
-function recordLaneResources(
-  workflow: Workflow,
-  index: number,
-  tabId: string,
-  paneId: string,
-): Lane {
-  const lane = workflow.lanes[index];
-  const recorded = {
-    ...lane,
-    status: lane.status === "planned" ? "resources-created" : lane.status,
-    tabId,
-    paneId,
-    resourceCreatedAt: now(),
-  };
-  workflow.lanes[index] = recorded;
-  workflow.ownership.tabIds ??= [];
-  if (!workflow.ownership.tabIds.includes(tabId))
-    workflow.ownership.tabIds.push(tabId);
-  if (!workflow.ownership.paneIds.includes(paneId))
-    workflow.ownership.paneIds.push(paneId);
-  if (index === 0)
-    workflow.herdr = {
-      ...workflow.herdr,
-      workspaceId: workflow.ownership.workspaceId,
-      tabId,
-      paneId,
-    };
-  return recorded;
-}
-
 function contract(workflow: Workflow, lane: Lane): string {
   const agentKind = laneAgentKind(workflow, lane);
   return [
@@ -1201,7 +1330,11 @@ function readControllerConfigForCurrentPane(): ControllerConfig | undefined {
   try {
     const path = rootConfigPath();
     const details = lstatSync(path);
-    if (!details.isFile() || details.isSymbolicLink() || (details.mode & 0o022) !== 0)
+    if (
+      !details.isFile() ||
+      details.isSymbolicLink() ||
+      (details.mode & 0o022) !== 0
+    )
       return undefined;
     return validateControllerConfig(JSON.parse(readFileSync(path, "utf8")));
   } catch {
@@ -1212,19 +1345,23 @@ function readControllerConfigForCurrentPane(): ControllerConfig | undefined {
 function isRootOrchestrator(): boolean {
   const paneId = process.env[HERDR_PANE_ID_ENV];
   if (!paneId) return false;
-  return readControllerConfigForCurrentPane()?.orchestrators.some(
-    (record) => record.root.pane_id === paneId,
-  ) ?? false;
+  return (
+    readControllerConfigForCurrentPane()?.orchestrators.some(
+      (record) => record.root.pane_id === paneId,
+    ) ?? false
+  );
 }
 
 function isRegisteredChildLane(): boolean {
   const paneId = process.env[HERDR_PANE_ID_ENV];
   if (!paneId) return false;
-  return readControllerConfigForCurrentPane()?.orchestrators.some((record) =>
-    record.workflows.some((workflow) =>
-      workflow.lanes.some((lane) => lane.pane_id === paneId),
-    ),
-  ) ?? false;
+  return (
+    readControllerConfigForCurrentPane()?.orchestrators.some((record) =>
+      record.workflows.some((workflow) =>
+        workflow.lanes.some((lane) => lane.pane_id === paneId),
+      ),
+    ) ?? false
+  );
 }
 
 function requestParentApproval(
@@ -1273,63 +1410,85 @@ function resolveParentApproval(
   request.resolvedAt = now();
 }
 
-function workflowForQuestionRequest(manifest: Manifest): Workflow | undefined {
+function currentChildAssignment() {
   const paneId = process.env.HERDR_PANE_ID;
-  if (paneId) {
-    const paneWorkflow = manifest.workflows.find((workflow) =>
-      workflow.lanes.some((lane) => lane.paneId === paneId),
+  const workspaceId = process.env.HERDR_WORKSPACE_ID;
+  const matches =
+    readControllerConfigForCurrentPane()?.orchestrators.flatMap((record) =>
+      record.workflows.flatMap((workflow) =>
+        workflow.lanes
+          .filter(
+            (lane) =>
+              lane.pane_id === paneId && lane.workspace_id === workspaceId,
+          )
+          .map((lane) => ({ record, workflow, lane })),
+      ),
+    ) ?? [];
+  if (matches.length !== 1)
+    throw new Error(
+      "Child routing requires exactly one registered pane/workspace assignment; no cwd fallback is allowed.",
     );
-    if (paneWorkflow) return paneWorkflow;
-  }
-  const active = manifest.workflows.filter((workflow) =>
-    [
-      "starting",
-      "running",
-      "dispatch-failed",
-      "goal-paused",
-      "goal-resume-requested",
-      "goal-resume-failed",
-    ].includes(workflow.status),
-  );
-  return active.length === 1 ? active[0] : undefined;
+  const match = matches[0];
+  const cwd = dirname(dirname(dirname(match.workflow.manifest_path)));
+  if (resolve(manifestPath(cwd)) !== resolve(match.workflow.manifest_path))
+    throw new Error(
+      "Registered child manifest path does not use the supported store layout.",
+    );
+  return { ...match, cwd };
 }
 
 async function persistParentQuestion(
   cwd: string,
   input: unknown,
 ): Promise<{ request: ParentQuestionRequest; created: boolean }> {
-  const manifest = await loadManifest(cwd);
-  const workflow = workflowForQuestionRequest(manifest);
-  const question = clip(jsonText(input), 6000);
-  const paneId = process.env.HERDR_PANE_ID;
-  const requests = workflow
-    ? (workflow.questionRequests ??= [])
-    : (manifest.questionRequests ??= []);
-  const existing = requests.find(
-    (request) =>
-      request.status === "parent-question-required" &&
-      request.question === question &&
-      request.paneId === paneId,
-  );
-  if (existing) return { request: existing, created: false };
-  const request: ParentQuestionRequest = {
-    id: `question-${randomUUID().slice(0, 8)}`,
-    kind: "question",
-    status: "parent-question-required",
-    requestedAt: now(),
-    workflowId: workflow?.id,
-    paneId,
-    question,
-  };
-  requests.push(request);
-  if (workflow)
+  const assignment = currentChildAssignment();
+  // cwd is a code location, never routing authority.
+  cwd = assignment.cwd;
+  const release = await acquireManifestLock(cwd, 10_000);
+  try {
+    const manifest = await loadManifest(cwd);
+    const workflow = workflowFor(manifest, assignment.workflow.workflow_id);
+    if (
+      !workflow.lanes.some(
+        (lane) =>
+          lane.id === assignment.lane.lane_id &&
+          lane.paneId === assignment.lane.pane_id,
+      )
+    )
+      throw new Error(
+        "Child assignment differs from the authoritative manifest.",
+      );
+    const question = clip(jsonText(input), 6000);
+    const paneId = assignment.lane.pane_id;
+    const requests = (workflow.questionRequests ??= []);
+    const existing = requests.find(
+      (request) =>
+        request.status === "parent-question-required" &&
+        request.question === question &&
+        request.paneId === paneId,
+    );
+    if (existing) return { request: existing, created: false };
+    const request: ParentQuestionRequest = {
+      id: `question-${randomUUID().slice(0, 8)}`,
+      kind: "question",
+      status: "parent-question-required",
+      requestedAt: now(),
+      workflowId: workflow.id,
+      paneId,
+      question,
+      delivery: { status: "pending", updatedAt: now() },
+    };
+    requests.push(request);
     workflow.evidence.push({
       at: now(),
       kind: "parent-question-required",
-      text: `Question ${request.id} was withheld from child UI and persisted for parent observation.`,
+      text: `Question ${request.id} is durable in the authoritative parent store.`,
     });
-  await saveManifest(cwd, manifest);
-  return { request, created: true };
+    await saveManifest(cwd, manifest);
+    return { request, created: true };
+  } finally {
+    await release();
+  }
 }
 
 async function confirmExecution(
@@ -1373,20 +1532,6 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     timeoutMs?: number,
   ): Promise<any> {
     return parseJson(await runHerdrRaw(args, signal, timeoutMs));
-  }
-
-  async function findAgent(
-    name: string,
-    signal?: AbortSignal,
-  ): Promise<unknown | undefined> {
-    const result = (await pi.exec("herdr", ["agent", "get", name], {
-      signal,
-      timeout: HERDR_COMMAND_TIMEOUT_MS,
-    })) as ExecResult;
-    if (result.code === 0) return parseJson(result.stdout);
-    const message = result.stderr || result.stdout;
-    if (/\bagent_not_found\b/.test(message)) return undefined;
-    throw new Error(`herdr agent get ${name} failed: ${clip(message, 2000)}`);
   }
 
   async function assertCleanLocalWorktree(
@@ -1481,7 +1626,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     return lines;
   }
 
-  function parentGoalSidebarTokens(goal: ParentGoal): Record<string, string | undefined> {
+  function parentGoalSidebarTokens(
+    goal: ParentGoal,
+  ): Record<string, string | undefined> {
     const status = goal.status.replaceAll("-", " ");
     const next = wrapSidebarText(goal.nextAction).slice(0, 3);
     return {
@@ -1512,7 +1659,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const mobileLabel = parentGoalMobileLabel(goal);
     // Herdr's compact/mobile switcher uses only state labels, not sidebar rows.
     // Cover idle-but-unseen panes, which the switcher renders as "done".
-    args.push("--state-label", `idle=${mobileLabel}`, "--state-label", `done=${mobileLabel}`);
+    args.push(
+      "--state-label",
+      `idle=${mobileLabel}`,
+      "--state-label",
+      `done=${mobileLabel}`,
+    );
     args.push("--ttl-ms", "86400000");
     await runHerdrRaw(args, signal);
   }
@@ -1522,7 +1674,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const paneId = process.env[HERDR_PANE_ID_ENV];
     if (!paneId) return;
     const args = ["pane", "report-metadata", paneId, "--source", OWNER];
-    for (const name of GOAL_SIDEBAR_TOKEN_NAMES) args.push("--clear-token", name);
+    for (const name of GOAL_SIDEBAR_TOKEN_NAMES)
+      args.push("--clear-token", name);
     args.push("--clear-state-labels");
     await runHerdrRaw(args, signal);
   }
@@ -1544,20 +1697,86 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     request: ParentQuestionRequest,
     signal?: AbortSignal,
   ): Promise<void> {
-    const config = await loadControllerConfig(await controllerConfigPath(signal));
-    const orchestrator = config?.orchestrators.find(
-      (record) => record.program.id === resolve(cwd),
-    );
-    if (!orchestrator)
-      throw new Error("No controller-mapped parent is available for this child question.");
-    await runHerdr([
-      "agent",
-      "prompt",
-      orchestrator.root.target,
-      `A mapped Herdr child needs a parent answer. Ask Zach the durable question in request ${request.id}, then call herdr_question_answer with that request ID and Zach's answer.\n\n${request.question}`,
-      "--timeout",
-      "60000",
-    ], signal);
+    const assignment = currentChildAssignment();
+    cwd = assignment.cwd;
+    if (
+      request.workflowId !== assignment.workflow.workflow_id ||
+      request.paneId !== assignment.lane.pane_id
+    )
+      throw new Error(
+        "Question does not belong to the current child assignment.",
+      );
+    if (request.delivery?.status === "delivered") return;
+    if (
+      request.delivery?.status === "sending" ||
+      request.delivery?.status === "uncertain"
+    )
+      throw new Error(
+        `Question ${request.id} is durable; notification delivery is uncertain. Do not resubmit terminal input.`,
+      );
+    const root = assignment.record.root;
+    const result = await runHerdr(["agent", "get", root.pane_id], signal);
+    const live = liveAgentIdentity(result, "question parent get");
+    if (
+      live.paneId !== root.pane_id ||
+      live.workspaceId !== root.workspace_id ||
+      (root.agent_kind && live.kind !== root.agent_kind) ||
+      (root.target_kind === "name" && live.name !== root.target)
+    )
+      throw new Error(
+        `Question ${request.id} remains pending: parent identity mismatch.`,
+      );
+    if (!["idle", "done"].includes(deepState(result) ?? "unknown"))
+      throw new Error(
+        `Question ${request.id} remains pending: parent is not ready.`,
+      );
+    const updateDelivery = async (
+      status: "sending" | "delivered" | "uncertain",
+      reason?: string,
+    ) => {
+      const release = await acquireManifestLock(cwd, 10_000);
+      try {
+        const manifest = await loadManifest(cwd);
+        const stored = workflowFor(
+          manifest,
+          request.workflowId!,
+        ).questionRequests?.find((item) => item.id === request.id);
+        if (!stored)
+          throw new Error(`Durable question ${request.id} is missing.`);
+        if (status === "sending" && stored.delivery?.status !== "pending")
+          return false;
+        stored.delivery = {
+          status,
+          updatedAt: now(),
+          ...(reason ? { reason } : {}),
+        };
+        await saveManifest(cwd, manifest);
+        return true;
+      } finally {
+        await release();
+      }
+    };
+    // Claim before terminal I/O. A crash or lost reply cannot authorize retyping.
+    if (!(await updateDelivery("sending"))) return;
+    try {
+      await runHerdr(
+        [
+          "agent",
+          "prompt",
+          root.pane_id,
+          `A mapped Herdr child needs a parent answer. Ask Zach the durable question in request ${request.id}, then call herdr_question_answer with that request ID and Zach's answer.\n\n${request.question}`,
+          "--timeout",
+          "60000",
+        ],
+        signal,
+      );
+    } catch (error) {
+      await updateDelivery("uncertain", clip((error as Error).message, 1000));
+      throw new Error(
+        `Question ${request.id} is durable; notification delivery is uncertain. Do not resubmit terminal input.`,
+      );
+    }
+    await updateDelivery("delivered");
   }
 
   async function answerChildQuestion(
@@ -1580,11 +1799,18 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const container = containers.find((item) =>
         item.requests?.some((request) => request.id === requestId),
       );
-      const request = container?.requests?.find((item) => item.id === requestId);
-      if (!request) throw new Error(`No durable parent question exists with ID ${requestId}.`);
+      const request = container?.requests?.find(
+        (item) => item.id === requestId,
+      );
+      if (!request)
+        throw new Error(
+          `No durable parent question exists with ID ${requestId}.`,
+        );
       if (request.status === "answered") return request;
       if (!request.paneId)
-        throw new Error(`Question ${requestId} has no child pane to receive an answer.`);
+        throw new Error(
+          `Question ${requestId} has no child pane to receive an answer.`,
+        );
 
       request.answer = answer;
       request.answeredAt = now();
@@ -1598,14 +1824,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       }
       await saveManifest(cwd, manifest);
       try {
-        await runHerdr([
-          "agent",
-          "prompt",
-          request.paneId,
-          `Herdr parent answer to your question (${requestId}):\n${answer}`,
-          "--timeout",
-          "60000",
-        ], signal);
+        await runHerdr(
+          [
+            "agent",
+            "prompt",
+            request.paneId,
+            `Herdr parent answer to your question (${requestId}):\n${answer}`,
+            "--timeout",
+            "60000",
+          ],
+          signal,
+        );
       } catch (error) {
         throw new Error(
           `The answer is durable but child delivery is pending: ${(error as Error).message}`,
@@ -1687,7 +1916,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     confirm: boolean,
     ctx: ExtensionContext,
     signal?: AbortSignal,
-  ): Promise<{ root: ControllerRootMapping; configPath: string; reset: boolean; manifestReset: boolean; alreadyRegistered: boolean }> {
+  ): Promise<{
+    root: ControllerRootMapping;
+    configPath: string;
+    reset: boolean;
+    manifestReset: boolean;
+    alreadyRegistered: boolean;
+  }> {
     requireHerdr();
     const root = await currentPaneRoot(signal);
     const configPath = await controllerConfigPath(signal);
@@ -1697,40 +1932,61 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       existingManifest.workflows.length > 0 ||
       existingManifest.parentGoal !== undefined ||
       (existingManifest.questionRequests?.length ?? 0) > 0;
-    if (config?.orchestrators.some((record) =>
-      record.workflows.some((workflow) => workflow.lanes.some((lane) => lane.pane_id === root.pane_id)),
-    ))
-      throw new Error("The current pane is already a registered child lane and cannot claim root authority.");
-    const current = config?.orchestrators.find((record) =>
-      sameControllerRoot(record.root, root) && record.program.id === resolve(cwd),
+    if (
+      config?.orchestrators.some((record) =>
+        record.workflows.some((workflow) =>
+          workflow.lanes.some((lane) => lane.pane_id === root.pane_id),
+        ),
+      )
+    )
+      throw new Error(
+        "The current pane is already a registered child lane and cannot claim root authority.",
+      );
+    const current = config?.orchestrators.find(
+      (record) =>
+        sameControllerRoot(record.root, root) &&
+        record.program.id === resolve(cwd),
     );
     if (current && !reset)
-      return { root, configPath, reset: false, manifestReset: false, alreadyRegistered: true };
+      return {
+        root,
+        configPath,
+        reset: false,
+        manifestReset: false,
+        alreadyRegistered: true,
+      };
     if ((config && config.orchestrators.length > 0) || manifestHasLegacyState) {
       if (!reset)
-        throw new Error("Controller config or parent manifest has existing state. Review it, then call herdr_bootstrap_root with reset=true to retire it before claiming this manually started root.");
+        throw new Error(
+          "Controller config or parent manifest has existing state. Review it, then call herdr_bootstrap_root with reset=true to retire it before claiming this manually started root.",
+        );
     }
     const label = reset
       ? "Reset Baa-ton controller mappings and claim this root"
       : "Claim this manually started Baa-ton root";
-    if (confirm && !(await ctx.ui.confirm(
-      "Herdr orchestrator",
-      `${label}? ${reset ? "This retires the existing controller mapping and parent manifest state." : "This records the verified current pane/workspace and a clean parent manifest."} It does not create lanes or enable the controller.`,
-    )))
+    if (
+      confirm &&
+      !(await ctx.ui.confirm(
+        "Herdr orchestrator",
+        `${label}? ${reset ? "This retires the existing controller mapping and parent manifest state." : "This records the verified current pane/workspace and a clean parent manifest."} It does not create lanes or enable the controller.`,
+      ))
+    )
       throw new Error("Root bootstrap was cancelled.");
     const next: ControllerConfig = {
       version: 2,
       owner: OWNER,
-      orchestrators: [{
-        id: controllerRecordId(root, cwd),
-        root,
-        program: {
-          id: resolve(cwd),
-          workspace_id: root.workspace_id,
-          parent_manifest_path: resolve(manifestPath(cwd)),
+      orchestrators: [
+        {
+          id: controllerRecordId(root, cwd),
+          root,
+          program: {
+            id: resolve(cwd),
+            workspace_id: root.workspace_id,
+            parent_manifest_path: resolve(manifestPath(cwd)),
+          },
+          workflows: [],
         },
-        workflows: [],
-      }],
+      ],
     };
     const release = await acquireManifestLock(cwd);
     try {
@@ -1739,12 +1995,21 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         configPath,
         reset || !config
           ? next
-          : { ...config, orchestrators: [...config.orchestrators, ...next.orchestrators] },
+          : {
+              ...config,
+              orchestrators: [...config.orchestrators, ...next.orchestrators],
+            },
       );
     } finally {
       await release();
     }
-    return { root, configPath, reset, manifestReset: reset, alreadyRegistered: false };
+    return {
+      root,
+      configPath,
+      reset,
+      manifestReset: reset,
+      alreadyRegistered: false,
+    };
   }
 
   async function controllerWorkflowMapping(
@@ -1782,7 +2047,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         target_kind: "name",
         pane_id: agent.paneId,
         workspace_id: agent.workspaceId,
-        ...(lane.relationshipId ? { relationship_id: lane.relationshipId } : {}),
+        ...(lane.relationshipId
+          ? { relationship_id: lane.relationshipId }
+          : {}),
       });
     }
     return {
@@ -1835,15 +2102,23 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       // A sole v1-derived record is promoted in place on the first matching
       // registration. This avoids leaving a legacy global record beside its
       // v2 replacement and therefore avoids duplicate wakes.
-      const legacy = config?.orchestrators.length === 1 &&
+      const legacy =
+        config?.orchestrators.length === 1 &&
         config.orchestrators[0].id.startsWith("legacy:") &&
         sameControllerRoot(config.orchestrators[0].root, root)
-        ? config.orchestrators[0] : undefined;
-      const record = config ? (findControllerRecord(config, root, cwd) ?? legacy) : undefined;
+          ? config.orchestrators[0]
+          : undefined;
+      const record = config
+        ? (findControllerRecord(config, root, cwd) ?? legacy)
+        : undefined;
       if (record) {
-        const sameId = record.workflows.filter((candidate) => candidate.workflow_id === mapping.workflow_id);
+        const sameId = record.workflows.filter(
+          (candidate) => candidate.workflow_id === mapping.workflow_id,
+        );
         if (sameId.length > 0 && !sameControllerWorkflow(sameId[0], mapping))
-          throw new Error("Linked controller config has a stale or mismatched workflow mapping; refusing to replace it.");
+          throw new Error(
+            "Linked controller config has a stale or mismatched workflow mapping; refusing to replace it.",
+          );
         const promoted = record.id.startsWith("legacy:")
           ? {
               ...record,
@@ -1856,10 +2131,24 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             }
           : record;
         if (sameId.length === 0 || promoted !== record)
-          await saveControllerConfig(configPath, { ...config!, orchestrators: config!.orchestrators.map((candidate) => candidate.id === record.id ? { ...promoted, workflows: sameId.length === 0 ? [...promoted.workflows, mapping] : promoted.workflows } : candidate) });
+          await saveControllerConfig(configPath, {
+            ...config!,
+            orchestrators: config!.orchestrators.map((candidate) =>
+              candidate.id === record.id
+                ? {
+                    ...promoted,
+                    workflows:
+                      sameId.length === 0
+                        ? [...promoted.workflows, mapping]
+                        : promoted.workflows,
+                  }
+                : candidate,
+            ),
+          });
       } else {
         const next: ControllerOrchestrator = {
-          id: controllerRecordId(root, cwd), root,
+          id: controllerRecordId(root, cwd),
+          root,
           program: {
             id: resolve(cwd),
             workspace_id: root.workspace_id,
@@ -1867,9 +2156,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           },
           workflows: [mapping],
         };
-        await saveControllerConfig(configPath, config
-          ? { ...config, orchestrators: [...config.orchestrators, next] }
-          : { version: 2, owner: OWNER, orchestrators: [next] });
+        await saveControllerConfig(
+          configPath,
+          config
+            ? { ...config, orchestrators: [...config.orchestrators, next] }
+            : { version: 2, owner: OWNER, orchestrators: [next] },
+        );
       }
       const registration: EventControllerRegistration = {
         version: 1,
@@ -1958,7 +2250,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     if (!config) throw new Error("Linked controller config is missing.");
     const record = recordForRegistration(config, registration);
     if (!record)
-      throw new Error("Linked controller config root, program, or workflow mapping is stale or mismatched.");
+      throw new Error(
+        "Linked controller config root, program, or workflow mapping is stale or mismatched.",
+      );
     return config;
   }
 
@@ -1970,18 +2264,44 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const registration = registeredControllerRegistration(cwd, workflow);
     const config = await linkedControllerConfig(registration, signal);
     const record = recordForRegistration(config, registration);
-    if (!record) throw new Error("Linked controller config no longer contains this workflow mapping.");
-    const remaining = record.workflows.filter((candidate) => candidate.workflow_id !== registration.workflow!.workflow_id);
-    if (remaining.length === record.workflows.length) throw new Error("Linked controller config no longer contains this workflow mapping.");
-    const orchestrators = remaining.length === 0
-      ? config.orchestrators.map((candidate) =>
-          candidate.id === record.id && candidate.program.parent_manifest_path
-            ? { ...candidate, workflows: [] }
-            : candidate,
-        ).filter((candidate) => candidate.id !== record.id || candidate.program.parent_manifest_path)
-      : config.orchestrators.map((candidate) => candidate.id === record.id ? { ...candidate, workflows: remaining } : candidate);
-    if (orchestrators.length === 0) await removeControllerConfig(registration.configPath!);
-    else await saveControllerConfig(registration.configPath!, { ...config, orchestrators });
+    if (!record)
+      throw new Error(
+        "Linked controller config no longer contains this workflow mapping.",
+      );
+    const remaining = record.workflows.filter(
+      (candidate) =>
+        candidate.workflow_id !== registration.workflow!.workflow_id,
+    );
+    if (remaining.length === record.workflows.length)
+      throw new Error(
+        "Linked controller config no longer contains this workflow mapping.",
+      );
+    const orchestrators =
+      remaining.length === 0
+        ? config.orchestrators
+            .map((candidate) =>
+              candidate.id === record.id &&
+              candidate.program.parent_manifest_path
+                ? { ...candidate, workflows: [] }
+                : candidate,
+            )
+            .filter(
+              (candidate) =>
+                candidate.id !== record.id ||
+                candidate.program.parent_manifest_path,
+            )
+        : config.orchestrators.map((candidate) =>
+            candidate.id === record.id
+              ? { ...candidate, workflows: remaining }
+              : candidate,
+          );
+    if (orchestrators.length === 0)
+      await removeControllerConfig(registration.configPath!);
+    else
+      await saveControllerConfig(registration.configPath!, {
+        ...config,
+        orchestrators,
+      });
     recordControllerRegistration(workflow, {
       ...registration,
       status: "removed",
@@ -2096,48 +2416,6 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     };
   }
 
-  async function validateWorktreeForDispatch(
-    workflow: Workflow,
-    expectedWorkspaceId: string | undefined,
-    signal?: AbortSignal,
-  ): Promise<WorktreeBinding> {
-    if (!workflow.worktree)
-      throw new Error(
-        "Internal error: worktree validation requested for generic workflow.",
-      );
-    const planned = workflow.worktreeBinding;
-    if (!planned)
-      throw new Error(
-        "Worktree workflow has no durable parent binding; refusing generic workspace fallback.",
-      );
-    if (expectedWorkspaceId && planned.workspaceId !== expectedWorkspaceId)
-      throw new Error(
-        "Recorded worktree workspace ID does not match the workflow workspace ownership.",
-      );
-    if (!expectedWorkspaceId && planned.workspaceId)
-      throw new Error(
-        "Planned worktree workflow already records a workspace; retry its recorded dispatch instead.",
-      );
-    const inspected = await inspectWorktreeForWorkspace(
-      workflow.worktree,
-      expectedWorkspaceId,
-      signal,
-    );
-    if (
-      !samePath(planned.checkoutPath, inspected.checkoutPath) ||
-      planned.repoParent.workspaceId !== inspected.repoParent.workspaceId ||
-      !samePath(
-        planned.repoParent.checkoutPath,
-        inspected.repoParent.checkoutPath,
-      ) ||
-      planned.repoParent.repoKey !== inspected.repoParent.repoKey
-    )
-      throw new Error(
-        "Registered worktree parent changed since planning; refusing workspace reuse.",
-      );
-    return { ...planned, ...inspected };
-  }
-
   async function plan(
     cwd: string,
     objective: string,
@@ -2145,6 +2423,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     worktreeCwd?: string,
     authorizationPolicyInput?: unknown,
     agentKindInput?: unknown,
+    launchProfileInput?: unknown,
   ): Promise<Workflow> {
     const agentKind = validateAgentKind(agentKindInput ?? "pi");
     const authorizationPolicy =
@@ -2171,7 +2450,26 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const worktreeBinding = target.worktree
       ? await inspectWorktreeForWorkspace(target.worktree)
       : undefined;
-    const manifest = await loadManifest(cwd);
+    requireRootGoalExecutor();
+    const root = await currentPaneRoot();
+    const rootAgent = responseRecord(
+      await runHerdr(["agent", "get", root.pane_id]),
+      "task root",
+    ).agent;
+    if (
+      !isRecord(rootAgent) ||
+      !isRecord(rootAgent.agent_session) ||
+      rootAgent.agent_session.kind !== "path" ||
+      typeof rootAgent.agent_session.value !== "string"
+    )
+      throw new Error(
+        "Task planning requires a verified native root session path.",
+      );
+    const rootSessionPath = rootAgent.agent_session.value;
+    const launchProfile =
+      launchProfileInput === undefined
+        ? undefined
+        : validateLaunchProfile(launchProfileInput);
     const stamp = now();
     const id = `herdr-${randomUUID().slice(0, 8)}`;
     const workflow: Workflow = {
@@ -2186,6 +2484,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       cwd: target.cwd,
       worktree: target.worktree,
       worktreeBinding,
+      taskBinding: {
+        workspaceId: root.workspace_id,
+        rootPaneId: root.pane_id,
+        rootSessionPath,
+      },
+      launchProfile,
       evidence: [],
       ownership: { createdBy: OWNER, tabIds: [], paneIds: [] },
       authorizationPolicy,
@@ -2206,8 +2510,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         kind: "worktree-parent-resolved",
         text: jsonText(worktreeBinding),
       });
-    manifest.workflows.push(workflow);
-    await saveManifest(cwd, manifest);
+    const release = await acquireManifestLock(cwd, 10_000);
+    try {
+      const manifest = await loadManifest(cwd);
+      manifest.workflows.push(workflow);
+      await saveManifest(cwd, manifest);
+    } finally {
+      await release();
+    }
     return workflow;
   }
 
@@ -2217,545 +2527,139 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     execute: boolean,
     ctx: ExtensionContext,
     signal?: AbortSignal,
-  ) {
+  ): Promise<{
+    workflow: Workflow;
+    dryRun?: boolean;
+    cancelled?: boolean;
+    dispatched?: boolean;
+    parentApprovalRequired?: boolean;
+    approvalRequest?: ApprovalRequest;
+    commands?: string[];
+  }> {
     const manifest = await loadManifest(cwd);
     const workflow = workflowFor(manifest, id);
-    let workspaceId = workflow.ownership.workspaceId;
-    let reusableWorkspace =
-      !workspaceId && !workflow.worktree
-        ? manifest.workflows.find(
-            (candidate) =>
-              candidate.id !== workflow.id &&
-              candidate.ownership.createdBy === OWNER &&
-              Boolean(candidate.ownership.workspaceId) &&
-              !candidate.worktree &&
-              candidate.outcome !== "closed" &&
-              samePath(candidate.cwd, workflow.cwd),
-          )
-        : undefined;
-    let resuming = Boolean(workspaceId);
-    if (workflow.worktree && !workflow.worktreeBinding)
-      throw new Error(
-        "Worktree workflow has no durable parent binding; refusing generic workspace fallback.",
-      );
-    if (!execute)
-      return {
-        dryRun: true,
-        mode: resuming ? "resume" : "create",
-        workflow,
-        commands: [
-          resuming
-            ? "reuse recorded workspace and lane resources; do not create or close a workspace"
-            : reusableWorkspace
-              ? `reuse durable workspace ${reusableWorkspace.ownership.workspaceId}; create a new tab for each lane`
-              : workflow.worktree
-                ? "herdr worktree open --workspace <registered-parent> --path <worktree.checkoutPath> --label <workflow.id> --no-focus"
-                : "herdr workspace create --cwd <workflow.cwd> --label <workflow.id> --no-focus",
-          "herdr tab create --workspace <workspace> --label <lane> --no-focus",
-          "herdr pane process-info --pane <new-tab-root-pane>",
-          `herdr agent start <name> --kind pi --pane <new-tab-root-pane> --timeout ${AGENT_START_TIMEOUT_MS}`,
-        ],
-      };
-    requireHerdr();
-    if (
-      workflow.status === "running" ||
-      workflow.outcome === "completed" ||
-      workflow.outcome === "closed"
-    )
-      throw new Error(
-        `Workflow ${id} cannot be dispatched from ${workflow.status}.`,
-      );
-    if (resuming && !["starting", "dispatch-failed"].includes(workflow.status))
-      throw new Error(
-        `Workflow ${id} has a recorded workspace but is not in a recoverable dispatch state.`,
-      );
-    const action = resuming
-      ? `Resume dispatch ${id}`
-      : `Create and dispatch ${id}`;
-    if (!isRootOrchestrator()) {
-      const approvalRequest = requestParentApproval(workflow, "dispatch");
-      workflow.updatedAt = now();
-      await saveManifest(cwd, manifest);
-      return { parentApprovalRequired: true, approvalRequest, workflow };
+    if (execute && !isRootOrchestrator()) {
+      const release = await acquireManifestLock(cwd, 10_000);
+      try {
+        const current = await loadManifest(cwd);
+        const stored = workflowFor(current, id);
+        const approvalRequest = requestParentApproval(stored, "dispatch");
+        await saveManifest(cwd, current);
+        return {
+          parentApprovalRequired: true,
+          approvalRequest,
+          workflow: stored,
+        };
+      } finally {
+        await release();
+      }
     }
-    const decision = authorizationDecision(
-      workflow,
-      resuming ? "retry" : "dispatch",
+    const adapters = new HarnessAdapterRegistry();
+    adapters.register(
+      piLaunchAdapter(
+        ctx,
+        join(homedir(), ".pi/agent/extensions/herdr-agent-state.ts"),
+      ),
     );
-    let worktreeBinding: WorktreeBinding | undefined;
-    if (decision.allowed) {
-      try {
-        if (workflow.worktree)
-          worktreeBinding = await validateWorktreeForDispatch(
-            workflow,
-            workspaceId,
-            signal,
-          );
-      } catch (error) {
-        const denied: AuthorizationDecision = {
-          ...decision,
-          allowed: false,
-          reason: `preauthorization denied: ${(error as Error).message}`,
-        };
-        auditAuthorization(workflow, denied);
-        workflow.evidence.push({
-          at: now(),
-          kind: "worktree-validation-denied",
-          text: (error as Error).message,
-        });
-        workflow.updatedAt = now();
-        await saveManifest(cwd, manifest);
-        throw error;
-      }
-      auditAuthorization(workflow, decision);
-      resolveParentApproval(workflow, "dispatch", "approved");
-      workflow.updatedAt = now();
-      await saveManifest(cwd, manifest);
-    } else {
-      auditAuthorization(workflow, decision);
-      workflow.updatedAt = now();
-      await saveManifest(cwd, manifest);
-      const approved = await confirmExecution(ctx, action);
-      resolveParentApproval(
-        workflow,
-        "dispatch",
-        approved ? "approved" : "cancelled",
-      );
-      workflow.updatedAt = now();
-      await saveManifest(cwd, manifest);
-      if (!approved) return { cancelled: true, workflow };
-      try {
-        if (workflow.worktree)
-          worktreeBinding = await validateWorktreeForDispatch(
-            workflow,
-            workspaceId,
-            signal,
-          );
-      } catch (error) {
-        workflow.evidence.push({
-          at: now(),
-          kind: "worktree-validation-denied",
-          text: (error as Error).message,
-        });
-        workflow.updatedAt = now();
-        await saveManifest(cwd, manifest);
-        throw error;
-      }
-    }
-
-    // A durable manifest can outlive a manually removed/failed Herdr
-    // workspace. Repair every persisted reference to a missing shared
-    // workspace only after proving none of its recorded lane agents is live.
-    // This runs before lane/tab handling, so a retry cannot reach tab create
-    // with an obsolete workspace ID.
-    if (workspaceId && !workflow.worktree) {
-      try {
-        await runHerdr(["workspace", "get", workspaceId], signal);
-      } catch (error) {
-        if (!/workspace_not_found/.test((error as Error).message)) throw error;
-        const sharedWorkflows = manifest.workflows.filter(
-          (candidate) => candidate.ownership.workspaceId === workspaceId,
-        );
-        const liveAgents = [];
-        for (const candidate of sharedWorkflows)
-          for (const lane of candidate.lanes) {
-            if (!lane.agentName) continue;
-            if (await findAgent(lane.agentName, signal))
-              liveAgents.push(`${candidate.id}/${lane.agentName}`);
+    return dispatchTask(
+      workflow,
+      execute,
+      {
+        directory: dirname(manifestPath(cwd)),
+        source: fileURLToPath(import.meta.url),
+        adapter: (kind) => adapters.resolve(kind),
+        run: runHerdr,
+        contract,
+        async update(workflowId, mutate) {
+          const release = await acquireManifestLock(cwd, 10_000);
+          try {
+            const current = await loadManifest(cwd);
+            const stored = workflowFor(current, workflowId);
+            mutate(stored);
+            stored.updatedAt = now();
+            await saveManifest(cwd, current);
+            return stored;
+          } finally {
+            await release();
           }
-        if (liveAgents.length > 0)
-          throw new Error(
-            `Recorded workspace ${workspaceId} is missing but still has live agents (${liveAgents.join(", ")}); refusing to clear ambiguous ownership.`,
+        },
+        async verifyRoot(w) {
+          requireRootGoalExecutor();
+          const root = await currentPaneRoot(signal);
+          if (
+            root.pane_id !== w.taskBinding?.rootPaneId ||
+            root.workspace_id !== w.taskBinding.workspaceId
+          )
+            throw new Error(
+              "Current root does not match the designated task workspace; no topology fallback allowed.",
+            );
+          const native = responseRecord(
+            await runHerdr(["agent", "get", root.pane_id], signal),
+            "task root",
+          ).agent;
+          if (
+            !isRecord(native) ||
+            !isRecord(native.agent_session) ||
+            native.agent_session.value !== w.taskBinding.rootSessionPath
+          )
+            throw new Error(
+              "Root incarnation changed; authorized task recovery is required before dispatch.",
+            );
+        },
+        async authorize(w) {
+          const decision = authorizationDecision(
+            w,
+            w.retry ? "retry" : "dispatch",
           );
-        for (const candidate of sharedWorkflows) {
-          candidate.evidence.push({
-            at: now(),
-            kind: "stale-workspace-binding-recovered",
-            text: `Workspace ${workspaceId} was not found and no recorded shared lane agent is live; cleared the persisted binding before retrying ${workflow.id}.`,
-          });
-          delete candidate.ownership.workspaceId;
-          delete candidate.ownership.workspaceOwnerWorkflowId;
-          candidate.herdr = {};
-          candidate.agent = {};
-          delete candidate.pi;
-          candidate.lanes = candidate.lanes.map((lane) => ({
-            ...lane,
-            status: "planned",
-            agentName: undefined,
-            tabId: undefined,
-            paneId: undefined,
-            resourceCreatedAt: undefined,
-            tabRenamedAt: undefined,
-            readiness: undefined,
-            agentStartedAt: undefined,
-            promptAttemptedAt: undefined,
-            promptedAt: undefined,
-            agentSessionPath: undefined,
-            agentSessionId: undefined,
-            piSessionPath: undefined,
-            piSessionId: undefined,
-            herdrState: undefined,
-          }));
-          candidate.updatedAt = now();
-        }
-        workspaceId = undefined;
-        resuming = false;
-        await saveManifest(cwd, manifest);
-      }
-    }
-    // Also verify a planner-selected candidate before reuse; never turn a
-    // stale workspace ID into a failed tab-create for a new workflow.
-    if (reusableWorkspace?.ownership.workspaceId) {
-      const candidateWorkspaceId = reusableWorkspace.ownership.workspaceId;
-      try {
-        await runHerdr(["workspace", "get", candidateWorkspaceId], signal);
-      } catch (error) {
-        if (!/workspace_not_found/.test((error as Error).message)) throw error;
-        const liveAgents = [];
-        for (const lane of reusableWorkspace.lanes) {
-          if (!lane.agentName) continue;
-          const agent = await findAgent(lane.agentName, signal);
-          if (agent) liveAgents.push(lane.agentName);
-        }
-        if (liveAgents.length > 0)
-          throw new Error(
-            `Recorded workspace ${candidateWorkspaceId} is missing but ${reusableWorkspace.id} still has live agents (${liveAgents.join(", ")}); refusing to clear ambiguous ownership.`,
+          return (
+            decision.allowed ||
+            (await confirmExecution(
+              ctx,
+              `Dispatch ${w.id} in task workspace ${w.taskBinding?.workspaceId}`,
+            ))
           );
-        reusableWorkspace.evidence.push({
-          at: now(),
-          kind: "stale-workspace-binding-recovered",
-          text: `Workspace ${candidateWorkspaceId} was not found and no recorded lane agent is live; cleared its reusable binding before dispatching ${workflow.id}.`,
-        });
-        delete reusableWorkspace.ownership.workspaceId;
-        delete reusableWorkspace.ownership.workspaceOwnerWorkflowId;
-        reusableWorkspace.updatedAt = now();
-        reusableWorkspace = undefined;
-        await saveManifest(cwd, manifest);
-      }
-    }
-
-    const attempt = (workflow.retry?.attempt ?? 0) + 1;
-    let currentLaneId: string | undefined;
-    let stage = resuming
-      ? "resume"
-      : workflow.worktree
-        ? "worktree-open"
-        : "workspace-create";
-    let createdWorkspace: unknown | undefined;
-    workflow.status = "starting";
-    workflow.updatedAt = now();
-    workflow.retry = {
-      state: "dispatching",
-      attempt,
-      retryCommand: `herdr_dispatch ${id} execute=true`,
-      resumedAt: now(),
-    };
-    await saveManifest(cwd, manifest);
-
-    try {
-      let recordedWorkspaceId = workspaceId;
-      if (!recordedWorkspaceId) {
-        if (reusableWorkspace?.ownership.workspaceId) {
-          recordedWorkspaceId = reusableWorkspace.ownership.workspaceId;
-          workflow.ownership = {
-            ...workflow.ownership,
-            workspaceId: recordedWorkspaceId,
-            workspaceOwnerWorkflowId:
-              reusableWorkspace.ownership.workspaceOwnerWorkflowId ?? reusableWorkspace.id,
-          };
-          workflow.evidence.push({
-            at: now(),
-            kind: "workspace-reused-for-tabs",
-            text: `Reused durable workspace ${recordedWorkspaceId} from ${reusableWorkspace.id}; this workflow owns only its new tabs/panes.`,
-          });
-        } else if (workflow.worktree) {
-          const binding = worktreeBinding;
-          if (!binding)
-            throw new Error(
-              "Worktree validation did not produce a parent binding; refusing generic workspace fallback.",
-            );
-          createdWorkspace = await runHerdr(
-            [
-              "worktree",
-              "open",
-              "--workspace",
-              binding.repoParent.workspaceId,
-              "--path",
-              binding.checkoutPath,
-              "--label",
-              workflow.id,
-              "--no-focus",
-            ],
-            signal,
-          );
-          if (deepBoolean(createdWorkspace, ["already_open"]) === true)
-            throw new Error(
-              "Herdr reported the Git worktree was already open; refusing to reuse a workspace outside this workflow contract.",
-            );
-          recordedWorkspaceId = deepString(createdWorkspace, ["workspace_id"]);
-          if (!recordedWorkspaceId)
-            throw new Error(
-              "Herdr worktree open did not return a workspace ID.",
-            );
-          workflow.worktreeBinding = {
-            ...binding,
-            workspaceId: recordedWorkspaceId,
-            openResult: createdWorkspace,
-          };
-          workflow.evidence.push({
-            at: now(),
-            kind: "worktree-opened",
-            text: jsonText({
-              repoParent: binding.repoParent,
-              checkoutPath: binding.checkoutPath,
-              workspaceId: recordedWorkspaceId,
-              openResult: createdWorkspace,
-            }),
-          });
-        } else {
-          createdWorkspace = await runHerdr(
-            [
-              "workspace",
-              "create",
-              "--cwd",
-              workflow.cwd,
-              "--label",
-              workflow.id,
-              "--no-focus",
-            ],
-            signal,
-          );
-          recordedWorkspaceId = deepString(createdWorkspace, ["workspace_id"]);
-          if (!recordedWorkspaceId)
-            throw new Error(
-              "Herdr workspace creation did not return a workspace ID.",
-            );
-        }
-        // Persist the owned workspace before handling its root tab/pane or starting an agent.
-        workflow.ownership = {
-          ...workflow.ownership,
-          createdBy: OWNER,
-          workspaceId: recordedWorkspaceId,
-          workspaceOwnerWorkflowId:
-            workflow.ownership.workspaceOwnerWorkflowId ?? workflow.id,
-          tabIds: workflow.ownership.tabIds ?? [],
-          paneIds: workflow.ownership.paneIds ?? [],
-        };
-        workflow.updatedAt = now();
-        await saveManifest(cwd, manifest);
-      }
-
-      for (const [index, initialLane] of workflow.lanes.entries()) {
-        currentLaneId = initialLane.id;
-        let lane = workflow.lanes[index];
-        if (lane.status === "running" && lane.agentName) continue;
-
-        if (!lane.tabId || !lane.paneId) {
-          stage = index === 0 ? "record-workspace-root" : "tab-create";
-          const createdTab =
-            index === 0 && createdWorkspace
-              ? createdWorkspace
-              : await runHerdr(
-                  [
-                    "tab",
-                    "create",
-                    "--workspace",
-                    recordedWorkspaceId,
-                    "--cwd",
-                    workflow.cwd,
-                    "--label",
-                    `${id}-${lane.id}`,
-                    "--no-focus",
-                  ],
-                  signal,
-                );
-          if (!createdTab)
-            throw new Error(
-              `Cannot safely resume ${lane.id}: its workspace root tab was not recorded. ` +
-                "No replacement tab was created; inspect the recorded workspace before retrying.",
-            );
-          const tabId = deepString(createdTab, ["tab_id"]);
-          const paneId = deepString(createdTab, ["pane_id", "root_pane_id"]);
-          if (!tabId || !paneId)
-            throw new Error(
-              `Herdr did not return a tab and root pane for ${lane.id}.`,
-            );
-          lane = recordLaneResources(workflow, index, tabId, paneId);
-          workflow.updatedAt = now();
-          await saveManifest(cwd, manifest);
-        }
-
-        const tabId = lane.tabId;
-        const paneId = lane.paneId;
-        if (!tabId || !paneId)
-          throw new Error(`Missing recorded tab or pane for ${lane.id}.`);
-
-        if (index === 0 && !lane.tabRenamedAt) {
-          stage = "tab-rename";
-          await runHerdr(["tab", "rename", tabId, `${id}-${lane.id}`], signal);
-          lane = { ...lane, tabRenamedAt: now() };
-          workflow.lanes[index] = lane;
-          workflow.updatedAt = now();
-          await saveManifest(cwd, manifest);
-        }
-
-        const agentKind = laneAgentKind(workflow, lane);
-        const agentName =
-          lane.agentName ??
-          `agent_${agentKind}_${id
-            .replace(/[^a-z0-9]/gi, "")
-            .toLowerCase()
-            .slice(-12)}_${index + 1}`;
-        if (!lane.agentName || lane.agentKind !== agentKind) {
-          lane = {
-            ...lane,
-            agentKind,
-            status: lane.agentName ? lane.status : "waiting-ready",
-            agentName,
-            relationshipId: lane.relationshipId ?? `herdr-rel-${randomUUID().slice(0, 12)}`,
-          };
-          workflow.lanes[index] = lane;
-          workflow.updatedAt = now();
-          await saveManifest(cwd, manifest);
-        }
-
-        // `agent start --timeout` is Herdr's native interactive-shell
-        // readiness gate. Do not infer readiness from a snapshot or ask a
-        // parent to retry a newly-created tab.
-        if (!lane.agentStartedAt) {
-          const reconcileLiveAgent = async (): Promise<string | undefined> => {
-            const result = await findAgent(agentName, signal);
-            if (!result) return undefined;
-            const live = liveAgentIdentity(result, `agent ${agentName} get`);
-            if (
-              live.name !== agentName ||
-              live.kind !== agentKind ||
-              live.paneId !== paneId ||
-              live.workspaceId !== recordedWorkspaceId
-            )
+        },
+        async register(w) {
+          const configPath = await controllerConfigPath(signal);
+          const lockPath = `${configPath}.lock`;
+          await mkdir(lockPath, { mode: 0o700 });
+          try {
+            const config = await loadControllerConfig(configPath);
+            const root = await currentPaneRoot(signal);
+            const record = config && findControllerRecord(config, root, cwd);
+            if (!record)
               throw new Error(
-                `Live agent ${agentName} does not match its recorded kind, pane, and workspace.`,
+                "Task root routing must be registered before launch.",
               );
-            return deepState(result) ?? "unknown";
-          };
-          let startedFromNonJsonAcknowledgment = false;
-          const existingAgentState = await reconcileLiveAgent();
-          if (existingAgentState !== undefined) {
-            if (existingAgentState !== "idle" && existingAgentState !== "done")
+            const mapping: ControllerWorkflowMapping = {
+              workflow_id: w.id,
+              manifest_path: resolve(manifestPath(cwd)),
+              pi_goal_pause_detection: false,
+              lanes: w.lanes.map((lane) => ({
+                lane_id: lane.id,
+                target: lane.paneId!,
+                target_kind: "pane_id",
+                pane_id: lane.paneId!,
+                workspace_id: w.taskBinding!.workspaceId,
+                relationship_id: lane.relationshipId,
+              })),
+            };
+            const previous = record.workflows.find(
+              (item) => item.workflow_id === w.id,
+            );
+            if (previous && !sameControllerWorkflow(previous, mapping))
               throw new Error(
-                `Recorded agent ${agentName} is ${existingAgentState}; inspect it with herdr_observe before retrying.`,
+                "Recorded lane route differs; authorized recovery is required.",
               );
-          } else {
-            stage = "agent-start";
-            const startArgs = [
-              "agent", "start", agentName, "--kind", agentKind,
-              "--pane", paneId, "--timeout", String(AGENT_START_TIMEOUT_MS),
-            ];
-            for (let readinessAttempt = 1; readinessAttempt <= 3; readinessAttempt += 1) {
-              try {
-                await runHerdr(startArgs, signal, AGENT_START_TIMEOUT_MS + 5_000);
-                break;
-              } catch (error) {
-                if ((await reconcileLiveAgent()) !== undefined) {
-                  startedFromNonJsonAcknowledgment = true;
-                  break;
-                }
-                if (!/agent_pane_busy/.test((error as Error).message) || readinessAttempt === 3)
-                  throw error;
-                lane = {
-                  ...lane,
-                  status: "waiting-ready",
-                  readiness: {
-                    source: "herdr agent start --timeout",
-                    checkedAt: now(),
-                    initialShellForeground: false,
-                    agentStartTimeoutMs: AGENT_START_TIMEOUT_MS,
-                  },
-                };
-                workflow.lanes[index] = lane;
-                workflow.evidence.push({ at: now(), kind: "agent-readiness-retrying", text: `Herdr native readiness gate reported agent_pane_busy for ${agentName}; retrying within this dispatch (${readinessAttempt + 1}/3).` });
-                workflow.updatedAt = now();
-                await saveManifest(cwd, manifest);
-              }
-            }
-            // A parseable acknowledgement is not identity proof. Reconcile it
-            // too, so no agent-start path can record failure before checking
-            // the live name, kind, pane, and workspace.
-            if ((await reconcileLiveAgent()) === undefined)
-              throw new Error(
-                `Herdr agent start for ${agentName} returned without a live matching agent.`,
-              );
+            if (!previous) record.workflows.push(mapping);
+            await saveControllerConfig(configPath, config!);
+          } finally {
+            await rm(lockPath, { recursive: true, force: true });
           }
-          lane = {
-            ...lane,
-            status: "agent-ready",
-            agentName,
-            agentStartedAt: now(),
-          };
-          workflow.lanes[index] = lane;
-          if (startedFromNonJsonAcknowledgment)
-            workflow.evidence.push({
-              at: now(),
-              kind: "agent-start-ack-reconciled",
-              text: `Live ${agentKind} agent ${agentName} matched pane ${paneId} after an unparseable agent-start acknowledgement.`,
-            });
-          if (index === 0) workflow.herdr = { ...workflow.herdr, agentName };
-          workflow.updatedAt = now();
-          await saveManifest(cwd, manifest);
-        }
-
-        if (lane.promptAttemptedAt && !lane.promptedAt)
-          throw new Error(
-            `Prompt delivery for ${agentName} is uncertain; inspect with herdr_observe before retrying so it is not submitted twice.`,
-          );
-        stage = "agent-prompt";
-        lane = { ...lane, status: "prompting", promptAttemptedAt: now() };
-        workflow.lanes[index] = lane;
-        workflow.updatedAt = now();
-        await saveManifest(cwd, manifest);
-        await runHerdr(
-          ["agent", "prompt", agentName, contract(workflow, lane)],
-          signal,
-        );
-        lane = { ...lane, status: "running", promptedAt: now() };
-        workflow.lanes[index] = lane;
-        workflow.updatedAt = now();
-        await saveManifest(cwd, manifest);
-      }
-      workflow.status = "running";
-      workflow.outcome = "running";
-      workflow.retry = undefined;
-      workflow.dispatchedAt = now();
-      workflow.updatedAt = now();
-      await saveManifest(cwd, manifest);
-      // Registration is best-effort by design: an unlinked or unavailable
-      // controller leaves a durable pending record but never undoes dispatch.
-      await registerEventController(cwd, manifest, workflow, signal);
-      return { dispatched: true, workflow };
-    } catch (error) {
-      const message = (error as Error).message;
-      workflow.status = "dispatch-failed";
-      workflow.outcome = "unknown";
-      workflow.updatedAt = now();
-      workflow.retry = {
-        state: "retryable",
-        attempt,
-        retryCommand: `herdr_dispatch ${id} execute=true`,
-        failedAt: now(),
-        failedLaneId: currentLaneId,
-        failedStage: stage,
-        error: message,
-      };
-      workflow.evidence.push({
-        at: now(),
-        kind: "dispatch-error",
-        text: message,
-      });
-      // Never close resources here: the manifest now contains every resource
-      // successfully returned by Herdr plus enough state for an explicit retry.
-      await saveManifest(cwd, manifest);
-      throw error;
-    }
+        },
+      },
+      signal,
+    );
   }
 
   async function observe(cwd: string, id: string, signal?: AbortSignal) {
@@ -3033,60 +2937,217 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     return { resumed: true, receipts, workflow };
   }
 
-  async function complete(cwd: string, id: string, summary: string, signal?: AbortSignal) {
+  async function complete(
+    cwd: string,
+    id: string,
+    summary: string,
+    signal?: AbortSignal,
+  ) {
     requireHerdr();
-    const manifest = await loadManifest(cwd);
-    const workflow = workflowFor(manifest, id);
-    const paneId = process.env[HERDR_PANE_ID_ENV];
-    const lane = workflow.lanes.find((item) => item.paneId === paneId);
-    if (!paneId || !lane?.agentName || !lane.relationshipId)
-      throw new Error("Completion receipt requires this lane's recorded pane, agent, and relationship ID.");
-    const configPath = await controllerConfigPath(signal);
-    const config = await loadControllerConfig(configPath);
-    const record = config?.orchestrators.find((item) => item.workflows.some((workflow) => workflow.workflow_id === id));
-    const mapping = record?.workflows.find((item) => item.workflow_id === id);
-    const controllerLane = mapping?.lanes.find((item) => item.lane_id === lane.id);
-    if (!config || !record || !mapping || !controllerLane || controllerLane.pane_id !== paneId || controllerLane.target !== lane.agentName || controllerLane.relationship_id !== lane.relationshipId)
-      throw new Error("Completion receipt has no matching controller parent-child mapping.");
-    const child = liveAgentIdentity(await runHerdr(["agent", "get", paneId], signal), "completion child identity");
-    if (child.name !== lane.agentName || child.paneId !== paneId)
-      throw new Error("Live child identity differs from its recorded completion receipt.");
-    const root = liveAgentIdentity(await runHerdr(["agent", "get", record.root.target], signal), "completion root identity");
-    if (root.paneId !== record.root.pane_id || root.workspaceId !== record.root.workspace_id)
-      throw new Error("Live controller root differs from the registered parent.");
-    workflow.evidence.push({ at: now(), kind: "child-completion-receipt", text: `${lane.relationshipId}: ${clip(summary, 2000)}` });
-    lane.status = "completion-reported";
-    workflow.status = "completion-reported";
-    workflow.outcome = "unknown";
-    workflow.updatedAt = now();
-    await saveManifest(cwd, manifest);
-    await runHerdr(["agent", "prompt", record.root.target, `[Herdr completion receipt] ${lane.relationshipId}: ${id}/${lane.id} reports complete. ${clip(summary, 2000)}`], signal);
-    return { delivered: true, workflow, relationshipId: lane.relationshipId };
+    const assignment = currentChildAssignment();
+    if (assignment.workflow.workflow_id !== id)
+      throw new Error("Completion is outside this participant's assignment.");
+    cwd = assignment.cwd;
+    const initial = workflowFor(await loadManifest(cwd), id);
+    const lane = initial.lanes.find(
+      (item) => item.id === assignment.lane.lane_id,
+    )!;
+    const raw = await runHerdr(
+      ["agent", "get", assignment.lane.pane_id],
+      signal,
+    );
+    const child = liveAgentIdentity(raw, "completion child identity");
+    const nativeSession = responseRecord(raw, "completion child").agent;
+    const sessionPath =
+      isRecord(nativeSession) && isRecord(nativeSession.agent_session)
+        ? nativeSession.agent_session.value
+        : undefined;
+    if (
+      !lane?.relationshipId ||
+      child.paneId !== lane.paneId ||
+      child.workspaceId !== assignment.lane.workspace_id ||
+      child.kind !== laneAgentKind(initial, lane) ||
+      (lane.agentSessionPath
+        ? sessionPath !== lane.agentSessionPath
+        : child.name !== lane.agentName)
+    )
+      throw new Error(
+        "Live child incarnation differs from its recorded completion authority.",
+      );
+    const transaction = async (
+      mutate: (stored: Workflow, current: Lane) => void,
+    ) => {
+      const release = await acquireManifestLock(cwd, 10_000);
+      try {
+        const manifest = await loadManifest(cwd);
+        const stored = workflowFor(manifest, id);
+        const current = stored.lanes.find((item) => item.id === lane.id)!;
+        if (
+          !current ||
+          current.agentSessionPath !== lane.agentSessionPath ||
+          current.relationshipId !== lane.relationshipId
+        )
+          throw new Error(
+            "Completion writer was fenced by a changed incarnation.",
+          );
+        mutate(stored, current);
+        await saveManifest(cwd, manifest);
+        return stored;
+      } finally {
+        await release();
+      }
+    };
+    let workflow = await transaction((stored, current) => {
+      if (current.completionReceipt) {
+        if (current.completionReceipt.summary !== summary)
+          throw new Error(
+            "Completion operation already exists with a different summary.",
+          );
+        return;
+      }
+      current.completionReceipt = {
+        id: current.relationshipId!,
+        summary,
+        delivery: "pending",
+      };
+      current.status = "completion-reported";
+      stored.status = "completion-reported";
+      stored.outcome = "unknown";
+      stored.evidence.push({
+        at: now(),
+        kind: "child-completion-receipt",
+        text: `${current.relationshipId}: ${clip(summary, 2000)}`,
+      });
+    });
+    let delivery = workflow.lanes.find((item) => item.id === lane.id)!
+      .completionReceipt!.delivery;
+    const result = () => ({
+      stored: true,
+      delivered: delivery === "delivered",
+      delivery,
+      workflow,
+      relationshipId: lane.relationshipId,
+    });
+    if (delivery !== "pending") return result();
+    const rootBinding = assignment.record.root;
+    let rootRaw;
+    try {
+      rootRaw = await runHerdr(["agent", "get", rootBinding.pane_id], signal);
+    } catch {
+      return result();
+    }
+    const root = liveAgentIdentity(rootRaw, "completion root identity");
+    if (
+      root.paneId !== rootBinding.pane_id ||
+      root.workspaceId !== rootBinding.workspace_id ||
+      !["idle", "done"].includes(deepState(rootRaw) ?? "unknown")
+    )
+      return result();
+    let claimed = false;
+    workflow = await transaction((_stored, current) => {
+      if (current.completionReceipt!.delivery === "pending") {
+        current.completionReceipt!.delivery = "sending";
+        claimed = true;
+      }
+    });
+    if (!claimed) {
+      delivery = workflow.lanes.find((item) => item.id === lane.id)!
+        .completionReceipt!.delivery;
+      return result();
+    }
+    try {
+      await runHerdr(
+        [
+          "agent",
+          "prompt",
+          rootBinding.pane_id,
+          `[Herdr completion receipt] ${lane.relationshipId}: ${id}/${lane.id} reports complete. ${clip(summary, 2000)}`,
+        ],
+        signal,
+      );
+      delivery = "delivered";
+    } catch {
+      delivery = "uncertain";
+    }
+    workflow = await transaction((_stored, current) => {
+      current.completionReceipt!.delivery = delivery;
+    });
+    return result();
   }
 
-  async function reparent(cwd: string, id: string, execute: boolean, ctx: ExtensionContext, signal?: AbortSignal) {
+  async function reparent(
+    cwd: string,
+    id: string,
+    execute: boolean,
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+  ) {
     const manifest = await loadManifest(cwd);
     const workflow = workflowFor(manifest, id);
     const registration = registeredControllerRegistration(cwd, workflow);
     const config = await linkedControllerConfig(registration, signal);
     const record = recordForRegistration(config, registration);
-    if (!record || record.workflows.length !== 1 || !sameControllerWorkflow(record.workflows[0], registration.workflow!))
-      throw new Error("Controller root handoff requires an isolated one-workflow orchestrator record.");
+    if (
+      !record ||
+      record.workflows.length !== 1 ||
+      !sameControllerWorkflow(record.workflows[0], registration.workflow!)
+    )
+      throw new Error(
+        "Controller root handoff requires an isolated one-workflow orchestrator record.",
+      );
     const nextRoot = await discoverControllerRoot(signal);
-    if (!execute) return { dryRun: true, workflow, previousRoot: registration.root, nextRoot };
+    if (!execute)
+      return {
+        dryRun: true,
+        workflow,
+        previousRoot: registration.root,
+        nextRoot,
+      };
     requireHerdr();
-    if (!isRootOrchestrator()) throw new Error("Only the designated root may reparent a controller workflow.");
-    if (sameControllerRoot(registration.root!, nextRoot)) return { reparented: false, unchanged: true, workflow };
-    if (!(await confirmExecution(ctx, `Reparent controller root for ${id}`))) return { cancelled: true, workflow };
-    await saveControllerConfig(registration.configPath!, { ...config, orchestrators: config.orchestrators.map((candidate) => candidate.id === record.id ? { ...candidate, id: controllerRecordId(nextRoot, workflow.cwd), root: nextRoot, program: { ...candidate.program, workspace_id: nextRoot.workspace_id } } : candidate) });
+    if (!isRootOrchestrator())
+      throw new Error(
+        "Only the designated root may reparent a controller workflow.",
+      );
+    if (sameControllerRoot(registration.root!, nextRoot))
+      return { reparented: false, unchanged: true, workflow };
+    if (!(await confirmExecution(ctx, `Reparent controller root for ${id}`)))
+      return { cancelled: true, workflow };
+    await saveControllerConfig(registration.configPath!, {
+      ...config,
+      orchestrators: config.orchestrators.map((candidate) =>
+        candidate.id === record.id
+          ? {
+              ...candidate,
+              id: controllerRecordId(nextRoot, workflow.cwd),
+              root: nextRoot,
+              program: {
+                ...candidate.program,
+                workspace_id: nextRoot.workspace_id,
+              },
+            }
+          : candidate,
+      ),
+    });
     recordControllerRegistration(workflow, {
-      ...registration, status: "registered", updatedAt: now(), root: nextRoot,
+      ...registration,
+      status: "registered",
+      updatedAt: now(),
+      root: nextRoot,
       reason: `Controller root handed off from ${registration.root!.pane_id} to ${nextRoot.pane_id}.`,
     });
-    workflow.evidence.push({ at: now(), kind: "controller-root-reparented", text: `Verified live root handoff: ${registration.root!.pane_id} -> ${nextRoot.pane_id}.` });
+    workflow.evidence.push({
+      at: now(),
+      kind: "controller-root-reparented",
+      text: `Verified live root handoff: ${registration.root!.pane_id} -> ${nextRoot.pane_id}.`,
+    });
     workflow.updatedAt = now();
     await saveManifest(cwd, manifest);
-    return { reparented: true, workflow, previousRoot: registration.root, nextRoot };
+    return {
+      reparented: true,
+      workflow,
+      previousRoot: registration.root,
+      nextRoot,
+    };
   }
 
   async function close(
@@ -3104,12 +3165,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         manifest.workflows.some(
           (candidate) =>
             candidate.id !== workflow.id &&
-            candidate.ownership.workspaceId === workflow.ownership.workspaceId &&
+            candidate.ownership.workspaceId ===
+              workflow.ownership.workspaceId &&
             candidate.outcome !== "closed",
         ),
     );
     if (evidence.filter(Boolean).length === 0)
       throw new Error("Close requires at least one evidence item.");
+    if (workflow.taskBinding)
+      throw new Error(
+        "Task workspaces are user-owned. Workspace closure is forbidden; per-lane cleanup requires a separately reviewed operation.",
+      );
     if (workflow.outcome !== "completed")
       throw new Error(
         "Close requires a completed Herdr observation; blocked, idle, failed, and unknown workflows stay open.",
@@ -3181,17 +3247,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     // A durable workspace can carry multiple goal/lane tabs. Never close it
     // while another non-closed workflow still references it; this workflow
     // only owns its tabs/panes and close has no tab/pane mutation path.
-    if (!sharedWorkspace) {
-      await runHerdr(
-        ["workspace", "close", workflow.ownership.workspaceId],
-        signal,
-      );
-    } else {
+    if (sharedWorkspace) {
       workflow.evidence.push({
         at: now(),
         kind: "workspace-retained-for-other-workflows",
         text: `Retained durable workspace ${workflow.ownership.workspaceId}; another open workflow still references it.`,
       });
+    } else {
+      await runHerdr(
+        ["workspace", "close", workflow.ownership.workspaceId],
+        signal,
+      );
     }
     if (registration) {
       try {
@@ -3220,13 +3286,143 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     return { closed: true, workflow };
   }
 
+  // A run spans every tool/LLM turn, retries, compaction and queued follow-ups.
+  // No timer, tool completion, agent_end, or Herdr idle snapshot releases it.
+  let rootRunId = randomUUID();
+  function currentRootTurn(state: RootTurn["state"]): RootTurn {
+    return {
+      state,
+      runId: rootRunId,
+      paneId: process.env.HERDR_PANE_ID ?? "",
+      workspaceId: process.env.HERDR_WORKSPACE_ID ?? "",
+      updatedAt: now(),
+    };
+  }
+  async function persistRootTurn(
+    ctx: ExtensionContext,
+    state: RootTurn["state"],
+  ): Promise<void> {
+    if (process.env.HERDR_ENV !== "1" || !isRootOrchestrator()) return;
+    const turn = currentRootTurn(state);
+    const config = readControllerConfigForCurrentPane();
+    if (
+      !config?.orchestrators.some(
+        (record) =>
+          record.root.pane_id === turn.paneId &&
+          record.root.workspace_id === turn.workspaceId &&
+          record.root.agent_kind === "pi" &&
+          (record.program?.parent_manifest_path === manifestPath(ctx.cwd) ||
+            record.workflows.some(
+              (workflow) => workflow.manifest_path === manifestPath(ctx.cwd),
+            )),
+      )
+    )
+      return;
+    let release: (() => Promise<void>) | undefined;
+    try {
+      release = await acquireManifestLock(ctx.cwd, 10_000);
+      // A queued settled handler must not release a newer run.
+      if (turn.runId !== rootRunId || (state === "idle" && !ctx.isIdle()))
+        return;
+      const manifest = await loadManifest(ctx.cwd);
+      const control = manifest.parentGoal?.supervisor;
+      if (!control) return;
+      if (
+        state === "idle" &&
+        (control.rootTurn?.runId !== turn.runId ||
+          control.rootTurn.state !== "active")
+      )
+        return;
+      control.rootTurn = turn;
+      if (state === "active" && control.lastDelivery?.status === "delivered")
+        control.lastDelivery.acknowledgedAt ??= turn.updatedAt;
+      // Settling never clears the wake latch. Only a material goal transition does.
+      control.updatedAt = turn.updatedAt;
+      await saveManifest(ctx.cwd, manifest);
+    } catch (error) {
+      // Pi logs lifecycle errors and otherwise continues. Do not execute a run
+      // with stale idle authority if its active write could not be persisted.
+      if (state === "active") ctx.abort();
+      throw error;
+    } finally {
+      await release?.();
+    }
+  }
+  pi.on("agent_start", async (_event, ctx) => {
+    rootRunId = randomUUID();
+    await persistRootTurn(ctx, "active");
+  });
+  pi.on("agent_settled", async (_event, ctx) => {
+    await persistRootTurn(ctx, "idle");
+  });
+  pi.on("session_shutdown", async (_event, ctx) => {
+    rootRunId = randomUUID();
+    await persistRootTurn(ctx, "unknown");
+  });
   pi.on("session_start", async (_event, ctx) => {
-    if (!isRootOrchestrator() || !ctx.hasUI) return;
+    rootRunId = randomUUID();
+    await persistRootTurn(ctx, "unknown");
+    const startupPath = process.env.BAA_STARTUP_INTENT;
+    if (startupPath) {
+      const intent = parseJson(await readFile(startupPath, "utf8"));
+      const profile = validateLaunchProfile(intent.profile);
+      verifyActualProfile(profile, ctx);
+      if (
+        intent.workspaceId !== process.env.HERDR_WORKSPACE_ID ||
+        intent.paneId !== process.env.HERDR_PANE_ID ||
+        intent.source !== fileURLToPath(import.meta.url)
+      )
+        throw new Error(
+          "Startup binding differs from the native task workspace or adapter source.",
+        );
+      const sessionPath = ctx.sessionManager.getSessionFile();
+      if (!sessionPath)
+        throw new Error(
+          "A durable native session is required for startup proof.",
+        );
+      const ready = {
+        version: 1,
+        nonce: intent.nonce,
+        paneId: process.env.HERDR_PANE_ID,
+        workspaceId: process.env.HERDR_WORKSPACE_ID,
+        sessionPath,
+        profile,
+        source: fileURLToPath(import.meta.url),
+        tools: pi.getActiveTools(),
+      };
+      const temporary = `${startupPath}.${randomUUID()}.tmp`;
+      await writeFile(temporary, jsonText(ready), { mode: 0o600 });
+      await rename(temporary, `${startupPath}.ready`);
+    }
+    if (!isRootOrchestrator()) return;
+    const activation = await acknowledgeActivation(
+      dirname(rootConfigPath()),
+      {
+        paneId: process.env.HERDR_PANE_ID,
+        workspaceId: process.env.HERDR_WORKSPACE_ID,
+        sessionPath: ctx.sessionManager.getSessionFile(),
+        source: await realpath(fileURLToPath(import.meta.url)),
+      },
+      async (paneId: string) =>
+        responseRecord(
+          await runHerdr(["agent", "get", paneId], ctx.signal),
+          "activation root",
+        ).agent,
+    );
+    if (activation)
+      pi.sendMessage(
+        {
+          customType: "herdr-runtime-activated",
+          display: true,
+          content: `Authorized runtime activation ${activation.id} verified in ${activation.workspaceId}. Continue the existing task: verify the live subscription/profile, then plan and dispatch bounded Luna work in this workspace only. Do not ask for activation approval again.`,
+        },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+    if (!ctx.hasUI) return;
     const manifest = await loadManifest(ctx.cwd);
     if (manifest.parentGoal)
       await publishParentGoalSidebar(manifest.parentGoal, ctx.signal);
-    else
-      await clearParentGoalSidebar(ctx.signal);
+    else await clearParentGoalSidebar(ctx.signal);
   });
 
   pi.on("tool_call", async (event, ctx) => {
@@ -3241,14 +3437,22 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       isRegisteredChildLane()
     ) {
       try {
-        const persisted = await persistParentQuestion(ctx.cwd, call.input ?? {});
-        if (persisted.created)
-          await wakeParentForQuestion(ctx.cwd, persisted.request, ctx.signal);
-        // A block reason renders in the child transcript and leaks the
-        // parent-routing protocol. The durable record and parent wake are the handoff.
-        return { block: true, terminate: true };
-      } catch {
-        return { block: true, terminate: true };
+        const persisted = await persistParentQuestion(
+          ctx.cwd,
+          call.input ?? {},
+        );
+        await wakeParentForQuestion(ctx.cwd, persisted.request, ctx.signal);
+        return {
+          block: true,
+          terminate: true,
+          reason: `Question ${persisted.request.id} is stored for the registered parent. Direct child UI remains disabled.`,
+        };
+      } catch (error) {
+        // Routing/persistence failure is not successful delegation. Keep it visible.
+        return {
+          block: true,
+          reason: `Parent question routing failed: ${(error as Error).message}. No user answer was recorded; do not treat this as approval.`,
+        };
       }
     }
     const command = call.input?.command;
@@ -3262,13 +3466,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           "Push, merge, PR creation, deploy/external mutation, and Herdr resource closure require explicit parent approval and are never authorized by the local policy.",
       };
     }
-    if (
-      /^\s*pi(?:\s|$)/m.test(command) ||
-      /(?:^|[;&|]\s*)pi-(?:subagents|background-tasks)(?:\s|$)/m.test(
-        command,
-      ) ||
-      /(?:^|[;&]\s*)(?:nohup|disown)\b/m.test(command)
-    ) {
+    if (blocksUnmanagedAgentCommand(command)) {
       return {
         block: true,
         reason:
@@ -3279,33 +3477,48 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event, ctx) => {
     if (process.env.HERDR_ENV !== "1") return {};
+    await persistRootTurn(ctx, "active");
     return {
-      systemPrompt: `${event.systemPrompt}\n\nHerdr controller active. Use available Herdr tools only as permitted by role; do not poll or auto-continue. Herdr delegation policy: delegate only via herdr_plan then herdr_dispatch. Every child must be a new Herdr-created session using its declared agentKind from the installed Herdr compatibility set. Never use Pi subagents, Pi background tasks, detached/background child jobs, or direct Pi child-session launches. Use herdr_observe for completion and herdr_close with evidence for extension-owned resources only.${await rootBootstrapPrompt(ctx.cwd)}`,
+      systemPrompt: `${event.systemPrompt}\n\nHerdr controller active. Use available Herdr tools only as permitted by role; do not poll. Continue authorized safe local work until waiting, blocked, paused, or complete. Herdr delegation policy: delegate only via herdr_plan then herdr_dispatch. Every child must be a new Herdr-created session using its declared agentKind from the installed Herdr compatibility set. Never use Pi subagents, Pi background tasks, detached/background child jobs, or direct Pi child-session launches. Use herdr_observe for completion and herdr_close with evidence for extension-owned resources only.${await rootBootstrapPrompt(ctx.cwd)}`,
     };
   });
 
   pi.registerTool({
     name: "herdr_bootstrap_root",
     label: "Bootstrap Herdr Root",
-    description: "Explicitly claim the verified current pane as the Baa-ton root before creating a parent goal.",
-    promptSnippet: "Bootstrap the manually started Baa-ton root; confirmation is opt-in.",
+    description:
+      "Explicitly claim the verified current pane as the Baa-ton root before creating a parent goal.",
+    promptSnippet:
+      "Bootstrap the manually started Baa-ton root; confirmation is opt-in.",
     promptGuidelines: [
       "Use herdr_bootstrap_root only when Zach explicitly asks to initialize a manually started Baa-ton parent. It never creates lanes or enables the controller; pass confirm=true only when Zach asks for a confirmation gate.",
     ],
-    parameters: Type.Object({
-      reset: Type.Optional(Type.Boolean()),
-      confirm: Type.Optional(Type.Boolean()),
-    }, { additionalProperties: false }),
+    parameters: Type.Object(
+      {
+        reset: Type.Optional(Type.Boolean()),
+        confirm: Type.Optional(Type.Boolean()),
+      },
+      { additionalProperties: false },
+    ),
     async execute(_id, params, signal, _update, ctx) {
-      const result = await bootstrapRoot(ctx.cwd, params.reset ?? false, params.confirm ?? false, ctx, signal);
-      if (!result.alreadyRegistered && ctx.hasUI) await clearParentGoalSidebar(signal);
+      const result = await bootstrapRoot(
+        ctx.cwd,
+        params.reset ?? false,
+        params.confirm ?? false,
+        ctx,
+        signal,
+      );
+      if (!result.alreadyRegistered && ctx.hasUI)
+        await clearParentGoalSidebar(signal);
       return {
-        content: [{
-          type: "text",
-          text: result.alreadyRegistered
-            ? `Verified Baa-ton root ${result.root.pane_id} is already registered.`
-            : `Registered Baa-ton root ${result.root.pane_id}${result.reset ? " after retiring prior mappings" : ""}.`,
-        }],
+        content: [
+          {
+            type: "text",
+            text: result.alreadyRegistered
+              ? `Verified Baa-ton root ${result.root.pane_id} is already registered.`
+              : `Registered Baa-ton root ${result.root.pane_id}${result.reset ? " after retiring prior mappings" : ""}.`,
+          },
+        ],
         details: result,
       };
     },
@@ -3313,25 +3526,53 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   pi.registerTool({
     name: "herdr_goal",
     label: "Herdr Goal",
-    description: "Create or update the controller-owned thin parent goal record; it never polls or resumes Pi goals.",
-    promptSnippet: "Manage the durable Herdr parent goal from the designated root.",
+    description:
+      "Create or update the controller-owned thin parent goal record; it never polls or resumes Pi goals.",
+    promptSnippet:
+      "Manage the durable Herdr parent goal from the designated root.",
     promptGuidelines: [
-      "Use herdr_goal only from the verified controller-mapped root. Initialize only for an explicit user objective. A durable controller signal changes the goal to action-required; after one parent decision, set waiting-for-event or another truthful state, then stop.",
+      "Use herdr_goal only from the verified controller-mapped root. Initialize only for an explicit user objective. A durable controller signal changes the goal to action-required; continue authorized safe local work and set waiting-for-event or another truthful state only at a real wait, blocker, pause, or completion boundary.",
     ],
-    parameters: Type.Object({
-      action: Type.Union([Type.Literal("initialize"), Type.Literal("set-state"), Type.Literal("status"), Type.Literal("start"), Type.Literal("stop"), Type.Literal("pause")]),
-      objective: Type.Optional(Type.String()),
-      status: Type.Optional(Type.String()),
-      nextAction: Type.Optional(Type.String()),
-      nudgeIntervalSeconds: Type.Optional(Type.Integer({ minimum: MIN_PARENT_GOAL_NUDGE_INTERVAL_SECONDS, maximum: MAX_PARENT_GOAL_NUDGE_INTERVAL_SECONDS })),
-      pauseReason: Type.Optional(Type.String()),
-    }, { additionalProperties: false }),
+    parameters: Type.Object(
+      {
+        action: Type.Union([
+          Type.Literal("initialize"),
+          Type.Literal("set-state"),
+          Type.Literal("status"),
+          Type.Literal("start"),
+          Type.Literal("stop"),
+          Type.Literal("pause"),
+        ]),
+        objective: Type.Optional(Type.String()),
+        status: Type.Optional(Type.String()),
+        nextAction: Type.Optional(Type.String()),
+        nudgeIntervalSeconds: Type.Optional(
+          Type.Integer({
+            minimum: MIN_PARENT_GOAL_NUDGE_INTERVAL_SECONDS,
+            maximum: MAX_PARENT_GOAL_NUDGE_INTERVAL_SECONDS,
+          }),
+        ),
+        pauseReason: Type.Optional(Type.String()),
+      },
+      { additionalProperties: false },
+    ),
     async execute(_id, params, signal, _update, ctx) {
-      const goal = await parentGoal(ctx.cwd, params.action, params.objective, params.status, params.nextAction, params.nudgeIntervalSeconds, params.pauseReason);
+      const goal = await parentGoal(
+        ctx.cwd,
+        params.action,
+        params.objective,
+        params.status,
+        params.nextAction,
+        params.nudgeIntervalSeconds,
+        params.pauseReason,
+        currentRootTurn("active"),
+      );
       if (ctx.hasUI) await publishParentGoalSidebar(goal, signal);
 
       return {
-        content: [{ type: "text", text: `Parent goal ${goal.id}: ${goal.status}` }],
+        content: [
+          { type: "text", text: `Parent goal ${goal.id}: ${goal.status}` },
+        ],
         details: { goal },
       };
     },
@@ -3339,15 +3580,20 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   pi.registerTool({
     name: "herdr_question_answer",
     label: "Herdr Question Answer",
-    description: "Record a user-approved parent answer and deliver it to one mapped child lane.",
-    promptSnippet: "Answer a durable mapped-child question from the verified controller root.",
+    description:
+      "Record a user-approved parent answer and deliver it to one mapped child lane.",
+    promptSnippet:
+      "Answer a durable mapped-child question from the verified controller root.",
     promptGuidelines: [
       "Use only after Zach has answered the exact durable child question. This records and delivers the answer; it never resumes a paused Pi goal.",
     ],
-    parameters: Type.Object({
-      requestId: Type.String({ minLength: 1 }),
-      answer: Type.String({ minLength: 1, maxLength: 6000 }),
-    }, { additionalProperties: false }),
+    parameters: Type.Object(
+      {
+        requestId: Type.String({ minLength: 1 }),
+        answer: Type.String({ minLength: 1, maxLength: 6000 }),
+      },
+      { additionalProperties: false },
+    ),
     async execute(_id, params, signal, _update, ctx) {
       const question = await answerChildQuestion(
         ctx.cwd,
@@ -3356,7 +3602,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         signal,
       );
       return {
-        content: [{ type: "text", text: `Delivered parent answer for ${question.id}.` }],
+        content: [
+          { type: "text", text: `Delivered parent answer for ${question.id}.` },
+        ],
         details: { question },
       };
     },
@@ -3364,23 +3612,65 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   pi.registerTool({
     name: "herdr_complete",
     label: "Herdr Complete",
-    description: "Deliver one verified child completion receipt to the registered controller root.",
+    description:
+      "Deliver one verified child completion receipt to the registered controller root.",
     promptSnippet: "Report a completed mapped child lane to its Herdr parent.",
-    parameters: Type.Object({ workflowId: Type.String(), summary: Type.String() }),
+    parameters: Type.Object({
+      workflowId: Type.String(),
+      summary: Type.String(),
+    }),
     async execute(_id, params, signal, _update, ctx) {
-      const result = await complete(ctx.cwd, params.workflowId, params.summary, signal);
-      return { content: [{ type: "text", text: `Delivered completion receipt ${result.relationshipId}` }], details: result };
+      const result = await complete(
+        ctx.cwd,
+        params.workflowId,
+        params.summary,
+        signal,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Stored completion receipt ${result.relationshipId}; parent notification: ${result.delivery}.`,
+          },
+        ],
+        details: result,
+      };
     },
   });
   pi.registerTool({
     name: "herdr_reparent",
     label: "Herdr Reparent",
-    description: "Preview or root-confirm a controller-root handoff for one isolated registered workflow.",
-    promptSnippet: "Reparent an isolated Herdr controller workflow to the verified current root.",
-    parameters: Type.Object({ workflowId: Type.String(), execute: Type.Optional(Type.Boolean()) }),
+    description:
+      "Preview or root-confirm a controller-root handoff for one isolated registered workflow.",
+    promptSnippet:
+      "Reparent an isolated Herdr controller workflow to the verified current root.",
+    parameters: Type.Object({
+      workflowId: Type.String(),
+      execute: Type.Optional(Type.Boolean()),
+    }),
     async execute(_id, params, signal, _update, ctx) {
-      const result = await reparent(ctx.cwd, params.workflowId, params.execute ?? false, ctx, signal);
-      return { content: [{ type: "text", text: result.dryRun ? `Dry-run reparent for ${params.workflowId}` : result.cancelled ? "Reparent cancelled" : result.unchanged ? "Controller root is already current" : `Reparented ${params.workflowId}` }], details: result };
+      const result = await reparent(
+        ctx.cwd,
+        params.workflowId,
+        params.execute ?? false,
+        ctx,
+        signal,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: result.dryRun
+              ? `Dry-run reparent for ${params.workflowId}`
+              : result.cancelled
+                ? "Reparent cancelled"
+                : result.unchanged
+                  ? "Controller root is already current"
+                  : `Reparented ${params.workflowId}`,
+          },
+        ],
+        details: result,
+      };
     },
   });
   pi.registerTool({
@@ -3412,6 +3702,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ),
         worktreeCwd: Type.Optional(Type.String()),
         agentKind: Type.Optional(Type.String()),
+        launchProfile: Type.Optional(
+          Type.Object(
+            {
+              provider: Type.String(),
+              model: Type.String(),
+              thinking: Type.String(),
+              auth: Type.Literal("subscription"),
+            },
+            { additionalProperties: false },
+          ),
+        ),
         authorizationPolicy: Type.Optional(
           Type.Object(
             {
@@ -3435,10 +3736,21 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const workflow = await plan(
         ctx.cwd,
         params.objective,
-        params.lanes ?? [],
+        (params.lanes ?? []).map((lane) =>
+          typeof lane === "string"
+            ? lane
+            : {
+                ...lane,
+                agentKind:
+                  lane.agentKind === undefined
+                    ? undefined
+                    : validateAgentKind(lane.agentKind),
+              },
+        ),
         params.worktreeCwd,
         params.authorizationPolicy,
         params.agentKind,
+        params.launchProfile,
       );
       return {
         content: [
@@ -3455,7 +3767,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     name: "herdr_dispatch",
     label: "Herdr Dispatch",
     description:
-      "Preview or explicitly dispatch a planned workflow into a new Herdr workspace and selected-agent pane.",
+      "Dispatch verified Pi lanes into the root-bound task workspace only. Explicit provider/model/thinking/subscription launchProfile and startup proof are mandatory; no workspace creation or model fallback.",
     promptSnippet:
       "Dispatch only a planned Herdr workflow; dry-run by default.",
     promptGuidelines: [
@@ -3485,7 +3797,6 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                   ? "Dispatch cancelled"
                   : `Dispatched ${params.workflowId}`,
           },
-          {},
         ],
         details: result,
       };
@@ -3583,7 +3894,6 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                   ? "Close cancelled"
                   : `Closed ${params.workflowId}`,
           },
-          {},
         ],
         details: result,
       };

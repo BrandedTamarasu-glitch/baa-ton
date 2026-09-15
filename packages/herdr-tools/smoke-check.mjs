@@ -2,7 +2,6 @@
 import assert from "node:assert/strict";
 import {
   chmod,
-  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -14,6 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { handleHook, runSupervisorTick } from "../controller/controller.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const source = await readFile(join(root, "index.ts"), "utf8");
@@ -28,9 +28,9 @@ assert.ok(
 const dispatch = source.slice(dispatchStart, dispatchEnd);
 
 assert.doesNotMatch(
-  source,
-  /waitForShell|setTimeout\s*\(/,
-  "no local sleep remains",
+  dispatch,
+  /waitForShell|setTimeout\s*\(|lockRetryDelay\s*\(/,
+  "dispatch readiness has no local sleeps (bounded manifest-lock contention is separate)",
 );
 assert.match(
   source,
@@ -42,64 +42,107 @@ assert.match(
   /\.\$\{MANIFEST_NAME\}\.herdr-orchestrator\.lock/,
   "goal writes use the documented shared manifest sibling lock",
 );
-const agentStartPattern = /"agent"\s*,\s*"start"/;
-assert.doesNotMatch(dispatch, /"pane"\s*,\s*"process-info"/, "does not mistake a process snapshot for readiness");
-assert.match(
+assert.doesNotMatch(
   dispatch,
-  /"agent"\s*,\s*"start"[\s\S]*?"--timeout"\s*,\s*String\s*\(\s*AGENT_START_TIMEOUT_MS\s*\)/,
-  "uses bounded server readiness",
+  /"pane"\s*,\s*"process-info"/,
+  "does not mistake a process snapshot for readiness",
 );
-assert.match(
-  dispatch,
-  /for \(let readinessAttempt = 1; readinessAttempt <= 3; readinessAttempt \+= 1\)[\s\S]*?agent-readiness-retrying/,
-  "uses only the native bounded agent-start readiness gate and persists automatic busy recovery",
-);
-assert.match(
-  dispatch,
-  /workspaceId: recordedWorkspaceId,[\s\S]{0,400}await saveManifest\(cwd, manifest\);/,
-  "persists each returned workspace before handling its root",
-);
-assert.match(
-  dispatch,
-  /recordLaneResources\(workflow, index, tabId, paneId\);[\s\S]{0,180}await saveManifest\(cwd, manifest\);/,
-  "persists each returned tab and pane before readiness/start",
-);
-assert.match(
-  dispatch,
-  /state: "retryable"/,
-  "persists a retryable partial-failure state",
-);
+// Native busy recovery and topology are tested behaviorally in dispatch-task.test.mjs.
 const failurePath = dispatch.slice(dispatch.indexOf("catch (error)"));
 assert.doesNotMatch(
   failurePath,
   /"workspace", "close"/,
   "partial failure has no cleanup close",
 );
-assert.match(readme, /Partial dispatch failures/, "README documents recovery behavior");
-assert.match(defects, /agent_pane_busy/, "defect ledger records the readiness incident");
-assert.match(source, /verified controller-mapped root/, "verified root designation is enforced");
-assert.match(source, /herdr_bootstrap_root/, "manual root bootstrap is registered");
-assert.match(source, /current pane identity/, "manual roots use verified pane identity");
+assert.match(
+  readme,
+  /Partial dispatch failures/,
+  "README documents recovery behavior",
+);
+assert.match(
+  defects,
+  /agent_pane_busy/,
+  "defect ledger records the readiness incident",
+);
+assert.match(
+  source,
+  /verified controller-mapped root/,
+  "verified root designation is enforced",
+);
+assert.match(
+  source,
+  /herdr_bootstrap_root/,
+  "manual root bootstrap is registered",
+);
+assert.match(
+  source,
+  /current pane identity/,
+  "manual roots use verified pane identity",
+);
 assert.match(readme, /Non-root callers/, "README documents root mediation");
-assert.match(defects, /Child approvals/, "defect ledger records approval mediation");
-assert.match(source, /ask_user_question[\s\S]*terminate:\s*true/, "child questions terminate without transcript output");
-assert.match(source, /worktreeCwd[\s\S]*plannedCwd/, "planner validates worktree cwd");
-assert.match(readme, /Worktree workflows/, "README documents worktree ownership");
-assert.match(source, /"worktree"\s*,\s*"open"[\s\S]*?"--workspace"[\s\S]*?"--path"/, "Git flow opens from a registered parent workspace");
-assert.match(source, /already_open[\s\S]*?refusing to reuse a workspace/, "Git flow refuses an already-open worktree workspace");
-assert.match(defects, /Worktree dispatch/, "defect ledger records worktree metadata retention");
-assert.match(source, /SUPPORTED_AGENT_KINDS[\s\S]*?"claude"[\s\S]*?"codex"[\s\S]*?"gemini"[\s\S]*?"--kind"\s*,\s*agentKind/, "dispatch selects a complete compatible lane agent kind");
-assert.match(dispatch, /reusableWorkspace[\s\S]*?workspace-reused-for-tabs[\s\S]*?tab",\s*"create"/, "same-cwd non-worktree workflows reuse a durable workspace and create lane tabs");
-assert.match(dispatch, /workspace", "get", candidateWorkspaceId[\s\S]*?stale-workspace-binding-recovered/, "dispatch verifies a reusable workspace and clears only a missing agent-free binding");
-assert.match(dispatch, /if \(workspaceId && !workflow\.worktree\)[\s\S]*?candidate\.ownership\.workspaceId === workspaceId[\s\S]*?workspaceId = undefined/, "retry clears every persisted shared reference only after missing-workspace recovery");
-assert.match(source, /sharedWorkspace[\s\S]*?workspace-retained-for-other-workflows/, "closing a shared workspace is guarded by other non-closed workflow references");
-assert.match(readme, /Each lane gets its own Herdr tab/, "README documents workspace/tab/pane topology");
-assert.match(source, /RECENT_AGENT_OUTPUT_LINES[\s\S]*goal-paused[\s\S]*?\/goal-resume/, "observation parses bounded paused-goal output and resume sends the goal command");
-assert.match(source, /herdr_complete\(\{ workflowId:[\s\S]*?chat-only outcome is insufficient[\s\S]*?fallback-only/, "every generated lane contract requires an explicit durable completion receipt");
-assert.match(source, /authorizationPolicy[\s\S]*authorization-policy-granted/, "bounded authorization policy is stored and audited");
-assert.match(source, /authorizationPolicy cannot authorize/, "policy rejects capabilities outside the fixed local allowlist");
+assert.match(
+  defects,
+  /Child approvals/,
+  "defect ledger records approval mediation",
+);
+assert.match(
+  source,
+  /ask_user_question[\s\S]*terminate:\s*true/,
+  "child questions terminate without transcript output",
+);
+assert.match(
+  source,
+  /worktreeCwd[\s\S]*plannedCwd/,
+  "planner validates worktree cwd",
+);
+assert.match(
+  readme,
+  /Worktree workflows/,
+  "README documents worktree ownership",
+);
+// Worktrees select checkout paths only; dispatch must never open a workspace.
+assert.match(
+  defects,
+  /Worktree dispatch/,
+  "defect ledger records worktree metadata retention",
+);
+// Detection compatibility is not a verified startup capability.
+assert.match(
+  source,
+  /sharedWorkspace[\s\S]*?workspace-retained-for-other-workflows/,
+  "closing a shared workspace is guarded by other non-closed workflow references",
+);
+assert.match(
+  readme,
+  /Each lane gets its own Herdr tab/,
+  "README documents workspace/tab/pane topology",
+);
+assert.match(
+  source,
+  /RECENT_AGENT_OUTPUT_LINES[\s\S]*goal-paused[\s\S]*?\/goal-resume/,
+  "observation parses bounded paused-goal output and resume sends the goal command",
+);
+assert.match(
+  source,
+  /herdr_complete\(\{ workflowId:[\s\S]*?chat-only outcome is insufficient[\s\S]*?fallback-only/,
+  "every generated lane contract requires an explicit durable completion receipt",
+);
+assert.match(
+  source,
+  /authorizationPolicy[\s\S]*authorization-policy-granted/,
+  "bounded authorization policy is stored and audited",
+);
+assert.match(
+  source,
+  /authorizationPolicy cannot authorize/,
+  "policy rejects capabilities outside the fixed local allowlist",
+);
 assert.match(readme, /herdr_resume/, "README documents the resume tool");
-assert.match(defects, /Paused-goal evidence/, "defect ledger records paused goals");
+assert.match(
+  defects,
+  /Paused-goal evidence/,
+  "defect ledger records paused goals",
+);
 
 const require = createRequire(import.meta.url);
 const createJiti = require("jiti");
@@ -265,6 +308,12 @@ extension.default({
             agent: {
               name: "smoke-root",
               agent: "pi",
+              agent_session: {
+                agent: "pi",
+                source: "herdr:pi",
+                kind: "path",
+                value: "/sessions/root.jsonl",
+              },
               pane_id: rootPaneId,
               workspace_id: rootWorkspaceId,
               agent_status: "idle",
@@ -330,25 +379,43 @@ extension.default({
   },
 });
 assert.equal(tools.size, 10, "extension registered its workflow tools");
-assert.ok(tools.has("herdr_bootstrap_root"), "extension registers manual root bootstrap");
-assert.ok(tools.has("herdr_question_answer"), "extension registers parent question answers");
+assert.ok(
+  tools.has("herdr_bootstrap_root"),
+  "extension registers manual root bootstrap",
+);
+assert.ok(
+  tools.has("herdr_question_answer"),
+  "extension registers parent question answers",
+);
 assert.ok(tools.has("herdr_reparent"), "extension registers root handoff");
-assert.ok(tools.has("herdr_complete"), "extension registers verified completion receipts");
+assert.ok(
+  tools.has("herdr_complete"),
+  "extension registers verified completion receipts",
+);
 assert.ok(commands.has("herdr-resume"), "extension registered /herdr-resume");
 
 const testCwd = await mkdtemp(join(tmpdir(), "herdr-orchestrator-smoke-"));
 const previousHerdrEnv = process.env.HERDR_ENV;
 const previousRootEnv = process.env.HERDR_ORCHESTRATOR_ROOT;
 const previousPaneEnv = process.env.HERDR_PANE_ID;
+const previousWorkspaceEnv = process.env.HERDR_WORKSPACE_ID;
 const previousPluginConfigDir = process.env.HERDR_PLUGIN_CONFIG_DIR;
 process.env.HERDR_ENV = "1";
 process.env.HERDR_PANE_ID = rootPaneId;
+process.env.HERDR_WORKSPACE_ID = rootWorkspaceId;
 controllerConfigDir = join(testCwd, "controller-config");
 process.env.HERDR_PLUGIN_CONFIG_DIR = controllerConfigDir;
 let confirmationCalls = 0;
+let rootIdle = false;
+let abortedRuns = 0;
 const notifications = [];
 const ctx = {
   cwd: testCwd,
+  sessionManager: { getSessionFile: () => "/sessions/root.jsonl" },
+  isIdle: () => rootIdle,
+  abort: () => {
+    abortedRuns += 1;
+  },
   mode: "tui",
   hasUI: true,
   ui: {
@@ -376,41 +443,51 @@ try {
   delete process.env.HERDR_ORCHESTRATOR_ROOT;
   await mkdir(controllerConfigDir, { mode: 0o755 });
   await chmod(controllerConfigDir, 0o755);
-  const legacyManifestPath = join(testCwd, ".pi", "herdr-orchestrator", "manifest.json");
+  const legacyManifestPath = join(
+    testCwd,
+    ".pi",
+    "herdr-orchestrator",
+    "manifest.json",
+  );
   await mkdir(dirname(legacyManifestPath), { recursive: true });
-  await writeFile(legacyManifestPath, `${JSON.stringify({
-    version: 2,
-    workflows: [{ id: "legacy-workflow" }],
-    questionRequests: [{ id: "legacy-question" }],
-  })}\n`);
+  await writeFile(
+    legacyManifestPath,
+    `${JSON.stringify({
+      version: 2,
+      workflows: [{ id: "legacy-workflow" }],
+      questionRequests: [{ id: "legacy-question" }],
+    })}\n`,
+  );
   await assert.rejects(
-    tools.get("herdr_bootstrap_root").execute(
-      "bootstrap-root-without-reset",
-      {},
-      undefined,
-      undefined,
-      ctx,
-    ),
+    tools
+      .get("herdr_bootstrap_root")
+      .execute("bootstrap-root-without-reset", {}, undefined, undefined, ctx),
     /parent manifest has existing state/,
     "bootstrap refuses to adopt a legacy manifest",
   );
-  const bootstrappedRoot = await tools.get("herdr_bootstrap_root").execute(
-    "bootstrap-root",
-    { reset: true },
-    undefined,
-    undefined,
-    ctx,
-  );
+  const bootstrappedRoot = await tools
+    .get("herdr_bootstrap_root")
+    .execute("bootstrap-root", { reset: true }, undefined, undefined, ctx);
   assert.equal(bootstrappedRoot.details.root.pane_id, rootPaneId);
   assert.equal(bootstrappedRoot.details.manifestReset, true);
-  assert.equal(confirmationCalls, 0, "manual root bootstrap is confirmation-free by default");
+  assert.equal(
+    confirmationCalls,
+    0,
+    "manual root bootstrap is confirmation-free by default",
+  );
   assert.deepEqual(
     JSON.parse(await readFile(legacyManifestPath, "utf8")),
     { version: 2, workflows: [] },
     "explicit reset retires legacy parent state",
   );
-  const bootstrapConfig = JSON.parse(await readFile(join(controllerConfigDir, "config.json"), "utf8"));
-  assert.equal(bootstrapConfig.orchestrators[0].root.pane_id, rootPaneId, "bootstrap persists the verified root pane");
+  const bootstrapConfig = JSON.parse(
+    await readFile(join(controllerConfigDir, "config.json"), "utf8"),
+  );
+  assert.equal(
+    bootstrapConfig.orchestrators[0].root.pane_id,
+    rootPaneId,
+    "bootstrap persists the verified root pane",
+  );
   const worktreeCwd = join(testCwd, "bb029-writer-worktree");
   const dirtyWorktreeCwd = join(testCwd, "dirty-worktree");
   const ambiguousWorktreeCwd = join(testCwd, "ambiguous-worktree");
@@ -591,7 +668,11 @@ try {
     );
   assert.equal(childDispatch.details.parentApprovalRequired, true);
   assert.equal(repeatedChildDispatch.details.parentApprovalRequired, true);
-  assert.equal(confirmationCalls, 0, "child dispatch opens no confirmation UI after root bootstrap");
+  assert.equal(
+    confirmationCalls,
+    0,
+    "child dispatch opens no confirmation UI after root bootstrap",
+  );
   process.env.HERDR_PANE_ID = rootPaneId;
   assert.equal(
     calls.filter((args) => args[0] === "worktree" && args[1] === "open").length,
@@ -630,54 +711,360 @@ try {
     "repeated child dispatch returns the single parent request",
   );
 
-  const initializedGoal = await tools.get("herdr_goal").execute(
-    "goal-initialize",
-    { action: "initialize", objective: "Complete BB-029 safely." },
-    undefined,
-    undefined,
-    ctx,
-  );
+  const initializedGoal = await tools
+    .get("herdr_goal")
+    .execute(
+      "goal-initialize",
+      { action: "initialize", objective: "Complete BB-029 safely." },
+      undefined,
+      undefined,
+      ctx,
+    );
   assert.equal(initializedGoal.details.goal.supervisor.state, "stopped");
   assert.deepEqual(calls.at(-1), [
-    "pane", "report-metadata", rootPaneId,
-    "--source", "herdr-orchestrator",
-    "--token", "herdr_goal_status=Goal: active",
-    "--token", "herdr_goal_next_1=Next: Choose one",
-    "--token", "herdr_goal_next_2=dependency-ready",
-    "--token", "herdr_goal_next_3=Herdr action or wait",
-    "--state-label", "idle=Goal: active",
-    "--state-label", "done=Goal: active",
-    "--ttl-ms", "86400000",
+    "pane",
+    "report-metadata",
+    rootPaneId,
+    "--source",
+    "herdr-orchestrator",
+    "--token",
+    "herdr_goal_status=Goal: active",
+    "--token",
+    "herdr_goal_next_1=Next: Choose one",
+    "--token",
+    "herdr_goal_next_2=dependency-ready",
+    "--token",
+    "herdr_goal_next_3=Herdr action or wait",
+    "--state-label",
+    "idle=Goal: active",
+    "--state-label",
+    "done=Goal: active",
+    "--ttl-ms",
+    "86400000",
   ]);
-  const runningGoal = await tools.get("herdr_goal").execute(
-    "goal-start",
-    { action: "start", nudgeIntervalSeconds: 5 },
-    undefined,
-    undefined,
-    headlessRootCtx,
-  );
-  assert.equal(runningGoal.details.goal.supervisor.state, "running");
-  assert.equal(runningGoal.details.goal.supervisor.intervalSeconds, 5);
-  assert.deepEqual(runningGoal.details.goal.supervisor.rootActivity?.status, "unknown");
-  const pausedGoal = await tools.get("herdr_goal").execute(
-    "goal-pause",
-    { action: "pause", pauseReason: "Waiting for explicit user direction." },
-    undefined,
-    undefined,
-    headlessRootCtx,
-  );
-  assert.equal(pausedGoal.details.goal.status, "paused");
-  assert.equal(pausedGoal.details.goal.supervisor.pauseReason, "Waiting for explicit user direction.");
-  await assert.rejects(
-    tools.get("herdr_goal").execute(
-      "goal-invalid-pause",
-      { action: "pause" },
+  const runningGoal = await tools
+    .get("herdr_goal")
+    .execute(
+      "goal-start",
+      { action: "start", nudgeIntervalSeconds: 5 },
       undefined,
       undefined,
       headlessRootCtx,
-    ),
+    );
+  assert.equal(runningGoal.details.goal.supervisor.state, "running");
+  assert.equal(runningGoal.details.goal.supervisor.intervalSeconds, 5);
+  assert.deepEqual(
+    runningGoal.details.goal.supervisor.rootActivity?.status,
+    "unknown",
+  );
+  // Exercise the actual extension lifecycle + controller against one shared
+  // manifest. Virtual timestamps advance in 5s steps; no live Herdr or sleeps.
+  let supervisorPrompts = 0;
+  const supervisorApi = {
+    async request(method, params) {
+      if (method === "agent.get")
+        return {
+          type: "agent_info",
+          agent: {
+            name: "smoke-root",
+            agent: "pi",
+            pane_id: rootPaneId,
+            workspace_id: rootWorkspaceId,
+            agent_status: "idle",
+          },
+        };
+      assert.equal(method, "agent.prompt");
+      assert.equal(params.target, rootPaneId);
+      supervisorPrompts += 1;
+      return { type: "agent_prompted" };
+    },
+  };
+  const tickBase = Date.parse(runningGoal.details.goal.supervisor.nextNudgeAt);
+  const tick = (step) =>
+    runSupervisorTick({
+      stateDir: controllerConfigDir,
+      herdr: supervisorApi,
+      timestamp: new Date(tickBase + step * 5000).toISOString(),
+    });
+  const persistedGoal = async () =>
+    JSON.parse(await readFile(manifestPath, "utf8")).parentGoal;
+  await eventHandlers.get("agent_start")({}, headlessRootCtx);
+  const activeRun = (await persistedGoal()).supervisor.rootTurn.runId;
+  for (let step = 0; step < 5; step += 1) {
+    await eventHandlers.get("tool_execution_end")?.({}, headlessRootCtx);
+    await eventHandlers.get("turn_end")?.({}, headlessRootCtx);
+    await eventHandlers.get("agent_end")?.({}, headlessRootCtx);
+    await handleHook({
+      stateDir: controllerConfigDir,
+      herdr: supervisorApi,
+      eventName: "pane.agent_status_changed",
+      eventJson: {
+        event: "pane_agent_status_changed",
+        data: {
+          type: "pane_agent_status_changed",
+          pane_id: rootPaneId,
+          workspace_id: rootWorkspaceId,
+          agent: "pi",
+          agent_status: "idle",
+        },
+      },
+    });
+    assert.equal((await tick(step)).results[0].status, "root-turn-not-idle");
+    assert.equal((await persistedGoal()).supervisor.rootTurn.runId, activeRun);
+  }
+  assert.equal(
+    supervisorPrompts,
+    0,
+    "tool/turn/run-end gaps and Herdr idle hooks never authorize a wake",
+  );
+  await eventHandlers.get("agent_settled")({}, headlessRootCtx);
+  assert.equal(
+    (await persistedGoal()).supervisor.rootTurn.state,
+    "active",
+    "settled while retrying is ignored",
+  );
+  rootIdle = true;
+  await eventHandlers.get("agent_settled")({}, headlessRootCtx);
+  assert.equal((await tick(5)).results[0].status, "delivered");
+  assert.equal((await persistedGoal()).supervisor.nextNudgeAt, null);
+  rootIdle = false;
+  await eventHandlers.get("agent_start")({}, headlessRootCtx);
+  assert.ok((await persistedGoal()).supervisor.lastDelivery.acknowledgedAt);
+  for (let step = 6; step < 10; step += 1) await tick(step);
+  rootIdle = true;
+  await eventHandlers.get("agent_settled")({}, headlessRootCtx);
+  await tick(10);
+  assert.equal(
+    supervisorPrompts,
+    1,
+    "acknowledging and settling a delivered wake do not re-arm it",
+  );
+  await tools
+    .get("herdr_goal")
+    .execute(
+      "goal-noop",
+      { action: "set-state", status: "active" },
+      undefined,
+      undefined,
+      headlessRootCtx,
+    );
+  await tools
+    .get("herdr_goal")
+    .execute(
+      "goal-start-noop",
+      { action: "start" },
+      undefined,
+      undefined,
+      headlessRootCtx,
+    );
+  await eventHandlers.get("agent_settled")({}, headlessRootCtx);
+  await tick(11);
+  assert.equal(
+    supervisorPrompts,
+    1,
+    "idempotent state/start calls cannot reset the wake latch",
+  );
+  await eventHandlers.get("session_shutdown")(
+    { reason: "reload" },
+    headlessRootCtx,
+  );
+  await eventHandlers.get("session_start")(
+    { reason: "reload" },
+    headlessRootCtx,
+  );
+  await eventHandlers.get("agent_settled")({}, headlessRootCtx);
+  assert.equal(
+    (await persistedGoal()).supervisor.rootTurn.state,
+    "unknown",
+    "reload cannot manufacture a settled run",
+  );
+  await tick(12);
+  assert.equal(supervisorPrompts, 1, "reload preserves delivered dedupe");
+  rootIdle = false;
+  await eventHandlers.get("agent_start")({}, headlessRootCtx);
+  await tools
+    .get("herdr_goal")
+    .execute(
+      "goal-wait",
+      { action: "set-state", status: "waiting-for-event" },
+      undefined,
+      undefined,
+      headlessRootCtx,
+    );
+  assert.equal((await tick(13)).results[0].status, "not-active");
+  await tools.get("herdr_goal").execute(
+    "goal-next",
+    {
+      action: "set-state",
+      status: "active",
+      nextAction: "Verify the next dependency.",
+    },
+    undefined,
+    undefined,
+    headlessRootCtx,
+  );
+  assert.equal((await tick(14)).results[0].status, "root-turn-not-idle");
+  rootIdle = true;
+  await eventHandlers.get("agent_settled")({}, headlessRootCtx);
+  assert.equal((await tick(15)).results[0].status, "delivered");
+  assert.equal(
+    supervisorPrompts,
+    2,
+    "a real durable work transition authorizes one later wake",
+  );
+  const rootBeforeChild = await persistedGoal();
+  process.env.HERDR_PANE_ID = "w-child:p1";
+  await eventHandlers.get("agent_start")({}, headlessRootCtx);
+  await eventHandlers.get("agent_settled")({}, headlessRootCtx);
+  assert.deepEqual(
+    await persistedGoal(),
+    rootBeforeChild,
+    "child lifecycle cannot write root authority",
+  );
+  process.env.HERDR_PANE_ID = rootPaneId;
+  const pausedGoal = await tools
+    .get("herdr_goal")
+    .execute(
+      "goal-pause",
+      { action: "pause", pauseReason: "Waiting for explicit user direction." },
+      undefined,
+      undefined,
+      headlessRootCtx,
+    );
+  assert.equal(pausedGoal.details.goal.status, "paused");
+  assert.equal(
+    pausedGoal.details.goal.supervisor.pauseReason,
+    "Waiting for explicit user direction.",
+  );
+  await eventHandlers.get("agent_start")({}, headlessRootCtx);
+  await eventHandlers.get("agent_settled")({}, headlessRootCtx);
+  for (let step = 16; step < 21; step += 1)
+    assert.equal((await tick(step)).results[0].status, "not-active");
+  assert.equal(
+    supervisorPrompts,
+    2,
+    "pause disarms all future nudges despite lifecycle activity",
+  );
+  assert.equal((await persistedGoal()).supervisor.nextNudgeAt, null);
+  // Ambiguous sends require explicit recovery; work edits and idempotent start
+  // must not replay them. Explicit stop/start is the reviewed reset path.
+  const savedManifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  savedManifest.parentGoal.status = "active";
+  savedManifest.parentGoal.supervisor.state = "running";
+  savedManifest.parentGoal.supervisor.lastDelivery = {
+    status: "uncertain",
+    attemptedAt: new Date(tickBase).toISOString(),
+  };
+  await writeFile(manifestPath, JSON.stringify(savedManifest));
+  await tools.get("herdr_goal").execute(
+    "ambiguous-work-edit",
+    {
+      action: "set-state",
+      status: "active",
+      nextAction: "Review uncertainty.",
+    },
+    undefined,
+    undefined,
+    headlessRootCtx,
+  );
+  await tools
+    .get("herdr_goal")
+    .execute(
+      "ambiguous-start-noop",
+      { action: "start" },
+      undefined,
+      undefined,
+      headlessRootCtx,
+    );
+  assert.equal(
+    (await persistedGoal()).supervisor.lastDelivery.status,
+    "uncertain",
+  );
+  await tools
+    .get("herdr_goal")
+    .execute(
+      "reviewed-stop",
+      { action: "stop" },
+      undefined,
+      undefined,
+      headlessRootCtx,
+    );
+  await tools
+    .get("herdr_goal")
+    .execute(
+      "reviewed-start",
+      { action: "start" },
+      undefined,
+      undefined,
+      headlessRootCtx,
+    );
+  assert.equal((await persistedGoal()).supervisor.lastDelivery, undefined);
+  assert.ok((await persistedGoal()).supervisor.nextNudgeAt);
+  await tools
+    .get("herdr_goal")
+    .execute(
+      "re-pause",
+      { action: "pause", pauseReason: "Test complete." },
+      undefined,
+      undefined,
+      headlessRootCtx,
+    );
+
+  const lifecycleLockPath = join(
+    dirname(manifestPath),
+    ".manifest.json.herdr-orchestrator.lock",
+  );
+  await mkdir(lifecycleLockPath);
+  let lifecycleFinished = false;
+  const contendedStart = eventHandlers
+    .get("agent_start")({}, headlessRootCtx)
+    .then(() => {
+      lifecycleFinished = true;
+    });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    lifecycleFinished,
+    false,
+    "lifecycle writer respects a held controller lock",
+  );
+  await rm(lifecycleLockPath, { recursive: true });
+  await contendedStart;
+  assert.equal(
+    (await persistedGoal()).supervisor.rootTurn.state,
+    "active",
+    "lifecycle resumes after bounded lock contention",
+  );
+  const beforeFailure = await readFile(manifestPath, "utf8");
+  await writeFile(manifestPath, "invalid manifest");
+  await assert.rejects(
+    eventHandlers.get("agent_start")({}, headlessRootCtx),
+    /Cannot read Herdr manifest/,
+  );
+  assert.equal(
+    abortedRuns,
+    1,
+    "failed active persistence aborts instead of silently running with stale idle authority",
+  );
+  await writeFile(manifestPath, beforeFailure);
+  assert.doesNotMatch(
+    source,
+    /one-turn work signals|then stop\.|do not poll or auto-continue/,
+    "injected guidance does not force one-action stops",
+  );
+  await assert.rejects(
+    tools
+      .get("herdr_goal")
+      .execute(
+        "goal-invalid-pause",
+        { action: "pause" },
+        undefined,
+        undefined,
+        headlessRootCtx,
+      ),
     /pauseReason is required/,
   );
+  // Corrected topology/startup behavior is exercised in test/dispatch-task.test.mjs.
+  // Legacy plans without explicit model selection must never create resources.
   await assert.rejects(
     tools
       .get("herdr_dispatch")
@@ -688,765 +1075,18 @@ try {
         undefined,
         headlessRootCtx,
       ),
-    /agent_pane_busy/,
+    /explicit launchProfile/,
   );
+  const bound = JSON.parse(await readFile(manifestPath, "utf8")).workflows[0];
+  assert.equal(bound.taskBinding.workspaceId, rootWorkspaceId);
+  assert.equal(bound.taskBinding.rootPaneId, rootPaneId);
   assert.equal(
-    confirmationCalls,
-    0,
-    "preauthorized root dispatch succeeds in headless mode without extra UI",
-  );
-  manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  workflow = manifest.workflows[0];
-  assert.deepEqual(workflow.ownership, {
-    createdBy: "herdr-orchestrator",
-    workspaceId: "w-smoke",
-    workspaceOwnerWorkflowId: workflowId,
-    tabIds: ["w-smoke:t1"],
-    paneIds: ["w-smoke:p1"],
-  });
-  assert.equal(workflow.lanes[0].paneId, "w-smoke:p1");
-  assert.equal(workflow.lanes[0].readiness.initialShellForeground, false);
-  assert.equal(workflow.lanes[0].readiness.source, "herdr agent start --timeout");
-  assert.equal(workflow.retry.state, "retryable");
-  assert.equal(workflow.retry.failedStage, "agent-start");
-  assert.equal(workflow.approvalRequests[0].status, "approved");
-  assert.ok(
-    workflow.evidence.some(
-      (item) =>
-        item.kind === "authorization-policy-granted" &&
-        item.text.includes("Autonomous dispatch"),
-    ),
-    "root dispatch records its autonomous policy decision",
-  );
-  const worktreeOpen = calls.find(
-    (args) => args[0] === "worktree" && args[1] === "open",
-  );
-  assert.equal(
-    worktreeOpen[worktreeOpen.indexOf("--path") + 1],
-    normalizedWorktreeCwd,
-    "dispatch opens the recorded worktree checkout",
-  );
-  assert.equal(
-    calls.filter((args) => args[0] === "workspace" && args[1] === "create")
-      .length,
-    0,
-    "Git flow never falls back to generic workspace creation",
-  );
-  assert.equal(workflow.worktreeBinding.workspaceId, "w-smoke");
-  assert.equal(workflow.worktreeBinding.checkoutPath, normalizedWorktreeCwd);
-  assert.equal(
-    workflow.worktreeBinding.openResult.result.type,
-    "worktree_opened",
-  );
-  assert.ok(
-    workflow.evidence.some((item) => item.kind === "worktree-opened"),
-    "worktree open result is durable evidence",
-  );
-  const startIndex = calls.findIndex(
-    (args) => args[0] === "agent" && args[1] === "start",
-  );
-  assert.ok(startIndex >= 0, "uses Herdr native agent-start readiness");
-  assert.equal(
-    calls.some((args) => args[0] === "pane" && args[1] === "process-info"),
-    false,
-    "does not use a racy process-info readiness probe",
-  );
-  assert.equal(
-    calls[startIndex].at(-1),
-    "60000",
-    "agent readiness timeout is bounded",
-  );
-
-  worktreeClean = false;
-  await assert.rejects(
-    tools
-      .get("herdr_dispatch")
-      .execute(
-        "dirty-policy-retry",
-        { workflowId, execute: true },
-        undefined,
-        undefined,
-        headlessRootCtx,
-      ),
-    /worktreeCwd must be clean/,
-    "a dirty worktree denies autonomous retry rather than opening UI",
-  );
-  manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  workflow = manifest.workflows.find((item) => item.id === workflowId);
-  assert.ok(
-    workflow.evidence.some(
-      (item) =>
-        item.kind === "authorization-policy-denied" &&
-        item.text.includes("worktreeCwd must be clean"),
-    ),
-    "dirty-worktree denial is durable evidence",
-  );
-  worktreeClean = true;
-  failAgentStart = false;
-  agentStartAcknowledgment = "empty";
-  await tools
-    .get("herdr_dispatch")
-    .execute(
-      "root-resume",
-      { workflowId, execute: true },
-      undefined,
-      undefined,
-      headlessRootCtx,
-    );
-  const recovered = JSON.parse(await readFile(manifestPath, "utf8"))
-    .workflows[0];
-  assert.equal(
-    recovered.status,
-    "running",
-    "explicit retry resumes the recorded workflow",
-  );
-  assert.equal(recovered.ownership.workspaceId, "w-smoke");
-  assert.ok(
-    recovered.evidence.some(
-      (item) => item.kind === "agent-start-ack-reconciled",
-    ),
-    "an empty successful agent-start acknowledgement reconciles the live identity",
-  );
-  const controllerConfigPath = join(controllerConfigDir, "config.json");
-  const controllerConfig = JSON.parse(
-    await readFile(controllerConfigPath, "utf8"),
-  );
-  assert.equal(
-    (await lstat(controllerConfigDir)).mode & 0o077,
-    0,
-    "registration securely repairs the linked config directory to 0700",
-  );
-  assert.equal(
-    (await lstat(controllerConfigPath)).mode & 0o077,
-    0,
-    "automatic controller config write is private",
-  );
-  assert.equal(controllerConfig.version, 2, "new registrations persist multi-orchestrator config v2");
-  assert.deepEqual(
-    controllerConfig.orchestrators[0].root,
-    {
-      target: rootPaneId,
-      target_kind: "pane_id",
-      agent_kind: "pi",
-      pane_id: rootPaneId,
-      workspace_id: rootWorkspaceId,
-    },
-    "registration discovers the current pane target and verified root identity",
-  );
-  const registeredMapping = controllerConfig.orchestrators[0].workflows.find(
-    (item) => item.workflow_id === workflowId,
-  );
-  assert.deepEqual(
-    registeredMapping.lanes,
-    recovered.lanes.map((lane) => ({
-      lane_id: lane.id,
-      target: lane.agentName,
-      target_kind: "name",
-      pane_id: lane.paneId,
-      workspace_id: recovered.ownership.workspaceId,
-      relationship_id: lane.relationshipId,
-    })),
-    "registration writes exact live lane identity and persistent relationship mappings",
-  );
-  assert.equal(
-    recovered.eventControllerRegistration.status,
-    "registered",
-    "successful dispatch durably records controller registration",
-  );
-  assert.equal(
-    recovered.ownership.tabIds.length,
-    2,
-    "worktree dispatch retains one tab per read-only lane",
-  );
-  assert.equal(
-    calls.filter((args) => args[0] === "pane" && args[1] === "split").length,
-    0,
-    "worktree dispatch uses no pane splits",
-  );
-  const tabCreate = calls.find(
-    (args) => args[0] === "tab" && args[1] === "create",
-  );
-  assert.equal(
-    tabCreate[tabCreate.indexOf("--cwd") + 1],
-    normalizedWorktreeCwd,
-    "dispatch creates each lane tab at the recorded worktree cwd",
-  );
-  assert.equal(
-    calls.filter((args) => args[0] === "worktree" && args[1] === "open").length,
-    1,
-    "retry does not reopen or replace the recorded worktree workspace",
-  );
-  assert.equal(
-    calls.filter((args) => args[0] === "workspace" && args[1] === "create")
-      .length,
-    0,
-    "Git retries never fall back to a generic replacement workspace",
-  );
-  assert.equal(
-    confirmationCalls,
-    0,
-    "preauthorized retry continues headlessly without extra UI",
-  );
-  assert.ok(
-    recovered.evidence.some(
-      (item) =>
-        item.kind === "authorization-policy-granted" &&
-        item.text.includes("Autonomous retry"),
-    ),
-    "retry records its autonomous policy decision",
-  );
-
-  const reparentPreview = await tools
-    .get("herdr_reparent")
-    .execute(
-      "reparent-preview",
-      { workflowId },
-      undefined,
-      undefined,
-      headlessRootCtx,
-    );
-  assert.equal(reparentPreview.details.dryRun, true);
-  assert.equal(
-    reparentPreview.details.nextRoot.pane_id,
-    rootPaneId,
-    "root handoff preview verifies the current live root identity",
-  );
-
-  const paused = await tools
-    .get("herdr_observe")
-    .execute("observe-paused", { workflowId }, undefined, undefined, ctx);
-  assert.equal(paused.details.state, "goal-paused");
-  assert.deepEqual(
-    paused.details.observations.map((item) => item.pausedGoalIds),
-    [["pi-goal-bb029"], ["pi-goal-bb029"]],
-    "bounded agent output detects every paused Pi goal",
-  );
-  manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  workflow = manifest.workflows.find((item) => item.id === workflowId);
-  assert.equal(workflow.status, "goal-paused");
-  assert.equal(
-    workflow.evidence.filter((item) => item.kind === "goal-paused").length,
-    2,
-    "observation persists one durable paused-goal record per lane",
-  );
-
-  const resumeDryRun = await tools
-    .get("herdr_resume")
-    .execute("resume-dry-run", { workflowId }, undefined, undefined, ctx);
-  assert.equal(resumeDryRun.details.dryRun, true);
-  assert.equal(resumeDryRun.details.commands.length, 2);
-  assert.equal(goalResumePromptCount, 0, "dry-run sends no resume command");
-
-  delete process.env.HERDR_ORCHESTRATOR_ROOT;
-  process.env.HERDR_PANE_ID = "w-child:p1";
-  const childResume = await tools
-    .get("herdr_resume")
-    .execute(
-      "child-resume",
-      { workflowId, execute: true },
-      undefined,
-      undefined,
-      ctx,
-    );
-  assert.equal(childResume.details.parentApprovalRequired, true);
-  assert.equal(confirmationCalls, 0, "child resume opens no confirmation UI after root bootstrap");
-  assert.equal(
-    goalResumePromptCount,
-    0,
-    "child resume does not prompt an agent",
-  );
-  const notificationsBeforeChildCommand = notifications.length;
-  await commands.get("herdr-resume").handler(`${workflowId} --execute`, ctx);
-  assert.equal(
-    notifications.length,
-    notificationsBeforeChildCommand,
-    "child /herdr-resume presents no UI",
-  );
-  assert.equal(
-    goalResumePromptCount,
-    0,
-    "child /herdr-resume does not prompt an agent",
-  );
-  manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  workflow = manifest.workflows.find((item) => item.id === workflowId);
-  assert.equal(
-    workflow.approvalRequests.filter((item) => item.action === "resume").length,
-    1,
-    "child resume persists one parent approval request",
-  );
-
-  process.env.HERDR_ORCHESTRATOR_ROOT = "1";
-  process.env.HERDR_PANE_ID = rootPaneId;
-  const resumedGoal = await tools
-    .get("herdr_resume")
-    .execute(
-      "root-resume-goal",
-      { workflowId, execute: true },
-      undefined,
-      undefined,
-      headlessRootCtx,
-    );
-  assert.equal(resumedGoal.details.resumed, true);
-  assert.equal(
-    goalResumePromptCount,
-    2,
-    "root resumes every paused lane through Herdr",
-  );
-  assert.equal(
-    confirmationCalls,
-    0,
-    "preauthorized paused-goal recovery continues headlessly without extra UI",
-  );
-  manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  workflow = manifest.workflows.find((item) => item.id === workflowId);
-  assert.equal(workflow.status, "goal-resume-requested");
-  assert.ok(
-    workflow.evidence.some(
-      (item) =>
-        item.kind === "authorization-policy-granted" &&
-        item.text.includes("Autonomous resume"),
-    ),
-    "paused-goal recovery records its autonomous policy decision",
-  );
-  assert.equal(
-    workflow.evidence.filter((item) => item.kind === "goal-resume-receipt")
-      .length,
-    2,
-    "every root resume receipt is durable",
-  );
-  assert.ok(
-    workflow.lanes.every((lane) =>
-      lane.goalResumeReceipts.at(-1).receipt.includes("accepted"),
-    ),
-    "manifest retains Herdr resume receipts",
-  );
-  const blockedPush = await eventHandlers.get("tool_call")(
-    { toolName: "bash", input: { command: "git push origin main" } },
-    headlessRootCtx,
-  );
-  const blockedClose = await eventHandlers.get("tool_call")(
-    { toolName: "bash", input: { command: "herdr workspace close w-smoke" } },
-    headlessRootCtx,
-  );
-  assert.equal(blockedPush.block, true);
-  assert.equal(blockedClose.block, true);
-  assert.match(blockedPush.reason, /never authorized by the local policy/);
-
-  delete process.env.HERDR_ORCHESTRATOR_ROOT;
-  process.env.HERDR_PANE_ID = workflow.lanes[0].paneId;
-  const questionInput = {
-    questions: [
-      {
-        header: "Approval",
-        question: "May this child continue?",
-        options: [{ label: "Continue", description: "Approve continuation" }],
-      },
-    ],
-  };
-  const callsBeforeQuestion = calls.length;
-  const childQuestion = await eventHandlers.get("tool_call")(
-    { toolName: "ask_user_question", input: questionInput },
-    ctx,
-  );
-  const repeatedChildQuestion = await eventHandlers.get("tool_call")(
-    { toolName: "ask_user_question", input: questionInput },
-    ctx,
-  );
-  assert.equal(childQuestion.block, true);
-  assert.equal(childQuestion.terminate, true, "child question terminates without transcript output");
-  assert.equal("reason" in childQuestion, false, "child question exposes no routing protocol");
-  assert.equal(repeatedChildQuestion.block, true);
-  assert.equal(repeatedChildQuestion.terminate, true);
-  assert.equal(confirmationCalls, 0, "child question opens no confirmation UI after root bootstrap");
-  assert.equal(
-    calls.length,
-    callsBeforeQuestion + 2,
-    "new child question reads controller mapping then wakes exactly one parent",
-  );
-  assert.deepEqual(calls.at(-1).slice(0, 3), ["agent", "prompt", rootPaneId]);
-  manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  const questionedWorkflow = manifest.workflows.find(
-    (item) => item.id === workflowId,
-  );
-  assert.equal(
-    questionedWorkflow.questionRequests.length,
-    1,
-    "child question is deduplicated",
-  );
-  assert.equal(
-    questionedWorkflow.questionRequests[0].status,
-    "parent-question-required",
-  );
-  assert.match(
-    questionedWorkflow.questionRequests[0].question,
-    /May this child continue/,
-  );
-
-  process.env.HERDR_PANE_ID = rootPaneId;
-  const answeredQuestion = await tools.get("herdr_question_answer").execute(
-    "answer-child-question",
-    { requestId: questionedWorkflow.questionRequests[0].id, answer: "Continue with the native pane footer." },
-    undefined,
-    undefined,
-    ctx,
-  );
-  assert.equal(answeredQuestion.details.question.status, "answered");
-  assert.equal(answeredQuestion.details.question.answer, "Continue with the native pane footer.");
-  assert.match(calls.at(-1).at(-3), /Herdr parent answer to your question/);
-
-  process.env.HERDR_PANE_ID = "w-manual:p1";
-  const manualQuestion = await eventHandlers.get("tool_call")(
-    { toolName: "ask_user_question", input: questionInput },
-    ctx,
-  );
-  assert.equal(
-    manualQuestion,
-    undefined,
-    "an unmanaged manually started pane may ask Zach directly",
-  );
-
-  process.env.HERDR_ORCHESTRATOR_ROOT = "1";
-  process.env.HERDR_PANE_ID = rootPaneId;
-  agentStartAcknowledgment = "non-json";
-  const stalePlan = await tools.get("herdr_plan").execute(
-    "stale-workspace-plan",
-    {
-      objective: "BB-029 stale workspace binding",
-      authorizationPolicy: bb029Policy,
-    },
-    undefined,
-    undefined,
-    ctx,
-  );
-  missingWorkspaceIds.add("w-stale");
-  manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  const staleWorkflow = manifest.workflows.find(
-    (item) => item.id === stalePlan.details.workflow.id,
-  );
-  staleWorkflow.ownership.workspaceId = "w-stale";
-  staleWorkflow.ownership.workspaceOwnerWorkflowId = staleWorkflow.id;
-  staleWorkflow.status = "dispatch-failed";
-  staleWorkflow.outcome = "unknown";
-  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-
-  const genericPlan = await tools.get("herdr_plan").execute(
-    "generic-plan",
-    {
-      objective: "BB-029 generic fallback",
-      agentKind: "codex",
-      lanes: [
-        { objective: "Codex lane" },
-        { objective: "Claude lane", agentKind: "claude" },
-        { objective: "Gemini lane", agentKind: "gemini" },
-      ],
-      authorizationPolicy: bb029Policy,
-    },
-    undefined,
-    undefined,
-    ctx,
-  );
-  const genericWorkflowId = genericPlan.details.workflow.id;
-  const genericDispatch = await tools
-    .get("herdr_dispatch")
-    .execute(
-      "generic-dispatch",
-      { workflowId: genericWorkflowId, execute: true },
-      undefined,
-      undefined,
-      headlessRootCtx,
-    );
-  assert.equal(genericDispatch.details.dispatched, true);
-  manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  const recoveredStaleWorkflow = manifest.workflows.find(
-    (item) => item.id === stalePlan.details.workflow.id,
-  );
-  assert.equal(
-    recoveredStaleWorkflow.ownership.workspaceId,
-    undefined,
-    "a missing reusable workspace binding is cleared before new tab creation",
-  );
-  assert.ok(
-    recoveredStaleWorkflow.evidence.some(
-      (item) => item.kind === "stale-workspace-binding-recovered",
-    ),
-    "stale workspace recovery is durable evidence",
-  );
-  assert.equal(
-    genericDispatch.details.workflow.ownership.workspaceId,
-    "w-generic-1",
-    "unspecified cwd falls back to a generic workspace",
-  );
-  assert.equal(
-    calls.filter((args) => args[0] === "workspace" && args[1] === "create")
-      .length,
-    1,
-    "only the non-Git workflow uses generic workspace creation",
-  );
-  assert.equal(
-    calls.filter((args) => args[0] === "worktree" && args[1] === "open").length,
-    1,
-    "generic fallback does not alter the worktree dispatch count",
-  );
-  assert.deepEqual(
-    new Set(
-      calls
-        .filter((args) => args[0] === "agent" && args[1] === "start")
-        .map((args) => args[args.indexOf("--kind") + 1])
-        .filter(
-          (kind) => kind === "codex" || kind === "claude" || kind === "gemini",
-        ),
-    ),
-    new Set(["codex", "claude", "gemini"]),
-    "lane kinds launch Codex, Claude Code, and another installed Herdr harness",
-  );
-  assert.ok(
     calls.some(
       (args) =>
-        args[0] === "agent" &&
-        args[1] === "prompt" &&
-        typeof args.at(-1) === "string" &&
-        args.at(-1).includes("Agent kind: gemini"),
+        (args[0] === "workspace" && args[1] === "create") ||
+        (args[0] === "worktree" && args[1] === "open"),
     ),
-    "agent-neutral contracts identify the selected kind",
-  );
-  assert.deepEqual(
-    genericDispatch.details.workflow.lanes.map((lane) => lane.agentKind),
-    ["codex", "claude", "gemini"],
-    "workflow and lane manifests preserve compatible harness kinds",
-  );
-  assert.equal(
-    genericDispatch.details.workflow.ownership.tabIds.length,
-    3,
-    "generic multi-harness dispatch retains one tab per lane",
-  );
-  assert.equal(
-    genericDispatch.details.workflow.evidence.filter(
-      (item) => item.kind === "agent-start-ack-reconciled",
-    ).length,
-    3,
-    "non-JSON successful acknowledgements reconcile every live lane identity",
-  );
-  const configWithGeneric = JSON.parse(
-    await readFile(controllerConfigPath, "utf8"),
-  );
-  assert.equal(
-    configWithGeneric.orchestrators[0].workflows.length,
-    2,
-    "a second dispatch atomically preserves the unrelated workflow mapping",
-  );
-
-  const persistedStalePlan = await tools.get("herdr_plan").execute(
-    "persisted-stale-workspace-plan",
-    {
-      objective: "BB-029 persisted stale workspace retry",
-      authorizationPolicy: bb029Policy,
-    },
-    undefined,
-    undefined,
-    ctx,
-  );
-  missingWorkspaceIds.add("w-persisted-stale");
-  manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  const persistedStaleWorkflow = manifest.workflows.find(
-    (item) => item.id === persistedStalePlan.details.workflow.id,
-  );
-  persistedStaleWorkflow.ownership.workspaceId = "w-persisted-stale";
-  persistedStaleWorkflow.ownership.workspaceOwnerWorkflowId = persistedStaleWorkflow.id;
-  persistedStaleWorkflow.status = "dispatch-failed";
-  persistedStaleWorkflow.outcome = "unknown";
-  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-  const persistedStaleDispatch = await tools
-    .get("herdr_dispatch")
-    .execute(
-      "persisted-stale-workspace-dispatch",
-      { workflowId: persistedStalePlan.details.workflow.id, execute: true },
-      undefined,
-      undefined,
-      headlessRootCtx,
-    );
-  assert.equal(persistedStaleDispatch.details.dispatched, true);
-  assert.equal(
-    persistedStaleDispatch.details.workflow.ownership.workspaceId,
-    "w-generic-2",
-    "a persisted missing workspace is rebound before tab creation",
-  );
-  assert.ok(
-    persistedStaleDispatch.details.workflow.evidence.some(
-      (item) => item.kind === "stale-workspace-binding-recovered",
-    ),
-    "persisted stale workspace recovery is durable",
-  );
-  assert.ok(
-    calls.some(
-      (args) => args[0] === "workspace" && args[1] === "get" && args[2] === "w-persisted-stale",
-    ),
-    "retry verifies the persisted workspace before attempting tab creation",
-  );
-
-  controllerPluginAvailable = false;
-  const deferredPlan = await tools.get("herdr_plan").execute(
-    "deferred-controller-plan",
-    {
-      objective: "BB-029 controller unavailable",
-      authorizationPolicy: bb029Policy,
-    },
-    undefined,
-    undefined,
-    ctx,
-  );
-  const deferredDispatch = await tools
-    .get("herdr_dispatch")
-    .execute(
-      "deferred-controller-dispatch",
-      { workflowId: deferredPlan.details.workflow.id, execute: true },
-      undefined,
-      undefined,
-      headlessRootCtx,
-    );
-  assert.equal(
-    deferredDispatch.details.dispatched,
-    true,
-    "an unavailable controller plugin never fails a completed dispatch",
-  );
-  manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  const deferredWorkflow = manifest.workflows.find(
-    (item) => item.id === deferredPlan.details.workflow.id,
-  );
-  assert.equal(
-    deferredWorkflow.eventControllerRegistration.status,
-    "pending",
-    "unavailable controller config leaves a durable registration-pending record",
-  );
-  assert.equal(
-    deferredWorkflow.ownership.workspaceId,
-    genericDispatch.details.workflow.ownership.workspaceId,
-    "later same-cwd controller work reuses the durable workspace",
-  );
-  assert.ok(
-    deferredWorkflow.evidence.some((item) => item.kind === "workspace-reused-for-tabs"),
-    "workspace reuse is durable evidence rather than implicit topology",
-  );
-  assert.match(
-    deferredWorkflow.eventControllerRegistration.reason,
-    /(?:plugin config-dir failed|plugin_not_linked)/,
-    "pending record retains the unavailable plugin/config reason",
-  );
-  assert.equal(
-    JSON.parse(await readFile(controllerConfigPath, "utf8")).orchestrators[0].workflows.length,
-    3,
-    "deferral never changes existing controller workflow mappings",
-  );
-  controllerPluginAvailable = true;
-  const recoveredDeferred = await tools
-    .get("herdr_observe")
-    .execute(
-      "recover-deferred-controller-registration",
-      { workflowId: deferredPlan.details.workflow.id },
-      undefined,
-      undefined,
-      headlessRootCtx,
-    );
-  assert.equal(
-    recoveredDeferred.details.workflow.eventControllerRegistration.status,
-    "registered",
-    "root observation retries a durable pending controller registration",
-  );
-  assert.equal(
-    JSON.parse(await readFile(controllerConfigPath, "utf8")).orchestrators[0].workflows.length,
-    4,
-    "recovered registration adds only its deferred workflow mapping",
-  );
-  delete process.env.HERDR_ORCHESTRATOR_ROOT;
-  process.env.HERDR_PANE_ID = "w-child:p1";
-
-  const closeWorkflowId = genericWorkflowId;
-  manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  const closeWorkflow = manifest.workflows.find(
-    (item) => item.id === closeWorkflowId,
-  );
-  closeWorkflow.status = "completed";
-  closeWorkflow.outcome = "completed";
-  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-  const childClose = await tools
-    .get("herdr_close")
-    .execute(
-      "child-close",
-      { workflowId: closeWorkflowId, evidence: ["smoke"], execute: true },
-      undefined,
-      undefined,
-      ctx,
-    );
-  const repeatedChildClose = await tools
-    .get("herdr_close")
-    .execute(
-      "child-close-repeat",
-      { workflowId: closeWorkflowId, evidence: ["smoke"], execute: true },
-      undefined,
-      undefined,
-      ctx,
-    );
-  assert.equal(childClose.details.parentApprovalRequired, true);
-  assert.equal(repeatedChildClose.details.parentApprovalRequired, true);
-  assert.equal(confirmationCalls, 0, "child close opens no confirmation UI after root bootstrap");
-  manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  const requestedClose = manifest.workflows.find(
-    (item) => item.id === closeWorkflowId,
-  );
-  assert.equal(
-    requestedClose.approvalRequests.length,
-    1,
-    "child close is deduplicated",
-  );
-  assert.equal(requestedClose.approvalRequests[0].action, "close");
-  assert.equal(
-    requestedClose.approvalRequests[0].status,
-    "parent-approval-required",
-  );
-  assert.ok(
-    !calls.some((args) => args[0] === "workspace" && args[1] === "close"),
-    "child close does not close a workspace",
-  );
-  process.env.HERDR_ORCHESTRATOR_ROOT = "1";
-  process.env.HERDR_PANE_ID = rootPaneId;
-  const rootClose = await tools
-    .get("herdr_close")
-    .execute(
-      "root-close",
-      { workflowId: closeWorkflowId, evidence: ["smoke"], execute: true },
-      undefined,
-      undefined,
-      ctx,
-    );
-  assert.equal(rootClose.details.closed, true);
-  assert.equal(
-    confirmationCalls,
-    1,
-    "closure remains non-autonomous and requires explicit root confirmation",
-  );
-  assert.ok(
-    !calls.some((args) => args[0] === "workspace" && args[1] === "close"),
-    "confirmed close retains a workspace still referenced by another workflow",
-  );
-  assert.ok(
-    rootClose.details.workflow.evidence.some(
-      (item) => item.kind === "workspace-retained-for-other-workflows",
-    ),
-    "retained shared workspace has durable cleanup evidence",
-  );
-  const configAfterClose = JSON.parse(
-    await readFile(controllerConfigPath, "utf8"),
-  );
-  assert.deepEqual(
-    configAfterClose.orchestrators[0].workflows.map((item) => item.workflow_id),
-    [workflowId, persistedStalePlan.details.workflow.id, deferredPlan.details.workflow.id],
-    "successful close removes only its registered workflow mapping",
-  );
-  manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  assert.equal(
-    manifest.workflows.find((item) => item.id === closeWorkflowId)
-      .eventControllerRegistration.status,
-    "removed",
-    "successful close durably records controller mapping removal",
+    false,
   );
 } finally {
   if (previousHerdrEnv === undefined) delete process.env.HERDR_ENV;
@@ -1455,7 +1095,10 @@ try {
   else process.env.HERDR_ORCHESTRATOR_ROOT = previousRootEnv;
   if (previousPaneEnv === undefined) delete process.env.HERDR_PANE_ID;
   else process.env.HERDR_PANE_ID = previousPaneEnv;
-  if (previousPluginConfigDir === undefined) delete process.env.HERDR_PLUGIN_CONFIG_DIR;
+  if (previousWorkspaceEnv === undefined) delete process.env.HERDR_WORKSPACE_ID;
+  else process.env.HERDR_WORKSPACE_ID = previousWorkspaceEnv;
+  if (previousPluginConfigDir === undefined)
+    delete process.env.HERDR_PLUGIN_CONFIG_DIR;
   else process.env.HERDR_PLUGIN_CONFIG_DIR = previousPluginConfigDir;
   await rm(testCwd, { recursive: true, force: true });
 }

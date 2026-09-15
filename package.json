@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "npm run test:extension && npm run test:controller",
-    "test:extension": "node packages/herdr-tools/smoke-check.mjs",
+    "test:extension": "node packages/herdr-tools/smoke-check.mjs && node --test packages/herdr-tools/test/*.test.mjs",
     "test:controller": "npm --prefix packages/controller test"
   },
   "dependencies": {
