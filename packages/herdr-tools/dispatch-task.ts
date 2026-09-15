@@ -257,6 +257,31 @@ export async function dispatchTask(
         { mode: 0o600 },
       );
       stage = "agent-start";
+      if (lane.agentStartedAt) {
+        // A recorded start whose pane no longer holds any agent (crash after
+        // detection) may be restarted once per dispatch attempt. An attested
+        // agent that vanished, or any occupied pane, fails closed instead.
+        let present = true;
+        try {
+          await port.run(["agent", "get", lane.paneId!], signal);
+        } catch (error) {
+          present = !/agent_not_found/.test(String(error));
+        }
+        if (!present) {
+          const prior = await readFile(`${lane.startupIntentPath}.ready`, "utf8")
+            .then((text) => JSON.parse(text))
+            .catch(() => null);
+          if (prior && prior.nonce === lane.startupNonce)
+            throw new Error(
+              "Lane attested but its agent vanished; inspect the pane before retrying dispatch.",
+            );
+          await update((w) => {
+            delete w.lanes[i].agentStartedAt;
+            delete w.lanes[i].agentStartAttemptedAt;
+          });
+          lane = workflow.lanes[i];
+        }
+      }
       if (!lane.agentStartedAt) {
         if (lane.agentStartAttemptedAt) {
           // A previous start was rejected mid-startup, crashed, or lost its

@@ -151,6 +151,11 @@ async function fixture(options = {}) {
           if (args.includes(flag))
             assert.equal(args[args.indexOf(flag) + 1], launchProfile.thinking);
         const p = panes.get(args[args.indexOf("--pane") + 1]);
+        if (options.startSilentOnce) {
+          options.startSilentOnce = false;
+          p.absent = true;
+          return {};
+        }
         if (options.startCrashesOnce) {
           options.startCrashesOnce = false;
           p.absent = true;
@@ -536,6 +541,42 @@ test("startup-blocked lane is adopted on retry once its attestation appears", as
     assert.equal(f.calls.filter((c) => c[1] === "start").length, 2);
     assert.equal(f.calls.filter((c) => c[1] === "prompt").length, 2);
     assert.equal(f.state.ownership.paneIds.length, 2);
+  } finally {
+    await f.close();
+  }
+});
+
+test("started-then-vanished lane restarts fresh once when unattested", async () => {
+  const f = await fixture({ startSilentOnce: true });
+  try {
+    await assert.rejects(f.run(), /agent_not_found/);
+    assert.equal((await f.run()).dispatched, true);
+    assert.equal(f.calls.filter((c) => c[1] === "start").length, 3);
+    assert.equal(f.calls.filter((c) => c[1] === "prompt").length, 2);
+  } finally {
+    await f.close();
+  }
+});
+
+test("attested lane that vanished fails closed", async () => {
+  const f = await fixture({ startSilentOnce: true });
+  try {
+    await assert.rejects(f.run(), /agent_not_found/);
+    const lane = f.state.lanes[0];
+    const intent = JSON.parse(await readFile(lane.startupIntentPath, "utf8"));
+    await writeFile(
+      `${lane.startupIntentPath}.ready`,
+      JSON.stringify({
+        nonce: intent.nonce,
+        paneId: lane.paneId,
+        workspaceId: "task-space",
+        source: f.ports.source,
+        profile: { ...profile },
+        sessionPath: `/sessions/${lane.paneId}.jsonl`,
+        tools: ["herdr_complete", "herdr_plan", "herdr_dispatch"],
+      }),
+    );
+    await assert.rejects(f.run(), /attested but its agent vanished/);
   } finally {
     await f.close();
   }
