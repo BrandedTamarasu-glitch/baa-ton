@@ -95,3 +95,8 @@ After verified runtime acknowledgement, verify the installed Luna profile/auth w
 Remaining delegated-core work includes neutral domain types/transactional store, durable inbox/outbox and incarnation recovery, scoped goal/decision protocol, thin Pi/MCP/CLI adapters and actual harness qualification. See required audit/architecture documents rather than treating the prerequisite module as the completed product.
 
 Todo: #3 source prerequisites completed; #5 activation/live verification in progress; #4 delegated core pending. No Luna launched yet.
+
+
+### Codex lane close-out (2026-09-15, herdr-44fa8053)
+
+Items 3, 6-remainder, and the permission broker landed via the Codex lane (41m work). Parent verification: focused regressions 17/17 serial (parallel-run flakiness in its test isolation noted as follow-up); work committed by parent as d3816c8 because the codex workspace-write sandbox cannot write the worktree linked git metadata. The durable completion receipt could not be recorded by the lane: its bridge instance went stale mid-flight (jiti loading across concurrent lane edits), and killing it revealed codex does not respawn dead MCP servers (dead-stub tool errors surface as type errors). Work is verified and committed; receipt reconciliation is recorded here as the operator evidence. Follow-ups: bridge restart/resilience for codex lanes, operator-closure tool for receipt-blocked workflows, sandbox exceptions for worktree git metadata.
