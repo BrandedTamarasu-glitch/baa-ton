@@ -878,6 +878,7 @@ export class JsonLineHerdrClient {
     return new Promise((resolveRequest, rejectRequest) => {
       const socket = net.createConnection({ path: this.socketPath });
       let settled = false;
+      let sent = false;
       let buffer = "";
       const settle = (callback, value) => {
         if (settled) return;
@@ -885,24 +886,23 @@ export class JsonLineHerdrClient {
         socket.destroy();
         callback(value);
       };
+      // A failure raised once the request bytes were already written cannot
+      // prove Herdr never received or acted on it: mark it ambiguous so a
+      // caller never treats it as safe-to-retry proof of nondelivery.
+      const fail = (code, message) => {
+        const error = new HerdrApiError(code, message);
+        error.sent = sent;
+        settle(rejectRequest, error);
+      };
       socket.setEncoding("utf8");
       socket.setTimeout(this.timeoutMs);
       socket.once("timeout", () =>
-        settle(
-          rejectRequest,
-          new HerdrApiError(
-            "socket_timeout",
-            `Timed out calling Herdr ${method}.`,
-          ),
-        ),
+        fail("socket_timeout", `Timed out calling Herdr ${method}.`),
       );
       socket.once("error", (error) =>
-        settle(
-          rejectRequest,
-          new HerdrApiError(
-            error.code ?? "socket_error",
-            `Herdr socket ${method} failed: ${error.message}`,
-          ),
+        fail(
+          error.code ?? "socket_error",
+          `Herdr socket ${method} failed: ${error.message}`,
         ),
       );
       socket.on("data", (chunk) => {
@@ -955,9 +955,10 @@ export class JsonLineHerdrClient {
         }
         settle(resolveRequest, response.result);
       });
-      socket.once("connect", () =>
-        socket.write(`${JSON.stringify({ id, method, params })}\n`),
-      );
+      socket.once("connect", () => {
+        socket.write(`${JSON.stringify({ id, method, params })}\n`);
+        sent = true;
+      });
     });
   }
 }
@@ -1173,6 +1174,14 @@ async function deliverWake(record, root, herdr) {
     });
     return { status: "delivered", reason: "agent_prompt_accepted" };
   } catch (error) {
+    // A failure raised after the prompt bytes were already written (timeout
+    // or transport error awaiting the reply) is not proof of nondelivery and
+    // must never be replayed automatically, regardless of its error code.
+    if (error?.sent)
+      return {
+        status: "uncertain",
+        reason: `root_prompt_ambiguous:${error instanceof Error ? error.message : String(error)}`,
+      };
     if (unavailable(error))
       return { status: "pending", reason: `root_unavailable:${error.code}` };
     return {
@@ -1220,6 +1229,13 @@ async function deliverSupervisorNudge(goal, root, herdr) {
     });
     return { status: "delivered", reason: "agent_prompt_accepted" };
   } catch (error) {
+    // Same ambiguous-send rule as deliverWake: a post-write failure can never
+    // be treated as a definite non-delivery safe to retry.
+    if (error?.sent)
+      return {
+        status: "uncertain",
+        reason: `root_prompt_ambiguous:${error instanceof Error ? error.message : String(error)}`,
+      };
     if (unavailable(error))
       return { status: "pending", reason: `root_unavailable:${error.code}` };
     return {

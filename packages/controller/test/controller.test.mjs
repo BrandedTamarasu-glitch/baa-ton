@@ -992,6 +992,48 @@ async function patchSupervisor(fixture, patch) {
   await writeFile(fixture.manifestPath, JSON.stringify(manifest));
 }
 
+// Mirrors the audit's "ambiguous socket delivery" fault probe: the server
+// receives the prompt over a real socket but withholds its reply, so the
+// client's own timeout fires. Corrected behavior must treat that as durable
+// uncertainty, not a retryable non-delivery.
+async function startAmbiguousPromptMock() {
+  const directory = await mkdtemp(
+    join(tmpdir(), "herdr-controller-ambiguous-"),
+  );
+  const socketPath = join(directory, "api.sock");
+  let prompts = 0;
+  const server = net.createServer((socket) => {
+    let input = "";
+    socket.setEncoding("utf8");
+    socket.on("error", () => {});
+    socket.on("data", (chunk) => {
+      input += chunk;
+      const newline = input.indexOf("\n");
+      if (newline === -1) return;
+      const request = JSON.parse(input.slice(0, newline));
+      if (request.method === "agent.prompt") {
+        prompts += 1;
+        return;
+      }
+      socket.end(
+        `${JSON.stringify({ id: request.id, ...rootAgentInfo() })}\n`,
+      );
+    });
+  });
+  server.listen(socketPath);
+  await once(server, "listening");
+  return {
+    socketPath,
+    get prompts() {
+      return prompts;
+    },
+    async close() {
+      await new Promise((resolveClose) => server.close(resolveClose));
+      await rm(directory, { recursive: true, force: true });
+    },
+  };
+}
+
 function recoveryApi() {
   const api = {
     prompts: 0,
@@ -1187,6 +1229,68 @@ test("definite unavailable-root recovery retries once but ambiguous delivery sta
       "an ambiguous accepted send must not be replayed",
     );
   } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a real socket timeout after the supervisor nudge is sent yields one logical prompt, never a retry", async () => {
+  const mock = await startAmbiguousPromptMock();
+  const fixture = await createFixture({ parentGoal: dueParentGoal() });
+  try {
+    const herdr = new JsonLineHerdrClient(mock.socketPath, 50);
+    const first = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr,
+      timestamp: "2026-09-14T00:00:00.000Z",
+    });
+    assert.equal(first.results[0].status, "uncertain");
+    const supervisor = (await fixture.manifest()).parentGoal.supervisor;
+    assert.equal(supervisor.lastDelivery.status, "uncertain");
+    assert.equal(supervisor.nextNudgeAt, null);
+    const second = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr,
+      timestamp: "2026-09-14T00:05:00.000Z",
+    });
+    assert.equal(second.results[0].status, "wake-suppressed");
+    assert.equal(
+      mock.prompts,
+      1,
+      "an ambiguous accepted send must not be replayed",
+    );
+  } finally {
+    await mock.close();
+    await fixture.cleanup();
+  }
+});
+
+test("a real socket timeout after a lane wake prompt is sent yields one logical delivery, never a duplicate", async () => {
+  const mock = await startAmbiguousPromptMock();
+  const fixture = await createFixture({});
+  try {
+    const herdr = new JsonLineHerdrClient(mock.socketPath, 50);
+    const first = await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("done"),
+      stateDir: fixture.stateDir,
+      herdr,
+    });
+    assert.equal(first.record.wake.status, "uncertain");
+    const second = await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("done"),
+      stateDir: fixture.stateDir,
+      herdr,
+    });
+    assert.equal(second.deduplicated, true);
+    assert.equal(second.record.wake.status, "uncertain");
+    assert.equal(
+      mock.prompts,
+      1,
+      "a lost reply after a real send must not duplicate the wake prompt",
+    );
+  } finally {
+    await mock.close();
     await fixture.cleanup();
   }
 });
