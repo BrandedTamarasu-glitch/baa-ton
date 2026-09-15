@@ -1,42 +1,31 @@
 # Baa-ton
 
-Canonical source repository for local Herdr orchestration tooling.
+<img src="assets/mascot.svg" alt="A little sheep with a terminal face" width="96" height="96">
 
-## Layout
+Baa-ton is a Herdr-owned orchestration core with thin adapters for each coding-agent harness. Herdr owns the terminals and agent processes; Baa-ton coordinates their work.
 
-- `packages/herdr-tools/` — durable workflow manifest operations, local MCP bridge, and deterministic smoke check.
-- `packages/controller/` — the Herdr event-controller plugin and its Node test suite.
-- `docs/` — architecture and ownership decisions.
+It plans tasks into lanes, checks each agent's identity and launch profile before assigning work, routes questions and decisions, and records completion receipts. A local event controller wakes the parent when a lane needs attention. Shared state and recovery rules live in the core; adapters handle harness-specific launch arguments and startup evidence.
 
-The runtime is local-only. It does not push, deploy, or create remote resources.
+## Harness support
 
-## Validate
+Pi, Claude Code, Codex, and OpenCode are live-qualified through one versioned launch contract. Every other harness fails closed by design, before creating terminals or assigning work.
+
+Qualification covers the tested subscription profiles, not every model or configuration. Recovery and lifecycle integration still have rough edges. The [adapter notes](packages/herdr-tools/HARNESS-ADAPTERS.md) and [progress log](docs/native-prerequisite-progress.md) record evidence and limitations; older entries describe earlier states.
+
+## Run the tests
+
+Requires Node.js 20+. The current adapter tests also expect the harness CLIs on `PATH`.
 
 ```sh
 npm install
 npm test
 ```
 
-Requires Node 20+.
+The suite runs the workflow smoke check, workflow tests, and controller tests. For one package, use `npm run test:extension` or `npm run test:controller`. Local tests do not replace live harness qualification.
 
-## Use from any Herdr-compatible harness
+## Go deeper
 
-Configure the harness's local stdio MCP client to run:
-
-```sh
-node /Users/zchristmas/baa-ton/packages/herdr-tools/mcp-server.mjs
-```
-
-Inside a Herdr session, this exposes the `herdr_*` workflow tools. The MCP bridge uses repository dependencies only; it has no platform-specific runtime dependency.
-
-## Install the event controller
-
-Review these commands before running them. They make only local Herdr registration changes. Linking remains disabled; enabling is a separate explicit parent-reviewed action.
-
-```sh
-herdr plugin unlink herdr-orchestrator-controller
-herdr plugin link /Users/zchristmas/baa-ton/packages/controller --disabled
-herdr plugin list --plugin herdr-orchestrator-controller --json
-```
-
-See the package READMEs for configuration and safety boundaries.
+- [Add a harness](docs/ADDING-A-HARNESS.md): implement the adapter and prove it works.
+- [Workflow tools and MCP setup](packages/herdr-tools/README.md).
+- [Event controller setup and behavior](packages/controller/README.md).
+- [Launch contract and evidence](packages/herdr-tools/HARNESS-ADAPTERS.md).

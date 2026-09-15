@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" role="img" aria-labelledby="title desc">
+  <title id="title">Baa-ton the terminal sheep</title>
+  <desc id="desc">A round cream sheep with tiny feet, mint ears, and a dark terminal face. A prompt and cursor form its friendly expression.</desc>
+  <path fill="#263D3B" d="M7 18h2v3a1 1 0 0 1-2 0Zm8 0h2v3a1 1 0 0 1-2 0Z"/>
+  <path fill="#FFF0D0" d="M6 7a3 3 0 0 1 4-4 3 3 0 0 1 5 0 3 3 0 0 1 4 4 3 3 0 0 1 2 5 3 3 0 0 1-2 5 3 3 0 0 1-4 3 3 3 0 0 1-5 0 3 3 0 0 1-5-3 3 3 0 0 1-2-5 3 3 0 0 1 3-5Z"/>
+  <path fill="#A3DBC5" d="M6 10Q1 7 3 13l4 1Zm12 0q5-3 3 3l-4 1Z"/>
+  <rect x="6" y="8" width="12" height="10" rx="4" fill="#263D3B"/>
+  <path fill="#A3DBC5" d="m9 10.5 2.5 2a.65.65 0 0 1 0 1L9 15.5l-1-1 2-1.5-2-1.5Zm4 3.5h2v1.5h-2Z"/>
+</svg>
