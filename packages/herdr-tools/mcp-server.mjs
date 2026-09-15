@@ -9,6 +9,7 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { Value } from "typebox/value";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -177,10 +178,31 @@ process.stdin.on("data", async (chunk) => {
         error(id, -32602, `Unknown tool: ${params.name}`);
         continue;
       }
+      const args = params.arguments ?? {};
+      // Every harness must see the same validated surface: reject arguments
+      // outside the tool's declared schema (an out-of-enum action, a missing
+      // required field) before it ever reaches the shared execute path,
+      // instead of letting the implementation's own ad hoc checks decide.
+      if (!Value.Check(definition.parameters, args)) {
+        const issues = [...Value.Errors(definition.parameters, args)]
+          .slice(0, 5)
+          .map((issue) => `${issue.path || "(root)"} ${issue.message}`)
+          .join("; ");
+        result(id, {
+          content: [
+            {
+              type: "text",
+              text: `Invalid arguments for ${params.name}: ${issues || "schema validation failed"}`,
+            },
+          ],
+          isError: true,
+        });
+        continue;
+      }
       try {
         const output = await definition.execute(
           "mcp",
-          params.arguments ?? {},
+          args,
           undefined,
           undefined,
           ctx,
