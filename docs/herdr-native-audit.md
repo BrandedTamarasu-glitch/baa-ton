@@ -90,6 +90,8 @@ The bridge ignores `on()` handlers, discards prompt guidelines/bootstrap context
 
 **Required:** extract a harness-independent orchestration API; make Pi, MCP, and CLI thin adapters. Use a proper validated/cancellable MCP transport. Provide a first-class request-input/request-approval operation usable by every participant rather than intercepting one harness's tool. Approval belongs to the authorized user's decision channel, not to the presence of Pi TUI APIs.
 
+**Partial remediation (durable-core batch, item 6, commit `c953c81`):** only the schema-validation slice. `mcp-server.mjs`'s `tools/call` handler now runs `Value.Check(definition.parameters, args)` against each tool's own advertised TypeBox schema before calling `execute()`, returning an `isError` tool result for arguments outside it (an out-of-enum `herdr_goal` action, a missing required `herdr_dispatch` field); a schema-valid call still reaches the real implementation unchanged. Converts the "MCP argument validation" probe into a regression in `packages/herdr-tools/test/mcp-server.test.mjs` (which also newly exercises the bridge as a real spawned process at all, closing part of the P2 finding's "MCP paths are not exercised end to end" gap). **Not remediated:** `on()`/lifecycle-hook parity ("MCP lifecycle parity" probe still reproduces: a goal write through the bridge leaves `rootTurn` active with no settled-transition path), execution timeout/cancellation, and the harness-independent orchestration-API extraction itself.
+
 ### P1 — Launch success does not prove the requested worker exists and is connected
 
 **Sources:** `index.ts::plan`, `contract`, `dispatch`, `registerEventController`; `ROADMAP.md`.
