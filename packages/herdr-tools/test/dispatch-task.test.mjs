@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -541,11 +541,49 @@ test("startup-blocked lane is adopted on retry once its attestation appears", as
   }
 });
 
+test("dispatch lock reclaims a dead owner and fails closed on live or unknown owners", async () => {
+  const deadOwner = await fixture();
+  try {
+    const lockDir = join(deadOwner.ports.directory, "wf.dispatch-lock");
+    await mkdir(lockDir, { recursive: true });
+    await writeFile(
+      join(lockDir, "owner.json"),
+      JSON.stringify({ pid: 999_999_999 }),
+    );
+    assert.equal((await deadOwner.run()).dispatched, true);
+  } finally {
+    await deadOwner.close();
+  }
+  const liveOwner = await fixture();
+  try {
+    const lockDir = join(liveOwner.ports.directory, "wf.dispatch-lock");
+    await mkdir(lockDir, { recursive: true });
+    await writeFile(
+      join(lockDir, "owner.json"),
+      JSON.stringify({ pid: process.pid }),
+    );
+    await assert.rejects(liveOwner.run(), /already active/);
+  } finally {
+    await liveOwner.close();
+  }
+  const unknownOwner = await fixture();
+  try {
+    const lockDir = join(unknownOwner.ports.directory, "wf.dispatch-lock");
+    await mkdir(lockDir, { recursive: true });
+    await assert.rejects(unknownOwner.run(), /verifiable owner/);
+  } finally {
+    await unknownOwner.close();
+  }
+});
+
 test("crashed lane start retries fresh when the pane holds no agent", async () => {
   const f = await fixture({ startCrashesOnce: true });
   try {
     await assert.rejects(f.run(), /spawn crashed/);
-    assert.equal(f.calls.some((c) => c[1] === "prompt"), false);
+    assert.equal(
+      f.calls.some((c) => c[1] === "prompt"),
+      false,
+    );
     // The retry finds no attestation and no live occupant: fresh start.
     assert.equal((await f.run()).dispatched, true);
     assert.equal(f.calls.filter((c) => c[1] === "start").length, 3);

@@ -94,17 +94,51 @@ export async function dispatchTask(
   if (!["planned", "dispatch-failed", "starting"].includes(workflow.status))
     throw new Error(`Workflow cannot be dispatched from ${workflow.status}.`);
   if (!(await port.authorize(workflow))) return { cancelled: true, workflow };
-  // Per-workflow effect serialization, not a global manifest transaction. A crash
-  // retains this lock for diagnosed recovery rather than spawning a duplicate.
+  // Per-workflow effect serialization, not a global manifest transaction. The
+  // lock records its owning pid: a killed dispatch leaves it behind, and a
+  // later dispatch may reclaim it only when the recorded owner is verifiably
+  // dead — a live or unverifiable owner still fails closed.
   await mkdir(port.directory, { recursive: true, mode: 0o700 });
   const lock = join(port.directory, `${workflow.id}.dispatch-lock`);
-  await mkdir(lock, { mode: 0o700 }).catch((error) => {
-    if (error.code === "EEXIST")
-      throw new Error(
-        "Dispatch is already active or requires crash reconciliation; no duplicate start allowed.",
-      );
-    throw error;
-  });
+  const ownerPath = join(lock, "owner.json");
+  const acquire = async (): Promise<void> => {
+    try {
+      await mkdir(lock, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      let owner: { pid?: number } | null = null;
+      try {
+        owner = JSON.parse(await readFile(ownerPath, "utf8")) as {
+          pid?: number;
+        };
+      } catch {
+        owner = null;
+      }
+      if (typeof owner?.pid !== "number")
+        throw new Error(
+          "Dispatch lock exists without a verifiable owner (possibly a live mid-acquire race or a pre-owner lock); inspect it before retrying dispatch.",
+        );
+      let alive = false;
+      try {
+        process.kill(owner.pid, 0);
+        alive = true;
+      } catch (signalError) {
+        alive = (signalError as NodeJS.ErrnoException).code === "EPERM";
+      }
+      if (alive)
+        throw new Error(
+          "Dispatch is already active; no duplicate start allowed.",
+        );
+      await rm(lock, { recursive: true, force: true });
+      return acquire();
+    }
+    await writeFile(
+      ownerPath,
+      JSON.stringify({ pid: process.pid, at: new Date().toISOString() }),
+      { mode: 0o600 },
+    );
+  };
+  await acquire();
   const update = async (edit: (workflow: Workflow) => void) => {
     workflow = await port.update(workflow.id, edit);
     return workflow;
