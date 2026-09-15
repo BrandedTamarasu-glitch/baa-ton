@@ -3366,6 +3366,115 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     return { closed: true, workflow };
   }
 
+  type DoctorCheck = {
+    id: string;
+    status: "ok" | "warn" | "fail";
+    detail: string;
+  };
+
+  /** Idempotent, read-only preflight. Never mutates the manifest, controller
+   * config, or any live Herdr/plugin state; every check below is a read. */
+  async function doctor(
+    cwd: string,
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+  ): Promise<{ ok: boolean; checks: DoctorCheck[] }> {
+    const checks: DoctorCheck[] = [];
+    const check = (
+      id: string,
+      run: () => Promise<Omit<DoctorCheck, "id">>,
+    ) => run().then(
+      (partial) => checks.push({ id, ...partial }),
+      (error: unknown) =>
+        checks.push({
+          id,
+          status: "fail",
+          detail: error instanceof Error ? error.message : String(error),
+        }),
+    );
+
+    await check("extension-source", async () => ({
+      status: "ok",
+      detail: `Loaded from ${await realpath(fileURLToPath(import.meta.url))}.`,
+    }));
+
+    let configPath: string | undefined;
+    await check("native-herdr-connectivity", async () => {
+      configPath = await controllerConfigPath(signal);
+      return {
+        status: "ok",
+        detail: `herdr plugin config-dir resolved: ${dirname(configPath)}.`,
+      };
+    });
+
+    let controllerConfig: ControllerConfig | undefined;
+    await check("plugin-enablement-and-routing", async () => {
+      if (!configPath)
+        return {
+          status: "fail",
+          detail: "Cannot check without native Herdr connectivity.",
+        };
+      controllerConfig = await loadControllerConfig(configPath);
+      if (!controllerConfig)
+        return {
+          status: "warn",
+          detail:
+            "No controller config registered yet; nothing has been dispatched through this controller.",
+        };
+      const workflowCount = controllerConfig.orchestrators.reduce(
+        (sum, orchestrator) => sum + orchestrator.workflows.length,
+        0,
+      );
+      return {
+        status: "ok",
+        detail: `${controllerConfig.orchestrators.length} registered orchestrator(s), ${workflowCount} routed workflow(s). This pane is${isRootOrchestrator() ? "" : " not"} a registered root.`,
+      };
+    });
+
+    await check("manifest-store", async () => {
+      const manifest = await loadManifest(cwd);
+      if (manifest.version !== 2)
+        return {
+          status: "warn",
+          detail: `Unrecognized manifest version ${manifest.version} at ${manifestPath(cwd)}; expected 2.`,
+        };
+      return {
+        status: "ok",
+        detail: `Version 2 manifest at ${manifestPath(cwd)}: ${manifest.workflows.length} workflow(s), parent goal ${manifest.parentGoal ? "present" : "absent"}.`,
+      };
+    });
+
+    await check("adapter-registry-capability-matrix", async () => {
+      const adapters = new HarnessAdapterRegistry();
+      adapters.register(
+        piLaunchAdapter(
+          ctx,
+          join(homedir(), ".pi/agent/extensions/herdr-agent-state.ts"),
+        ),
+      );
+      adapters.register(
+        claudeLaunchAdapter({
+          bridge: fileURLToPath(new URL("./mcp-server.mjs", import.meta.url)),
+          attestHelper: fileURLToPath(
+            new URL("./claude-startup-attest.mjs", import.meta.url),
+          ),
+          scratchDirectory: dirname(manifestPath(cwd)),
+        }),
+      );
+      const matrix = adapters.capabilities();
+      const unqualified = matrix.filter(
+        (entry) =>
+          !entry.startupAttestation || !entry.supportsSessionPersistence,
+      );
+      return {
+        status: unqualified.length > 0 ? "warn" : "ok",
+        detail: jsonText(matrix),
+      };
+    });
+
+    return { ok: checks.every((entry) => entry.status !== "fail"), checks };
+  }
+
   // A run spans every tool/LLM turn, retries, compaction and queued follow-ups.
   // No timer, tool completion, agent_end, or Herdr idle snapshot releases it.
   let rootRunId = randomUUID();
@@ -3989,6 +4098,29 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           },
         ],
         details: result,
+      };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_doctor",
+    label: "Herdr Doctor",
+    description:
+      "Idempotent, read-only preflight: extension source, native Herdr connectivity, plugin/routing registration, manifest store version, and the adapter capability matrix. Never mutates anything.",
+    promptSnippet:
+      "Run a read-only Herdr installation/health preflight before relying on dispatch, goals, or messaging.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _update, ctx) {
+      const report = await doctor(ctx.cwd, ctx, signal);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${report.ok ? "healthy" : "attention required"}: ${report.checks
+              .map((entry) => `${entry.id}=${entry.status}`)
+              .join(", ")}`,
+          },
+        ],
+        details: report,
       };
     },
   });
