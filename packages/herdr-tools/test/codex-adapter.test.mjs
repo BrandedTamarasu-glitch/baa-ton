@@ -40,6 +40,7 @@ test("codex launchArguments wires model, effort, notify, mcp env, and handshake"
     flat,
     /mcp_servers\.herdr-orchestrator\.env\.BAA_STARTUP_INTENT="\/intents\/lane\.json"/,
   );
+  assert.match(flat, /mcp_servers\.herdr-orchestrator\.env\.HERDR_ENV="1"/);
   assert.equal(args[args.length - 1], "Reply with exactly: READY");
   assert.throws(
     () => adapter.launchArguments(profile, "/src/index.ts"),

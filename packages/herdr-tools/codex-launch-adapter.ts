@@ -134,6 +134,10 @@ export function codexLaunchAdapter(
         `mcp_servers.herdr-orchestrator.args=["${paths.bridge}"]`,
         "-c",
         `mcp_servers.herdr-orchestrator.env.BAA_STARTUP_INTENT="${intentPath}"`,
+        // Codex MCP children do NOT inherit pane env — every key the bridge
+        // needs must be passed explicitly, including the session marker.
+        "-c",
+        'mcp_servers.herdr-orchestrator.env.HERDR_ENV="1"',
         // Handshake positional prompt: the startup-proof turn. Assignment is
         // delivered only after its notify attestation verifies.
         "Reply with exactly: READY",
