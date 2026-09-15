@@ -248,7 +248,10 @@ test("persistent busy still fails closed and remains retryable in the same tabs"
   const f = await fixture({ busyAlways: true });
   try {
     await assert.rejects(f.run(), /agent_pane_busy/);
-    assert.equal(f.calls.some((c) => c[1] === "prompt"), false);
+    assert.equal(
+      f.calls.some((c) => c[1] === "prompt"),
+      false,
+    );
     const ids = [...f.state.ownership.paneIds];
     f.options.busyAlways = false;
     assert.equal((await f.run()).dispatched, true);
