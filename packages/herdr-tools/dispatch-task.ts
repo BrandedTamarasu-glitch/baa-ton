@@ -293,20 +293,24 @@ export async function dispatchTask(
       const raw = await port.run(["agent", "get", lane.paneId!], signal);
       const agent = (raw.result ?? raw).agent;
       // Some harnesses attest asynchronously (e.g. a handshake turn completing,
-      // or an MCP server merging operations). Bounded readiness gate, like the
-      // shell gate — never an unbounded loop, never an instant give-up.
+      // or an MCP server merging operations — codex may spawn it lazily). Wait
+      // for a COMPLETE attestation: identity fields plus merged operations.
+      // Bounded readiness gate, never an unbounded loop, never an early break
+      // on a partial attestation.
       let hello: any = null;
       const attestationDeadline = Date.now() + 90_000;
+      const complete = (value: unknown) =>
+        adapters[i].attestationComplete?.(value) ?? true;
       while (Date.now() < attestationDeadline) {
         hello = await readFile(`${lane.startupIntentPath}.ready`, "utf8")
           .then((text) => JSON.parse(text))
           .catch(() => null);
-        if (hello) break;
+        if (hello && complete(hello)) break;
         await delay(500, { signal });
       }
-      if (!hello)
+      if (!hello || !complete(hello))
         throw new Error(
-          "Startup handshake not available; no work assigned. Observe before retrying dispatch.",
+          "Startup attestation incomplete or unavailable; no work assigned. Verify the harness handshake and MCP bridge serve the protocol tools.",
         );
       const proof = adapters[i].verifyStartup(agent, hello);
       if (

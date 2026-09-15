@@ -86,6 +86,12 @@ export function codexLaunchAdapter(paths: CodexAdapterPaths): HarnessLaunchAdapt
     // Honest capability reporting: session identity is integrated, but Codex
     // lifecycle state in Herdr is screen-derived.
     lifecycle: "screen",
+    attestationComplete: (attestation: unknown): boolean => {
+      const hello = attestation as { sessionId?: unknown; operations?: unknown };
+      return (
+        typeof hello?.sessionId === "string" && Array.isArray(hello?.operations)
+      );
+    },
     preflight(profile: LaunchProfile): void {
       if (profile.provider !== CODEX_PROVIDER)
         throw new Error(

@@ -112,6 +112,12 @@ export function opencodeLaunchAdapter(
       supportsNativeSessionIdentity: true,
     },
     lifecycle: "screen",
+    attestationComplete: (attestation: unknown): boolean => {
+      const hello = attestation as { sessionId?: unknown; operations?: unknown };
+      return (
+        typeof hello?.sessionId === "string" && Array.isArray(hello?.operations)
+      );
+    },
     preflight(profile: LaunchProfile): void {
       if (profile.provider !== OPENCODE_PROVIDER)
         throw new Error(

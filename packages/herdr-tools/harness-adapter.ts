@@ -46,6 +46,10 @@ export interface HarnessLaunchAdapter {
   /** Honest lifecycle reporting: native, screen-derived, or unavailable. */
   lifecycle: HarnessLifecycle;
   preflight(profile: LaunchProfile): void | Promise<void>;
+  /** Optional: when the harness's attestation is assembled from multiple
+   * writers, reports whether it is complete enough to verify (identity plus
+   * tool/operation evidence). Default: any parseable attestation. */
+  attestationComplete?(attestation: unknown): boolean;
   launchArguments(
     profile: LaunchProfile,
     source: string,
