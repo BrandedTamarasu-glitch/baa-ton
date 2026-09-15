@@ -89,6 +89,26 @@ const ctx = {
   },
 };
 
+/** When spawned as a dispatched lane's MCP server, merge the live protocol
+ * operations into the lane's startup attestation. The host harness's
+ * SessionStart hook merges session identity into the same file; both merge
+ * atomically, so write order does not matter. */
+if (process.env.BAA_STARTUP_INTENT && process.env.HERDR_ENV === "1") {
+  const { mergeAttestation } = await import(join(root, "attest-merge.mjs"));
+  const { mapPiToolNamesToProtocolOperations } = await jiti.import(
+    join(root, "pi-launch-adapter.ts"),
+  );
+  try {
+    await mergeAttestation(process.env.BAA_STARTUP_INTENT, {
+      operations: mapPiToolNamesToProtocolOperations([...tools.keys()]),
+    });
+  } catch (error) {
+    console.error(
+      `startup-attestation merge failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }

@@ -15,10 +15,10 @@ The common dispatcher additionally enforces workspace/pane/agent identity, start
 
 | Adapter | Source/local tests | Live qualification |
 | --- | --- | --- |
-| Pi / openai-codex subscription | Implemented in `pi-launch-adapter.ts`; maps Pi tool names to the neutral `plan`/`dispatch`/`complete` operations | Pending activation and observed startup |
+| Pi / openai-codex subscription | Implemented in `pi-launch-adapter.ts`; maps Pi tool names to the neutral `plan`/`dispatch`/`complete` operations | Proven: `herdr-f3afd260` and `herdr-fc6d2a3e` dispatched with verified startup proof and durable completion receipts |
 | Codex | Synthetic ID-session adapter with native tool names proves normalized operations and shared dispatch sequencing without editing the core | No production launch adapter registered |
 | Missing-capability adapter | Registry regression rejects missing `supportsSessionPersistence` before topology mutation | Not launch-qualified |
-| Claude | Native Herdr compatibility is not startup qualification | No production launch adapter registered |
+| Claude Code / claude-code subscription | Implemented in `claude-launch-adapter.ts` (+ `claude-startup-attest.mjs` SessionStart hook, `mcp-server.mjs` operations merge, `attest-merge.mjs`): exact model + `--effort` (identical ladder), generated settings/mcp config, conservative lane permissions (push/merge/PR denied), session attestation matched against native identity | In flight: first live dispatch qualifies it (durable-core batch) |
 
 Unregistered adapters fail before topology mutation. The synthetic Codex test is **not** a claim that real Codex startup is qualified.
 

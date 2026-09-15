@@ -8,6 +8,9 @@ const require = createRequire(import.meta.url);
 const jiti = require("jiti")(import.meta.url);
 const { dispatchTask } = await jiti.import("../dispatch-task.ts");
 const { piLaunchAdapter } = await jiti.import("../pi-launch-adapter.ts");
+const { claudeLaunchAdapter } = await jiti.import(
+  "../claude-launch-adapter.ts",
+);
 const {
   HarnessAdapterRegistry,
   PROTOCOL_OPERATIONS,
@@ -140,14 +143,17 @@ async function fixture(options = {}) {
           "route is established before start, not after assignment",
         );
         assert.equal(args[args.indexOf("--model") + 1], launchProfile.model);
-        assert.equal(
-          args[args.indexOf("--provider") + 1],
-          launchProfile.provider,
-        );
-        assert.equal(
-          args[args.indexOf("--thinking") + 1],
-          launchProfile.thinking,
-        );
+        if (args.includes("--provider"))
+          assert.equal(
+            args[args.indexOf("--provider") + 1],
+            launchProfile.provider,
+          );
+        for (const flag of ["--thinking", "--effort"])
+          if (args.includes(flag))
+            assert.equal(
+              args[args.indexOf(flag) + 1],
+              launchProfile.thinking,
+            );
         const p = panes.get(args[args.indexOf("--pane") + 1]);
         if (options.busy) {
           options.busy = false;
@@ -168,6 +174,7 @@ async function fixture(options = {}) {
         };
         options.changeHello?.(hello);
         p.session = hello.sessionId ?? hello.sessionPath;
+        p.sessionKind = hello.sessionId && !hello.sessionPath ? "id" : "path";
         await writeFile(`${p.intentPath}.ready`, JSON.stringify(hello));
         return {};
       }
@@ -180,7 +187,7 @@ async function fixture(options = {}) {
               workspace_id: "task-space",
               agent: options.adapter?.kind ?? "pi",
               agent_session: {
-                kind: options.adapter ? "id" : "path",
+                kind: p.sessionKind ?? "path",
                 value: options.unrelatedSession
                   ? "/sessions/unrelated"
                   : p.session,
@@ -439,5 +446,47 @@ test("a non-Pi ID-session adapter with native tool names plugs into unchanged di
     );
   } finally {
     await f.close();
+  }
+});
+
+test("claude adapter dispatches through unchanged sequencing with its own attestation", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "baa-claude-scratch-"));
+  const adapter = claudeLaunchAdapter({
+    bridge: "/bridge/mcp-server.mjs",
+    attestHelper: "/bridge/claude-startup-attest.mjs",
+    scratchDirectory: scratch,
+  });
+  const f = await fixture({
+    adapter,
+    profile: {
+      provider: "claude-code",
+      model: "claude-sonnet-5",
+      thinking: "high",
+      auth: "subscription",
+    },
+    changeHello: (hello) => {
+      // Claude attestation shape: SessionStart hook identity + bridge-merged
+      // protocol operations, no Pi tool names anywhere.
+      delete hello.tools;
+      hello.operations = ["plan", "dispatch", "complete"];
+    },
+  });
+  try {
+    assert.equal((await f.run()).dispatched, true);
+    assert.ok(f.state.lanes.every((l) => l.nativeSession.kind === "path"));
+    const start = f.calls.find((c) => c[1] === "start");
+    assert.equal(start[start.indexOf("--model") + 1], "claude-sonnet-5");
+    assert.equal(start[start.indexOf("--effort") + 1], "high");
+    const settings = JSON.parse(
+      await readFile(start[start.indexOf("--settings") + 1], "utf8"),
+    );
+    assert.match(
+      settings.hooks.SessionStart[0].hooks[0].command,
+      /claude-startup-attest\.mjs/,
+    );
+    assert.equal(f.calls.filter((c) => c[1] === "prompt").length, 2);
+  } finally {
+    await f.close();
+    await rm(scratch, { recursive: true, force: true });
   }
 });

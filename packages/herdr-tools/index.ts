@@ -23,6 +23,7 @@ import { blocksUnmanagedAgentCommand } from "./command-policy.js";
 import { dispatchTask } from "./dispatch-task.js";
 import { type LaunchProfile, validateLaunchProfile } from "./launch-profile.js";
 import { piLaunchAdapter, verifyActualProfile } from "./pi-launch-adapter.js";
+import { claudeLaunchAdapter } from "./claude-launch-adapter.js";
 import {
   HarnessAdapterRegistry,
   type NativeSessionRef,
@@ -2560,6 +2561,15 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ctx,
         join(homedir(), ".pi/agent/extensions/herdr-agent-state.ts"),
       ),
+    );
+    adapters.register(
+      claudeLaunchAdapter({
+        bridge: fileURLToPath(new URL("./mcp-server.mjs", import.meta.url)),
+        attestHelper: fileURLToPath(
+          new URL("./claude-startup-attest.mjs", import.meta.url),
+        ),
+        scratchDirectory: dirname(manifestPath(cwd)),
+      }),
     );
     return dispatchTask(
       workflow,
