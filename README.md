@@ -11,23 +11,41 @@ what actually happened.
 
 ## Install
 
-You'll need [Herdr](https://github.com/herdrdev/herdr) 0.9+, Node.js 20+, and a
-Pi session running inside a Herdr pane (that's the root host). Then:
+**macOS, Linux, WSL:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zachristmas/baa-ton/main/install.sh | bash
+```
+
+**Windows PowerShell:**
+
+```powershell
+irm https://raw.githubusercontent.com/zachristmas/baa-ton/main/install.ps1 | iex
+```
+
+**Windows CMD:**
+
+```bat
+curl -fsSL https://raw.githubusercontent.com/zachristmas/baa-ton/main/install.cmd -o install.cmd && install.cmd && del install.cmd
+```
+
+The script clones to `~/.baa-ton` (override with `BAA_TON_DIR`), installs dependencies, links the Pi extension, and links the Herdr controller plugin when the Herdr CLI is present. Idempotent — re-run to update.
+
+**Or as a Pi package** (extension only, no controller): `pi install git:github.com/zachristmas/baa-ton`
+
+**From source**, for development:
 
 ```sh
 git clone git@github.com:zachristmas/baa-ton.git
 cd baa-ton && npm install
-
-# 1. Pi extension (the herdr_* tools)
 ln -s "$PWD/packages/herdr-tools" ~/.pi/agent/extensions/herdr-orchestrator
-
-# 2. Event controller (review before enabling — see its README)
 herdr plugin link "$PWD/packages/controller"
 ```
 
-From your Herdr-rooted Pi pane, call `herdr_bootstrap_root` once to claim the root,
-then `herdr_plan` → `herdr_dispatch` to delegate. Full details:
-[workflow tools](packages/herdr-tools/README.md) ·
+You'll need [Herdr](https://github.com/herdrdev/herdr) 0.9+, Node.js 20+, and a
+Pi session running inside a Herdr pane (that's the root host). From that pane, call
+`herdr_bootstrap_root` once to claim the root, then `herdr_plan` → `herdr_dispatch` to
+delegate. Full details: [workflow tools](packages/herdr-tools/README.md) ·
 [event controller](packages/controller/README.md).
 
 **Run the tests** (harness CLIs on `PATH` required for adapter tests):
