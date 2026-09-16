@@ -9,6 +9,37 @@ terminal multiplexer for coding agents. Herdr owns the terminals and the agent p
 Baa-ton plans their work, checks each agent before handing it a task, and keeps a record of
 what actually happened.
 
+## Install
+
+You'll need [Herdr](https://github.com/herdrdev/herdr) 0.9+, Node.js 20+, and a
+Pi session running inside a Herdr pane (that's the root host). Then:
+
+```sh
+git clone git@github.com:zachristmas/baa-ton.git
+cd baa-ton && npm install
+
+# 1. Pi extension (the herdr_* tools)
+ln -s "$PWD/packages/herdr-tools" ~/.pi/agent/extensions/herdr-orchestrator
+
+# 2. Event controller (review before enabling — see its README)
+herdr plugin link "$PWD/packages/controller"
+```
+
+From your Herdr-rooted Pi pane, call `herdr_bootstrap_root` once to claim the root,
+then `herdr_plan` → `herdr_dispatch` to delegate. Full details:
+[workflow tools](packages/herdr-tools/README.md) ·
+[event controller](packages/controller/README.md).
+
+**Run the tests** (harness CLIs on `PATH` required for adapter tests):
+
+```sh
+npm test
+```
+
+The suite runs the workflow smoke check plus the workflow and controller tests. To run
+just one package, use `npm run test:extension` or `npm run test:controller`. Local
+tests don't replace live harness qualification.
+
 ## Why Baa-ton
 
 **What problem does it solve?** Running several coding agents at once is easy. Trusting
@@ -136,19 +167,6 @@ Parallel writers each get their own workflow and worktree, with disjoint file
 ownership; if two lanes would touch the same files, they're sequenced instead.
 Integration is the parent's job: land the changes one at a time, re-run the merged
 test suite, and get a cross-vendor review before anything ships.
-
-## Quick start
-
-You'll need Node.js 20+, Herdr 0.9.0+, and, for adapter tests, the harness CLIs on `PATH`.
-
-```sh
-npm install
-npm test
-```
-
-The suite runs the workflow smoke check plus the workflow and controller tests. To run
-just one package, use `npm run test:extension` or `npm run test:controller`. Local
-tests don't replace live harness qualification.
 
 ## Go deeper
 
