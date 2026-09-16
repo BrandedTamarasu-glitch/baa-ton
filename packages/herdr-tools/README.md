@@ -103,6 +103,23 @@ orchestrator records in one config but routes lifecycle events and wakes by the
 registered pane/workspace mapping, so Pi, Claude Code, and other harness roots
 can run side by side without sharing parent state.
 
+## The queue
+
+Each verified root has an additive, versioned durable queue in its own
+manifest. Use `herdr_queue action=enqueue` with an objective, optional `notes`,
+declared `files`, and `after` queue-item IDs; `list` shows states and blockers,
+and `dequeue` returns only the ordered head whose dependencies and file
+ownership are clear. The queue stores intent, not scoping judgment: the root
+checks the declared files and decides scope at dequeue time.
+
+Pass the returned `queueItemId` to `herdr_plan` to copy the objective and notes
+into a planned workflow. Planning records the queue link and marks the item
+`dispatched`; the root later uses `herdr_queue action=update` with evidence to
+mark it `verified`, then `landed` (or `dropped`). When a landed workflow leaves a
+clear next head, the controller sends one event-driven review wake. The optional
+sidebar includes `$herdr_queue` as `N pending · head <slug>` alongside the goal
+rows.
+
 ## Validate
 
 ```sh

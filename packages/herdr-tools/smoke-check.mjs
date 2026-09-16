@@ -387,7 +387,7 @@ extension.default({
     throw new Error(`Unexpected Herdr call: ${args.join(" ")}`);
   },
 });
-assert.equal(tools.size, 13, "extension registered its workflow tools");
+assert.equal(tools.size, 14, "extension registered its workflow tools");
 assert.ok(
   tools.has("herdr_bootstrap_root"),
   "extension registers manual root bootstrap",
@@ -396,6 +396,7 @@ assert.ok(
   tools.has("herdr_question_answer"),
   "extension registers parent question answers",
 );
+assert.ok(tools.has("herdr_queue"), "extension registers the root queue");
 assert.ok(tools.has("herdr_reparent"), "extension registers root handoff");
 assert.ok(tools.has("herdr_message"), "extension registers child messages");
 assert.ok(
@@ -753,6 +754,8 @@ try {
     "herdr_goal_next_2=dependency-ready",
     "--token",
     "herdr_goal_next_3=Herdr action or wait",
+    "--clear-token",
+    "herdr_queue",
     "--state-label",
     "idle=Goal: active",
     "--state-label",

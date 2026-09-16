@@ -11,7 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -121,6 +121,44 @@ const CONTROLLER_PLUGIN_ID = "herdr-orchestrator-controller";
 const CONTROLLER_CONFIG_NAME = "config.json";
 const SCOPED_GOALS_SCHEMA_VERSION = 1 as const;
 const GOAL_HISTORY_SCHEMA_VERSION = 1 as const;
+const QUEUE_SCHEMA_VERSION = 1 as const;
+const QUEUE_DEDUPE_WINDOW_MS = 60_000;
+const QUEUE_ITEM_STATES = [
+  "pending",
+  "dispatched",
+  "verified",
+  "landed",
+  "dropped",
+] as const;
+type QueueItemState = (typeof QUEUE_ITEM_STATES)[number];
+type QueueItem = {
+  version: typeof QUEUE_SCHEMA_VERSION;
+  id: string;
+  objective: string;
+  notes?: string;
+  files: string[];
+  after: string[];
+  state: QueueItemState;
+  createdAt: string;
+  updatedAt: string;
+  workflowId?: string;
+  evidence?: string;
+};
+type QueueStore = {
+  version: typeof QUEUE_SCHEMA_VERSION;
+  items: QueueItem[];
+};
+type ManifestWithQueue = ManifestWithGoalHistory & {
+  queue?: QueueStore;
+};
+type QueueBlockers = {
+  dependencies: Array<{ id: string; state?: QueueItemState }>;
+  files: Array<{ itemId: string; files: string[] }>;
+};
+type QueueReadiness = {
+  item: QueueItem | undefined;
+  blockers: QueueBlockers;
+};
 type GoalHistoryRecord = ParentGoal & {
   version: typeof GOAL_HISTORY_SCHEMA_VERSION;
   archivedAt: string;
@@ -302,7 +340,171 @@ function normalizeWorkflowGoals(workflow: Workflow): Workflow {
   return workflow;
 }
 
-async function loadManifest(cwd: string): Promise<ManifestWithGoalHistory> {
+function queueStore(value: unknown, label = "manifest.queue"): QueueStore {
+  if (Array.isArray(value)) {
+    // Accept the early array-only draft in memory; all new writes use the
+    // versioned wrapper so the queue schema can evolve independently.
+    value = { version: QUEUE_SCHEMA_VERSION, items: value };
+  }
+  if (!isRecord(value)) throw new Error(`${label} must be an object.`);
+  if (value.version !== QUEUE_SCHEMA_VERSION)
+    throw new Error(`${label}.version must be ${QUEUE_SCHEMA_VERSION}.`);
+  if (!Array.isArray(value.items))
+    throw new Error(`${label}.items must be an array.`);
+  const ids = new Set<string>();
+  const items = value.items.map((raw, index) => {
+    const itemLabel = `${label}.items[${index}]`;
+    if (!isRecord(raw)) throw new Error(`${itemLabel} must be an object.`);
+    const allowed = new Set([
+      "version",
+      "id",
+      "objective",
+      "notes",
+      "files",
+      "after",
+      "state",
+      "createdAt",
+      "updatedAt",
+      "workflowId",
+      "evidence",
+    ]);
+    for (const key of Object.keys(raw))
+      if (!allowed.has(key)) throw new Error(`${itemLabel}.${key} is not allowed.`);
+    if (raw.version !== QUEUE_SCHEMA_VERSION)
+      throw new Error(`${itemLabel}.version must be ${QUEUE_SCHEMA_VERSION}.`);
+    if (
+      typeof raw.id !== "string" ||
+      !/^queue-[0-9a-f]{8}$/i.test(raw.id)
+    )
+      throw new Error(`${itemLabel}.id must match queue-<8hex>.`);
+    if (ids.has(raw.id)) throw new Error(`Duplicate queue item ID: ${raw.id}.`);
+    ids.add(raw.id);
+    if (typeof raw.objective !== "string" || !raw.objective.trim())
+      throw new Error(`${itemLabel}.objective must be non-empty.`);
+    if ("notes" in raw && typeof raw.notes !== "string")
+      throw new Error(`${itemLabel}.notes must be a string when present.`);
+    if (
+      !Array.isArray(raw.files) ||
+      raw.files.some((file) => typeof file !== "string" || !file.trim())
+    )
+      throw new Error(`${itemLabel}.files must contain non-empty strings.`);
+    if (
+      !Array.isArray(raw.after) ||
+      raw.after.some((dependency) => typeof dependency !== "string" || !dependency)
+    )
+      throw new Error(`${itemLabel}.after must contain queue item IDs.`);
+    if (!QUEUE_ITEM_STATES.includes(raw.state as QueueItemState))
+      throw new Error(`${itemLabel}.state is invalid.`);
+    for (const key of ["createdAt", "updatedAt"])
+      if (typeof raw[key] !== "string" || !raw[key])
+        throw new Error(`${itemLabel}.${key} must be a non-empty string.`);
+    if ("workflowId" in raw && typeof raw.workflowId !== "string")
+      throw new Error(`${itemLabel}.workflowId must be a string when present.`);
+    if ("evidence" in raw && typeof raw.evidence !== "string")
+      throw new Error(`${itemLabel}.evidence must be a string when present.`);
+    return raw as unknown as QueueItem;
+  });
+  for (const item of items)
+    for (const dependency of item.after)
+      if (!ids.has(dependency))
+        throw new Error(`Queue item ${item.id} depends on unknown item ${dependency}.`);
+  return { version: QUEUE_SCHEMA_VERSION, items };
+}
+
+function queueForManifest(
+  manifest: ManifestWithQueue,
+  create = false,
+): QueueStore | undefined {
+  if (!("queue" in manifest) || manifest.queue === undefined) {
+    if (!create) return undefined;
+    manifest.queue = { version: QUEUE_SCHEMA_VERSION, items: [] };
+    return manifest.queue;
+  }
+  const normalized = queueStore(manifest.queue);
+  // Normalize an array-only draft when a writer touches the manifest.
+  manifest.queue = normalized;
+  return normalized;
+}
+
+function queuePathKey(cwd: string, file: string): string {
+  return resolve(cwd, file);
+}
+
+function queueReadiness(
+  manifest: ManifestWithQueue,
+  candidate: QueueItem | undefined,
+  cwd: string,
+): QueueReadiness {
+  const blockers: QueueBlockers = { dependencies: [], files: [] };
+  if (!candidate) return { item: undefined, blockers };
+  const queue = queueForManifest(manifest) ?? { version: QUEUE_SCHEMA_VERSION, items: [] };
+  for (const dependencyId of candidate.after) {
+    const dependency = queue.items.find((item) => item.id === dependencyId);
+    if (!dependency || !["landed", "dropped"].includes(dependency.state))
+      blockers.dependencies.push({
+        id: dependencyId,
+        ...(dependency ? { state: dependency.state } : {}),
+      });
+  }
+  const candidateFiles = new Map(
+    candidate.files.map((file) => [queuePathKey(cwd, file), file]),
+  );
+  if (candidateFiles.size > 0) {
+    for (const other of queue.items) {
+      if (other.id === candidate.id || ["landed", "dropped"].includes(other.state))
+        continue;
+      const workflow = manifest.workflows.find(
+        (item) =>
+          (item as Workflow & { queueItemId?: string }).queueItemId === other.id,
+      );
+      const undischarged =
+        other.state === "dispatched" ||
+        other.state === "verified" ||
+        Boolean(
+          other.workflowId ||
+            (workflow &&
+              ["planned", "starting", "running", "blocked", "dispatch-failed"].includes(
+                workflow.status,
+              )),
+        );
+      if (!undischarged) continue;
+      const overlap = other.files.filter((file) =>
+        candidateFiles.has(queuePathKey(cwd, file)),
+      );
+      if (overlap.length)
+        blockers.files.push({ itemId: other.id, files: overlap });
+    }
+  }
+  return { item: candidate, blockers };
+}
+
+function queueHead(
+  manifest: ManifestWithQueue,
+  cwd: string,
+): QueueReadiness {
+  const queue = queueForManifest(manifest);
+  const candidate = queue?.items.find((item) => item.state === "pending");
+  return queueReadiness(manifest, candidate, cwd);
+}
+
+function queueBlockerText(blockers: QueueBlockers): string {
+  const parts: string[] = [];
+  if (blockers.dependencies.length)
+    parts.push(
+      `dependencies: ${blockers.dependencies
+        .map((item) => `${item.id}${item.state ? ` (${item.state})` : ""}`)
+        .join(", ")}`,
+    );
+  if (blockers.files.length)
+    parts.push(
+      `files: ${blockers.files
+        .map((item) => `${item.itemId} [${item.files.join(", ")}]`)
+        .join(", ")}`,
+    );
+  return parts.join("; ");
+}
+
+async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
   try {
     const parsed = JSON.parse(await readFile(manifestPath(cwd), "utf8")) as {
       version?: unknown;
@@ -311,6 +513,7 @@ async function loadManifest(cwd: string): Promise<ManifestWithGoalHistory> {
       questionRequests?: ParentQuestionRequest[];
       messageRequests?: MessageRecord[];
       goalHistory?: unknown;
+      queue?: unknown;
     };
     if (
       (parsed.version === 1 || parsed.version === 2) &&
@@ -326,6 +529,9 @@ async function loadManifest(cwd: string): Promise<ManifestWithGoalHistory> {
         messageRequests: parsed.messageRequests,
         ...(Array.isArray(parsed.goalHistory)
           ? { goalHistory: parsed.goalHistory as GoalHistoryRecord[] }
+          : {}),
+        ...(parsed.queue !== undefined
+          ? { queue: queueStore(parsed.queue) }
           : {}),
       };
     return { version: 2, workflows: [] };
@@ -498,7 +704,7 @@ function requireRootGoalExecutor(): void {
   requireHerdr();
   if (!isRootOrchestrator())
     throw new Error(
-      "Only the verified controller-mapped root may create or update the parent goal.",
+      "Only the verified controller-mapped root may create or update the parent goal or queue.",
     );
 }
 
@@ -1647,6 +1853,33 @@ function isRootOrchestrator(): boolean {
   );
 }
 
+function isRootForManifest(cwd: string): boolean {
+  const paneId = process.env[HERDR_PANE_ID_ENV];
+  const workspaceId = process.env.HERDR_WORKSPACE_ID;
+  if (!paneId || !workspaceId) return false;
+  const target = resolve(cwd);
+  return (
+    readControllerConfigForCurrentPane()?.orchestrators.some(
+      (record) =>
+        record.root.pane_id === paneId &&
+        record.root.workspace_id === workspaceId &&
+        (record.program.id === "legacy-global" ||
+          resolve(record.program.id) === target ||
+          (record.program.parent_manifest_path &&
+            resolve(record.program.parent_manifest_path) ===
+              resolve(manifestPath(cwd)))),
+    ) ?? false
+  );
+}
+
+function requireRootManifestExecutor(cwd: string): void {
+  requireRootGoalExecutor();
+  if (!isRootForManifest(cwd))
+    throw new Error(
+      "The verified controller-mapped root does not own this queue manifest.",
+    );
+}
+
 function isRegisteredChildLane(): boolean {
   const paneId = process.env[HERDR_PANE_ID_ENV];
   if (!paneId) return false;
@@ -2034,6 +2267,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     "herdr_goal_next_1",
     "herdr_goal_next_2",
     "herdr_goal_next_3",
+    "herdr_queue",
   ] as const;
 
   function wrapSidebarText(text: string, width = 20): string[] {
@@ -2053,14 +2287,22 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
 
   function parentGoalSidebarTokens(
     goal: ParentGoal,
+    queue?: QueueStore,
   ): Record<string, string | undefined> {
     const status = goal.status.replaceAll("-", " ");
     const next = wrapSidebarText(goal.nextAction).slice(0, 3);
+    const pending = queue?.items.filter((item) => item.state === "pending") ?? [];
+    const head = pending[0];
     return {
       herdr_goal_status: `Goal: ${status}`,
       herdr_goal_next_1: next[0] ? `Next: ${next[0]}` : undefined,
       herdr_goal_next_2: next[1],
       herdr_goal_next_3: next[2],
+      ...(queue
+        ? {
+            herdr_queue: `${pending.length} pending · head ${head ? laneSlug(head.objective) : "none"}`,
+          }
+        : {}),
     };
   }
 
@@ -2071,13 +2313,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   async function publishParentGoalSidebar(
     goal: ParentGoal,
     signal?: AbortSignal,
+    queue?: QueueStore,
   ): Promise<void> {
     if (!isRootOrchestrator()) return;
     const paneId = process.env[HERDR_PANE_ID_ENV];
     if (!paneId) return;
     const args = ["pane", "report-metadata", paneId, "--source", OWNER];
     for (const name of GOAL_SIDEBAR_TOKEN_NAMES) {
-      const value = parentGoalSidebarTokens(goal)[name];
+      const value = parentGoalSidebarTokens(goal, queue)[name];
       if (value) args.push("--token", `${name}=${value}`);
       else args.push("--clear-token", name);
     }
@@ -2358,11 +2601,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const resolvedCwd = resolve(cwd);
     const configPath = await controllerConfigPath(signal);
     const config = await loadControllerConfig(configPath);
-    const manifestHasState = (manifest: ManifestWithGoalHistory): boolean =>
+    const manifestHasState = (manifest: ManifestWithQueue): boolean =>
       manifest.workflows.length > 0 ||
       manifest.parentGoal !== undefined ||
       (manifest.questionRequests?.length ?? 0) > 0 ||
-      (manifest.messageRequests?.length ?? 0) > 0;
+      (manifest.messageRequests?.length ?? 0) > 0 ||
+      (manifest.queue?.items.length ?? 0) > 0;
     const existingManifest = await loadManifest(cwd);
     const manifestHasLegacyState = manifestHasState(existingManifest);
     if (
@@ -3015,15 +3259,166 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     };
   }
 
+  type QueueAction = "enqueue" | "dequeue" | "list" | "update";
+
+  async function queueOperation(
+    cwd: string,
+    action: QueueAction,
+    input: {
+      objective?: string;
+      files?: string[];
+      after?: string[];
+      notes?: string;
+      queueItemId?: string;
+      state?: QueueItemState;
+      evidence?: string;
+      reason?: string;
+    },
+  ): Promise<unknown> {
+    requireRootManifestExecutor(cwd);
+    if (action === "enqueue") {
+      const objective = input.objective?.trim();
+      if (!objective) throw new Error("objective is required to enqueue a queue item.");
+      const files = [...new Set(
+        (input.files ?? []).map((file) => file.trim()).filter(Boolean),
+      )];
+      if (input.files?.some((file) => typeof file !== "string" || !file.trim()))
+        throw new Error("files must contain only non-empty strings.");
+      const after = [...new Set((input.after ?? []).map((item) => item.trim()))];
+      if (after.some((item) => !item))
+        throw new Error("after must contain only queue item IDs.");
+      const notes = input.notes?.trim();
+      const release = await acquireManifestLock(cwd, 10_000);
+      try {
+        const manifest = await loadManifest(cwd);
+        const queue = queueForManifest(manifest, true)!;
+        const timestamp = now();
+        const objectiveHash = createHash("sha256").update(objective).digest("hex");
+        const duplicate = queue.items.find(
+          (item) =>
+            createHash("sha256").update(item.objective).digest("hex") === objectiveHash &&
+            Date.parse(timestamp) - Date.parse(item.createdAt) <= QUEUE_DEDUPE_WINDOW_MS &&
+            Date.parse(timestamp) >= Date.parse(item.createdAt),
+        );
+        if (duplicate)
+          return { queueItem: duplicate, deduplicated: true, queue };
+        for (const dependency of after)
+          if (!queue.items.some((item) => item.id === dependency))
+            throw new Error(`Queue item after dependency is unknown: ${dependency}.`);
+        const item: QueueItem = {
+          version: QUEUE_SCHEMA_VERSION,
+          id: `queue-${randomUUID().slice(0, 8)}`,
+          objective,
+          ...(notes ? { notes } : {}),
+          files,
+          after,
+          state: "pending",
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        };
+        queue.items.push(item);
+        await saveManifest(cwd, manifest);
+        return { queueItem: item, deduplicated: false, queue };
+      } finally {
+        await release();
+      }
+    }
+    if (action === "update") {
+      const id = input.queueItemId?.trim();
+      if (!id) throw new Error("queueItemId is required to update a queue item.");
+      if (!input.state || !QUEUE_ITEM_STATES.includes(input.state))
+        throw new Error("state must be verified, landed, or dropped.");
+      if (!["verified", "landed", "dropped"].includes(input.state))
+        throw new Error("state must be verified, landed, or dropped.");
+      const evidence = (input.evidence ?? input.reason)?.trim();
+      if (!evidence) throw new Error("evidence is required for a queue update.");
+      const release = await acquireManifestLock(cwd, 10_000);
+      try {
+        const manifest = await loadManifest(cwd);
+        const queue = queueForManifest(manifest);
+        if (!queue) throw new Error("No queue is registered.");
+        const item = queue.items.find((candidate) => candidate.id === id);
+        if (!item) throw new Error(`Unknown queue item: ${id}.`);
+        const allowed: Record<QueueItemState, QueueItemState[]> = {
+          pending: ["verified", "dropped"],
+          dispatched: ["verified", "dropped"],
+          verified: ["landed", "dropped"],
+          landed: ["landed"],
+          dropped: ["dropped"],
+        };
+        if (!allowed[item.state].includes(input.state))
+          throw new Error(`Queue item ${id} cannot move from ${item.state} to ${input.state}.`);
+        const changed = item.state !== input.state || item.evidence !== evidence;
+        if (changed) {
+          item.state = input.state;
+          item.evidence = evidence;
+          item.updatedAt = now();
+          await saveManifest(cwd, manifest);
+        }
+        return { queueItem: item, changed, queue };
+      } finally {
+        await release();
+      }
+    }
+    const manifest = await loadManifest(cwd);
+    const queue = queueForManifest(manifest) ?? {
+      version: QUEUE_SCHEMA_VERSION,
+      items: [],
+    };
+    const readiness = queueHead(manifest, cwd);
+    const blockersByItem = Object.fromEntries(
+      queue.items
+        .filter((item) => item.state === "pending")
+        .map((item) => [item.id, queueReadiness(manifest, item, cwd).blockers]),
+    );
+    if (action === "dequeue")
+      return {
+        item: readiness.blockers.dependencies.length || readiness.blockers.files.length
+          ? undefined
+          : readiness.item,
+        head: readiness.item,
+        blockers: readiness.blockers,
+        blockersByItem,
+        queue,
+      };
+    return {
+      items: queue.items,
+      queue,
+      head: readiness.item,
+      blockers: readiness.blockers,
+      blockersByItem,
+    };
+  }
+
   async function plan(
     cwd: string,
-    objective: string,
+    objectiveInput: string | undefined,
     laneObjectives: LaneInput[],
     worktreeCwd?: string,
     authorizationPolicyInput?: unknown,
     agentKindInput?: unknown,
     launchProfileInput?: unknown,
+    queueItemId?: string,
   ): Promise<Workflow> {
+    let objective = objectiveInput?.trim() ?? "";
+    let linkedQueueItem: QueueItem | undefined;
+    if (queueItemId) {
+      requireRootManifestExecutor(cwd);
+      const manifest = await loadManifest(cwd);
+      const queue = queueForManifest(manifest);
+      if (!queue) throw new Error("No queue is registered.");
+      linkedQueueItem = queue.items.find((item) => item.id === queueItemId);
+      if (!linkedQueueItem) throw new Error(`Unknown queue item: ${queueItemId}.`);
+      if (linkedQueueItem.state !== "pending")
+        throw new Error(`Queue item ${queueItemId} is ${linkedQueueItem.state}, not pending.`);
+      const readiness = queueReadiness(manifest, linkedQueueItem, cwd);
+      if (readiness.blockers.dependencies.length || readiness.blockers.files.length)
+        throw new Error(
+          `Queue item ${queueItemId} is blocked: ${queueBlockerText(readiness.blockers)}.`,
+        );
+      objective = linkedQueueItem.objective;
+    }
+    if (!objective) throw new Error("objective is required to plan a workflow.");
     const agentKind = validateAgentKind(agentKindInput ?? "pi");
     const authorizationPolicy =
       authorizationPolicyInput === undefined
@@ -3111,6 +3506,16 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       createdAt: stamp,
       updatedAt: stamp,
     };
+    if (linkedQueueItem) {
+      const linked = workflow as Workflow & { queueItemId?: string; notes?: string };
+      linked.queueItemId = linkedQueueItem.id;
+      if (linkedQueueItem.notes) linked.notes = linkedQueueItem.notes;
+      workflow.evidence.push({
+        at: now(),
+        kind: "queue-item-linked",
+        text: `Planned from queue item ${linkedQueueItem.id}.`,
+      });
+    }
     if (authorizationPolicy)
       workflow.evidence.push({
         at: now(),
@@ -3126,6 +3531,21 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const release = await acquireManifestLock(cwd, 10_000);
     try {
       const manifest = await loadManifest(cwd);
+      if (linkedQueueItem) {
+        const queue = queueForManifest(manifest);
+        const item = queue?.items.find((candidate) => candidate.id === linkedQueueItem!.id);
+        if (!item) throw new Error(`Queue item ${linkedQueueItem.id} disappeared before planning.`);
+        if (item.state !== "pending")
+          throw new Error(`Queue item ${item.id} is ${item.state}, not pending.`);
+        const readiness = queueReadiness(manifest, item, cwd);
+        if (readiness.blockers.dependencies.length || readiness.blockers.files.length)
+          throw new Error(
+            `Queue item ${item.id} became blocked: ${queueBlockerText(readiness.blockers)}.`,
+          );
+        item.state = "dispatched";
+        item.workflowId = workflow.id;
+        item.updatedAt = now();
+      }
       manifest.workflows.push(workflow);
       await saveManifest(cwd, manifest);
     } finally {
@@ -4768,7 +5188,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     if (!ctx.hasUI) return;
     const manifest = await loadManifest(ctx.cwd);
     if (manifest.parentGoal)
-      await publishParentGoalSidebar(manifest.parentGoal, ctx.signal);
+      await publishParentGoalSidebar(manifest.parentGoal, ctx.signal, manifest.queue);
     else await clearParentGoalSidebar(ctx.signal);
   });
 
@@ -4953,7 +5373,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           details: result,
         };
       }
-      if (ctx.hasUI) await publishParentGoalSidebar(result.goal, signal);
+      if (ctx.hasUI) {
+        const manifest = await loadManifest(ctx.cwd);
+        await publishParentGoalSidebar(result.goal, signal, manifest.queue);
+      }
 
       return {
         content: [
@@ -5144,17 +5567,91 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     },
   });
   pi.registerTool({
-    name: "herdr_plan",
-    label: "Herdr Plan",
+    name: "herdr_queue",
+    label: "Herdr Queue",
     description:
-      "Create a durable local plan manifest for Herdr-managed agent lanes.",
-    promptSnippet: "Plan a Herdr-only delegated agent workflow.",
+      "Manage the verified root's durable ordered queue; queue intent never replaces root scoping judgment at dequeue time.",
+    promptSnippet: "Manage the root-only durable Herdr work queue.",
     promptGuidelines: [
-      "Use herdr_plan before herdr_dispatch; select any documented Herdr agentKind when needed. Supply authorizationPolicy only for the narrowly validated BB-029 local-only scope.",
+      "Use herdr_queue only from the verified controller-mapped root. Enqueue intent with declared files and after dependencies, dequeue only when the ordered head is clear, and record verified/landed/dropped transitions with evidence.",
     ],
     parameters: Type.Object(
       {
-        objective: Type.String(),
+        action: Type.Union([
+          Type.Literal("enqueue"),
+          Type.Literal("dequeue"),
+          Type.Literal("list"),
+          Type.Literal("update"),
+        ]),
+        objective: Type.Optional(Type.String({ minLength: 1 })),
+        notes: Type.Optional(Type.String()),
+        files: Type.Optional(Type.Array(Type.String())),
+        after: Type.Optional(Type.Array(Type.String())),
+        queueItemId: Type.Optional(Type.String({ minLength: 1 })),
+        state: Type.Optional(
+          Type.Union([
+            Type.Literal("verified"),
+            Type.Literal("landed"),
+            Type.Literal("dropped"),
+          ]),
+        ),
+        evidence: Type.Optional(Type.String({ minLength: 1 })),
+        reason: Type.Optional(Type.String({ minLength: 1 })),
+      },
+      { additionalProperties: false },
+    ),
+    async execute(_id, params, _signal, _update, ctx) {
+      const result = await queueOperation(ctx.cwd, params.action, params);
+      if (ctx.hasUI) {
+        const manifest = await loadManifest(ctx.cwd);
+        if (manifest.parentGoal)
+          await publishParentGoalSidebar(
+            manifest.parentGoal,
+            _signal,
+            manifest.queue,
+          );
+      }
+      const details = result as {
+        queueItem?: QueueItem;
+        item?: QueueItem;
+        head?: QueueItem;
+        blockers?: QueueBlockers;
+        deduplicated?: boolean;
+      };
+      const subject = details.queueItem ?? details.item ?? details.head;
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              params.action === "enqueue"
+                ? `${details.deduplicated ? "Reused" : "Enqueued"} ${subject?.id ?? "queue item"}.`
+                : params.action === "dequeue"
+                  ? subject
+                    ? `Queue head ${subject.id} is dispatchable.`
+                    : `Queue head is blocked${details.blockers ? `: ${queueBlockerText(details.blockers)}` : "."}`
+                  : params.action === "update"
+                    ? `Queue item ${subject?.id ?? params.queueItemId} is now ${subject?.state}.`
+                    : `Queue has ${((result as { items?: QueueItem[] }).items ?? []).length} item(s).`,
+          },
+        ],
+        details: result,
+      };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_plan",
+    label: "Herdr Plan",
+    description:
+      "Create a durable local plan manifest for Herdr-managed agent lanes, optionally linked to a dispatchable queue item.",
+    promptSnippet: "Plan a Herdr-only delegated agent workflow.",
+    promptGuidelines: [
+      "Use herdr_plan before herdr_dispatch; select any documented Herdr agentKind when needed. Pass queueItemId to consume the clear queue head and copy its objective/notes. Supply authorizationPolicy only for the narrowly validated BB-029 local-only scope.",
+    ],
+    parameters: Type.Object(
+      {
+        objective: Type.Optional(Type.String()),
+        queueItemId: Type.Optional(Type.String({ minLength: 1 })),
         lanes: Type.Optional(
           Type.Array(
             Type.Union([
@@ -5234,6 +5731,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         params.authorizationPolicy,
         params.agentKind,
         params.launchProfile,
+        params.queueItemId,
       );
       return {
         content: [

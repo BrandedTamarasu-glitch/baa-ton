@@ -68,6 +68,14 @@ const POST_COMPLETION_STATUSES = new Set([
   "operator-closed",
 ]);
 const POST_COMPLETION_OBSERVATION_STATUSES = new Set(["done", "idle"]);
+const QUEUE_SCHEMA_VERSION = 1;
+const QUEUE_ITEM_STATES = new Set([
+  "pending",
+  "dispatched",
+  "verified",
+  "landed",
+  "dropped",
+]);
 const SUPERVISOR_STATES = new Set(["running", "stopped", "paused"]);
 const AGENT_STATUSES = new Set([
   "idle",
@@ -967,6 +975,112 @@ function signalParentGoalMismatch(manifest, routedWorkflows, timestamp = now()) 
   return changed;
 }
 
+function queueStore(manifest) {
+  if (!("queue" in manifest) || manifest.queue === undefined) return undefined;
+  let value = manifest.queue;
+  if (Array.isArray(value)) value = { version: QUEUE_SCHEMA_VERSION, items: value };
+  assertObjectShape(value, "manifest.queue", ["version", "items"]);
+  assert(value.version === QUEUE_SCHEMA_VERSION, "manifest.queue.version must be 1.");
+  assert(Array.isArray(value.items), "manifest.queue.items must be an array.");
+  const ids = new Set();
+  for (const [index, item] of value.items.entries()) {
+    const label = `manifest.queue.items[${index}]`;
+    assertObjectShape(
+      item,
+      label,
+      ["version", "id", "objective", "files", "after", "state", "createdAt", "updatedAt"],
+      ["notes", "workflowId", "evidence"],
+    );
+    assert(item.version === QUEUE_SCHEMA_VERSION, `${label}.version must be 1.`);
+    assert(/^queue-[0-9a-f]{8}$/i.test(item.id), `${label}.id must match queue-<8hex>.`);
+    assert(!ids.has(item.id), `Duplicate queue item ID: ${item.id}.`);
+    ids.add(item.id);
+    assertString(item.objective, `${label}.objective`);
+    assert(Array.isArray(item.files), `${label}.files must be an array.`);
+    assert(item.files.every((file) => typeof file === "string" && file.trim()), `${label}.files must contain non-empty strings.`);
+    assert(Array.isArray(item.after), `${label}.after must be an array.`);
+    assert(item.after.every((dependency) => typeof dependency === "string" && dependency), `${label}.after must contain queue item IDs.`);
+    assert(QUEUE_ITEM_STATES.has(item.state), `${label}.state is invalid.`);
+    assertString(item.createdAt, `${label}.createdAt`);
+    assertString(item.updatedAt, `${label}.updatedAt`);
+    if ("notes" in item) assert(typeof item.notes === "string", `${label}.notes must be a string.`);
+    if ("workflowId" in item) assert(typeof item.workflowId === "string", `${label}.workflowId must be a string.`);
+    if ("evidence" in item) assert(typeof item.evidence === "string", `${label}.evidence must be a string.`);
+  }
+  for (const item of value.items)
+    for (const dependency of item.after)
+      assert(ids.has(dependency), `Queue item ${item.id} depends on unknown item ${dependency}.`);
+  const normalized = { version: QUEUE_SCHEMA_VERSION, items: value.items };
+  manifest.queue = normalized;
+  return normalized;
+}
+
+function queueHeadReadiness(manifest, manifestPath) {
+  const queue = queueStore(manifest);
+  const item = queue?.items.find((candidate) => candidate.state === "pending");
+  const blockers = { dependencies: [], files: [] };
+  if (!item) return { item, blockers };
+  for (const dependencyId of item.after) {
+    const dependency = queue.items.find((candidate) => candidate.id === dependencyId);
+    if (!dependency || !["landed", "dropped"].includes(dependency.state))
+      blockers.dependencies.push({ id: dependencyId, ...(dependency ? { state: dependency.state } : {}) });
+  }
+  const rootCwd = dirname(dirname(dirname(resolve(manifestPath))));
+  const paths = new Map(item.files.map((file) => [resolve(rootCwd, file), file]));
+  if (paths.size > 0) {
+    for (const other of queue.items) {
+      if (other.id === item.id || ["landed", "dropped"].includes(other.state)) continue;
+      const workflow = Array.isArray(manifest.workflows)
+        ? manifest.workflows.find((candidate) => candidate.queueItemId === other.id)
+        : undefined;
+      const undischarged =
+        other.state === "dispatched" ||
+        other.state === "verified" ||
+        Boolean(other.workflowId || (workflow && ["planned", "starting", "running", "blocked", "dispatch-failed"].includes(workflow.status)));
+      if (!undischarged) continue;
+      const overlap = other.files.filter((file) => paths.has(resolve(rootCwd, file)));
+      if (overlap.length) blockers.files.push({ itemId: other.id, files: overlap });
+    }
+  }
+  return { item, blockers };
+}
+
+function queueObjectiveSlug(objective) {
+  const stopwords = new Set(["a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "into", "is", "it", "of", "on", "or", "that", "the", "this", "these", "those", "to", "via", "with"]);
+  const words = (objective ?? "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .match(/[a-z0-9]+/g)
+    ?.filter((word) => !stopwords.has(word)) ?? [];
+  return words.slice(0, 5).join("-").slice(0, 32).replace(/-+$/, "") || "queue";
+}
+
+function queueBlockerText(blockers) {
+  const parts = [];
+  if (blockers.dependencies.length)
+    parts.push(`dependencies: ${blockers.dependencies.map((item) => `${item.id}${item.state ? ` (${item.state})` : ""}`).join(", ")}`);
+  if (blockers.files.length)
+    parts.push(`files: ${blockers.files.map((item) => `${item.itemId} [${item.files.join(", ")}]`).join(", ")}`);
+  return parts.join("; ");
+}
+
+function queueOriginId(workflow, queue) {
+  if (typeof workflow.queueItemId === "string" && workflow.queueItemId) return workflow.queueItemId;
+  return queue?.items.find((item) => item.workflowId === workflow.id)?.id;
+}
+
+function signalParentGoalForQueue(manifest, item, timestamp = now()) {
+  if (!("parentGoal" in manifest)) return false;
+  const goal = validateParentGoal(manifest.parentGoal);
+  const nextAction = `Review queue head now dispatchable: ${item.id} ${queueObjectiveSlug(item.objective)}.`;
+  if (goal.status === "review-requested" && goal.nextAction === nextAction) return false;
+  goal.status = "review-requested";
+  goal.nextAction = nextAction;
+  goal.updatedAt = timestamp;
+  return true;
+}
+
 function pendingParentAction(manifest, workflows = manifest.workflows) {
   const actions = [];
   const add = (request, kind, workflowId) => {
@@ -1416,14 +1530,18 @@ function wrapSidebarText(text, width = 20) {
   return lines;
 }
 
-function parentGoalSidebarTokens(goal) {
+function parentGoalSidebarTokens(goal, queue) {
   const next = wrapSidebarText(goal.nextAction).slice(0, 3);
+  const pending = queue?.items.filter((item) => item.state === "pending") ?? [];
   return {
     herdr_role: "🐕 root",
     herdr_goal_status: `Goal: ${goal.status.replaceAll("-", " ")}`,
     herdr_goal_next_1: next[0] ? `Next: ${next[0]}` : null,
     herdr_goal_next_2: next[1] ?? null,
     herdr_goal_next_3: next[2] ?? null,
+    ...(queue
+      ? { herdr_queue: `${pending.length} pending · head ${pending[0] ? queueObjectiveSlug(pending[0].objective) : "none"}` }
+      : {}),
   };
 }
 
@@ -1431,14 +1549,14 @@ function parentGoalMobileLabel(goal) {
   return `Goal: ${goal.status.replaceAll("-for-event", "").replaceAll("-", " ")}`;
 }
 
-async function publishParentGoalSidebar(goal, root, herdr) {
+async function publishParentGoalSidebar(goal, root, herdr, queue) {
   // Display-only metadata is best effort: delivery or terminal failures must
   // never change the durable controller outcome.
   try {
     await herdr.request("pane.report_metadata", {
       pane_id: root.pane_id,
       source: OWNER,
-      tokens: parentGoalSidebarTokens(goal),
+      tokens: parentGoalSidebarTokens(goal, queue),
       // The compact/mobile switcher ignores sidebar rows but shows state labels.
       state_labels: {
         idle: parentGoalMobileLabel(goal),
@@ -1549,6 +1667,115 @@ async function deliverChildMessageWake(message, root, herdr) {
       reason: `root_prompt_failed:${error instanceof Error ? error.message : String(error)}`,
     };
   }
+}
+
+function queueHeadWakeText(item) {
+  return [
+    `queue head now dispatchable: ${item.id} ${queueObjectiveSlug(item.objective)}`,
+    `Review the durable queue item ${item.id} before planning or dispatching it.`,
+    "This notification is observational only: do not dispatch, resume, close, push, merge, create a PR, deploy, or mutate production from it.",
+  ].join(" ");
+}
+
+async function deliverQueueHeadWake(item, root, herdr) {
+  try {
+    const rootInfo = await herdr.request("agent.get", { target: root.target });
+    if (!rootMatches(rootInfo, root))
+      return { status: "pending", reason: "recorded_root_unavailable_or_mismatched" };
+  } catch (error) {
+    if (unavailable(error))
+      return { status: "pending", reason: `root_unavailable:${error.code}` };
+    return { status: "uncertain", reason: `root_check_failed:${error instanceof Error ? error.message : String(error)}` };
+  }
+  try {
+    await herdr.request("agent.prompt", {
+      target: root.target,
+      text: queueHeadWakeText(item),
+    });
+    return { status: "delivered", reason: "agent_prompt_accepted" };
+  } catch (error) {
+    if (error?.sent)
+      return { status: "uncertain", reason: `root_prompt_ambiguous:${error instanceof Error ? error.message : String(error)}` };
+    if (unavailable(error))
+      return { status: "pending", reason: `root_unavailable:${error.code}` };
+    return { status: "uncertain", reason: `root_prompt_failed:${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+async function processQueueHeadWake({
+  manifestPath,
+  manifest,
+  workflow,
+  mapping,
+  configDir,
+  herdr,
+  timestamp = now(),
+}) {
+  if (!workflowIsTerminal(workflow)) return undefined;
+  const queue = queueStore(manifest);
+  const originId = queueOriginId(workflow, queue);
+  const origin = queue?.items.find((item) => item.id === originId);
+  if (!origin || origin.state !== "landed") return undefined;
+  const readiness = queueHeadReadiness(manifest, manifestPath);
+  if (!readiness.item || readiness.blockers.dependencies.length || readiness.blockers.files.length)
+    return { status: "blocked", item: readiness.item, blockers: readiness.blockers };
+  const logicalKey = `queue-head:${routeScope(mapping.orchestrator, manifestPath)}:${readiness.item.id}`;
+  const occurrenceId = sha256(logicalKey);
+  const changed = signalParentGoalForQueue(manifest, readiness.item, timestamp);
+  if (changed) await atomicWriteJson(manifestPath, manifest);
+  const inboxMessage = await persistControllerMessage(configDir, {
+    logicalKey,
+    occurrenceId,
+    kind: "queue-head",
+    from: inboxIdentity(
+      mapping.orchestrator.root.workspace_id,
+      mapping.orchestrator.root.pane_id,
+      mapping.orchestrator.root.agent_kind,
+    ),
+    to: inboxIdentity(
+      mapping.orchestrator.root.workspace_id,
+      mapping.orchestrator.root.pane_id,
+      mapping.orchestrator.root.agent_kind,
+    ),
+    payload: {
+      queueItemId: readiness.item.id,
+      objective: readiness.item.objective,
+      blockers: readiness.blockers,
+    },
+    wake: true,
+    dedupe: "occurrence",
+  });
+  if (inboxMessage) {
+    const prior = inboxMessage.message.delivery?.status;
+    if (prior === "delivered" || prior === "uncertain")
+      return { status: prior, item: readiness.item, deduplicated: true };
+    if (prior === "sending") {
+      await markDelivery(
+        inboxMessage.path,
+        inboxMessage.message.occurrence_id,
+        "uncertain",
+        { reason: "interrupted_root_delivery_requires_parent_review" },
+      );
+      return { status: "uncertain", item: readiness.item, deduplicated: true };
+    }
+    await markDelivery(
+      inboxMessage.path,
+      inboxMessage.message.occurrence_id,
+      "sending",
+      { attempts: (inboxMessage.message.delivery?.attempts ?? 0) + 1 },
+    );
+  }
+  const outcome = await deliverQueueHeadWake(
+    readiness.item,
+    mapping.orchestrator.root,
+    herdr,
+  );
+  await finishControllerMessage(
+    inboxMessage,
+    outcome.status,
+    { attempts: inboxMessage?.message.delivery?.attempts ?? 1, reason: outcome.reason },
+  );
+  return { ...outcome, item: readiness.item, deduplicated: false };
 }
 
 function signalParentGoalForMessage(manifest, message, timestamp = now()) {
@@ -1826,6 +2053,7 @@ async function persistControllerMessage(stateDir, {
   to,
   payload,
   wake = false,
+  dedupe = "occurrence",
 }) {
   // Older diagnostic fixtures and pre-task registrations may describe a
   // cross-workspace child. They remain supported by the controller's legacy
@@ -1842,14 +2070,14 @@ async function persistControllerMessage(stateDir, {
       to,
       payload,
     }),
-    dedupe: "occurrence",
+    dedupe,
   });
   if (wake)
     await enqueueWakeHint(path, {
       recipient: to,
       occurrenceId: stored.message.occurrence_id,
     });
-  return { path, message: stored.message };
+  return { path, message: stored.message, created: stored.created };
 }
 
 async function finishControllerMessage(stored, status, details = {}) {
@@ -1915,6 +2143,32 @@ export async function runSupervisorTick({
           config.owner,
         ),
       );
+      // Queue continuation uses this existing event-driven tick as its retry
+      // point. A landed predecessor can wake only a clear ordered head.
+      for (const [workflowIndex, stored] of matchedWorkflows.entries()) {
+        const candidate = workflows[workflowIndex];
+        const queueWake = await processQueueHeadWake({
+          manifestPath,
+          manifest,
+          workflow: stored,
+          mapping: { orchestrator, workflow: candidate, lane: candidate.lanes[0] },
+          configDir,
+          herdr: api,
+          timestamp,
+        });
+        if (
+          queueWake &&
+          queueWake.status !== "blocked" &&
+          !queueWake.deduplicated
+        )
+          pendingWakes.push({
+            manifestPath,
+            workflowId: stored.id,
+            kind: "queue-head",
+            queueItemId: queueWake.item?.id,
+            status: queueWake.status,
+          });
+      }
       // Herdr's sidebar rows are selected by canonical agent kind, while
       // pane.report_metadata supplies the per-pane role/workflow breadcrumb.
       // The display-only publication runs in finally, after lifecycle work,
@@ -1930,6 +2184,7 @@ export async function runSupervisorTick({
             validateParentGoal(manifest.parentGoal),
             orchestrator.root,
             api,
+            queueStore(manifest),
           );
       }
       // A terminal parent goal must not silently coexist with a newly routed
@@ -1942,6 +2197,7 @@ export async function runSupervisorTick({
             validateParentGoal(manifest.parentGoal),
             orchestrator.root,
             api,
+            queueStore(manifest),
           );
       }
       // Event-driven pending-outbox reconciliation. A lane wake that could
@@ -2050,6 +2306,7 @@ export async function runSupervisorTick({
               validateParentGoal(manifest.parentGoal),
               orchestrator.root,
               api,
+              queueStore(manifest),
             );
         }
       }
@@ -2415,6 +2672,7 @@ export async function handleHook({
       : ledger.events.find((entry) => entry.identity === identity);
     const created = !record;
     let inboxMessage;
+    let queueWake;
     if (!record) {
       const classification = await classifyEvent(event, mapping, api, workflow);
       record = newRecord(event, mapping, classification, identity);
@@ -2451,6 +2709,7 @@ export async function handleHook({
           validateParentGoal(manifest.parentGoal),
           mapping.orchestrator.root,
           api,
+          queueStore(manifest),
         );
     } else {
       const userActionChanged = signalParentGoalForUserAction(manifest);
@@ -2465,11 +2724,22 @@ export async function handleHook({
             validateParentGoal(manifest.parentGoal),
             mapping.orchestrator.root,
             api,
+            queueStore(manifest),
           );
       }
     }
+    // A queue continuation is evaluated after every mapped lifecycle hook;
+    // inbox occurrence dedupe makes repeated post-completion observations safe.
+    queueWake = await processQueueHeadWake({
+      manifestPath: mapping.workflow.manifest_path,
+      manifest,
+      workflow,
+      mapping,
+      configDir,
+      herdr: api,
+    });
     if (!ACTIONABLE_CLASSIFICATIONS.has(record.classification)) {
-      return { accepted: true, deduplicated: !created, record };
+      return { accepted: true, deduplicated: !created, record, queueWake };
     }
     if (
       record.wake.status === "delivered" ||
@@ -2482,7 +2752,7 @@ export async function handleHook({
         status: "uncertain",
         reason: "interrupted_root_delivery_requires_parent_review",
       });
-      return { accepted: true, deduplicated: true, record };
+      return { accepted: true, deduplicated: true, record, queueWake };
     }
     inboxMessage ??= await persistControllerMessage(configDir, {
       logicalKey: `lane-event:${routeScope(mapping.orchestrator, mapping.workflow.manifest_path)}:${record.workflow_id}/${record.lane_id}/${record.classification}`,
@@ -2522,7 +2792,7 @@ export async function handleHook({
       outcome.status,
       { attempts: record.wake.attempts, reason: outcome.reason },
     );
-    return { accepted: true, deduplicated: !created, record };
+    return { accepted: true, deduplicated: !created, record, queueWake };
   } finally {
     await release();
   }

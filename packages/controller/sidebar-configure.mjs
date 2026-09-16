@@ -63,6 +63,7 @@ function goalRows() {
     '[{ token = "$herdr_goal_next_1", fg = "#a99e92", bold = false, dim = false }]',
     '[{ token = "$herdr_goal_next_2", fg = "#a99e92", bold = false, dim = false }]',
     '[{ token = "$herdr_goal_next_3", fg = "#a99e92", bold = false, dim = false }]',
+    '[{ token = "$herdr_queue", fg = "#a99e92", bold = false, dim = false }]',
   ];
 }
 
@@ -88,7 +89,17 @@ export function configureSidebar(text) {
     const close = matchingBracket(text, open);
     if (close > sectionEnd) throw new Error(`Agent row ${match[1]} escapes its TOML section.`);
     const content = text.slice(open + 1, close);
-    if (content.includes(START) && content.includes(END)) continue;
+    if (content.includes(START) && content.includes(END)) {
+      // Repair older Baa-ton fences after the queue row was introduced, while
+      // leaving a fully configured fence byte-for-byte idempotent.
+      if (!content.includes("$herdr_queue"))
+        replacements.push({
+          start: open + 1,
+          end: close,
+          value: content.replace(END, `    ${goalRows().at(-1)},\n    ${END}`),
+        });
+      continue;
+    }
     const trimmed = content.trimEnd();
     const separator = trimmed.trim() ? "," : "";
     replacements.push({
