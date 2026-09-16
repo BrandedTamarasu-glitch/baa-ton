@@ -99,12 +99,17 @@ export function opencodeLaunchAdapter(
       startupAttestation: true,
       supportsSessionPersistence: true,
       supportsNativeSessionIdentity: true,
+      // OpenCode's adapter only receives launch/config paths; its model list
+      // is not an authoritative live provider catalog at this boundary.
+      supportsLiveCapabilityDiscovery: false,
+      supportsStartupHandshake: true,
     },
     lifecycle: "screen",
     // OpenCode creates its native session lazily, so the dispatcher must
     // submit the first turn that causes the attest plugin and MCP bridge to
     // initialize. Keep this exact text stable: it is deliberately not an
-    // assignment or a harness-specific wrapper.
+    // assignment or a harness-specific wrapper. Live catalog discovery is
+    // explicitly unsupported because no authoritative API is exposed here.
     startupHandshake: "Reply with exactly: READY",
     attestationComplete: (attestation: unknown): boolean => {
       const hello = attestation as {

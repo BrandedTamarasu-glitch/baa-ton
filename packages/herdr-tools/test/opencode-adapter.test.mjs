@@ -23,6 +23,9 @@ test("opencode adapter generates project config, plugin, and model mapping", asy
   try {
     const adapter = opencodeLaunchAdapter({ scratchDirectory: scratch });
     assert.equal(adapter.startupHandshake, "Reply with exactly: READY");
+    assert.equal(adapter.capabilities.supportsLiveCapabilityDiscovery, false);
+    assert.equal(adapter.capabilities.supportsStartupHandshake, true);
+    assert.equal(adapter.discoverCatalog, undefined);
     adapter.preflight(profile);
     const args = adapter.launchArguments(
       profile,

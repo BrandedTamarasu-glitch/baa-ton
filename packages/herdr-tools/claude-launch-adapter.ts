@@ -83,6 +83,12 @@ export function claudeLaunchAdapter(
       startupAttestation: true,
       supportsSessionPersistence: true,
       supportsNativeSessionIdentity: true,
+      // Claude Code has no stable machine-readable live model/auth catalog API
+      // at this adapter boundary; startup validity is still fail-closed.
+      supportsLiveCapabilityDiscovery: false,
+      // SessionStart emits the startup proof without a first turn. Do not send
+      // an unnecessary prompt or imply that a handshake is supported.
+      supportsStartupHandshake: false,
     },
     // Honest capability reporting: Herdr's Claude integration exposes session
     // identity, but lifecycle state is screen-derived, not native.

@@ -29,6 +29,10 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
       scratchDirectory: scratch,
     });
     adapter.preflight(profile);
+    assert.equal(adapter.startupHandshake, undefined);
+    assert.equal(adapter.capabilities.supportsLiveCapabilityDiscovery, false);
+    assert.equal(adapter.capabilities.supportsStartupHandshake, false);
+    assert.equal(adapter.discoverCatalog, undefined);
     const args = adapter.launchArguments(profile);
     assert.equal(args[args.indexOf("--model") + 1], "claude-sonnet-5");
     assert.equal(args[args.indexOf("--effort") + 1], "high");

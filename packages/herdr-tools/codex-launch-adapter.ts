@@ -70,7 +70,7 @@ function filterProtocolOperations(operations: unknown): ProtocolOperation[] {
 }
 
 /** Codex lanes run on the same openai-codex subscription as Pi. The startup
- * proof turn is a handshake positional prompt; Codex's `notify` hook writes
+ * proof turn is the adapter's startupHandshake; Codex's `notify` hook writes
  * the attestation (thread-id) when that turn completes, and the MCP bridge
  * merges the live protocol operations. MCP children do not inherit pane env,
  * so the intent path is passed explicitly through mcp_servers env config. */
@@ -84,10 +84,18 @@ export function codexLaunchAdapter(
       startupAttestation: true,
       supportsSessionPersistence: true,
       supportsNativeSessionIdentity: true,
+      // Codex has no stable machine-readable live model/auth catalog API at
+      // this adapter boundary; static config is not a discovery substitute.
+      supportsLiveCapabilityDiscovery: false,
+      supportsStartupHandshake: true,
     },
     // Honest capability reporting: session identity is integrated, but Codex
     // lifecycle state in Herdr is screen-derived.
     lifecycle: "screen",
+    // Codex's notify attestation is emitted only after a turn completes. Keep
+    // the proof turn explicit in the contract so dispatch applies its durable
+    // terminal-input fence instead of hiding it in launch arguments.
+    startupHandshake: "Reply with exactly: READY",
     attestationComplete: (attestation: unknown): boolean => {
       const hello = attestation as {
         sessionId?: unknown;
@@ -138,9 +146,6 @@ export function codexLaunchAdapter(
         // needs must be passed explicitly, including the session marker.
         "-c",
         'mcp_servers.herdr-orchestrator.env.HERDR_ENV="1"',
-        // Handshake positional prompt: the startup-proof turn. Assignment is
-        // delivered only after its notify attestation verifies.
-        "Reply with exactly: READY",
       ];
     },
     verifyStartup(nativeAgent: unknown, attestation: unknown): StartupProof {

@@ -32,10 +32,15 @@ export type HarnessLifecycle = "native" | "screen" | "unavailable";
  * Boolean capabilities are intentionally open-ended so a harness can publish
  * new provider features without changing this contract version. The lifecycle
  * tier is metadata rather than a boolean and stays explicit on the adapter.
+ * Optional operation flags make an omitted optional operation deliberate:
+ * `false` means unsupported (and must have a reason in the adapter audit), not
+ * an accidental omission.
  */
 export type HarnessCapabilityFlags = Record<string, boolean | undefined> & {
   startupAttestation: boolean;
   supportsSessionPersistence: boolean;
+  supportsLiveCapabilityDiscovery?: boolean;
+  supportsStartupHandshake?: boolean;
 };
 
 export type StartupProof = {
@@ -86,6 +91,26 @@ export interface HarnessLaunchAdapter {
   verifyStartup(nativeAgent: unknown, attestation: unknown): StartupProof;
 }
 
+/*
+ * SOURCE PARITY AUDIT
+ *
+ * Every operation in the version-1 adapter surface is either present or
+ * explicitly unsupported below. `GAP-fixed-now` records work done by this
+ * parity pass; an unsupported discovery operation is represented by the
+ * adapter's `capabilities.supportsLiveCapabilityDiscovery: false`, with its
+ * reason next to that declaration. The startup-handshake flag follows the
+ * same rule for harnesses that do not need a first turn.
+ *
+ * | harness  | preflight  | launchArguments | verifyStartup | startupHandshake                                      | discoverCatalog                                                    | capabilities flags |
+ * | codex    | implemented | implemented     | implemented   | GAP-fixed-now (implemented adapter field; READY turn) | explicitly-unsupported-with-reason (no stable live catalog API)    | implemented; required=true, discovery=false, handshake=true |
+ * | claude   | implemented | implemented     | implemented   | explicitly-unsupported-with-reason (SessionStart)   | explicitly-unsupported-with-reason (no stable live catalog API)    | implemented; required=true, discovery=false, handshake=false |
+ * | opencode | implemented | implemented     | implemented   | implemented (READY turn for lazy sessions)          | explicitly-unsupported-with-reason (no authoritative live catalog) | implemented; required=true, discovery=false, handshake=true |
+ *
+ * Pi remains the reference implementation: it implements discoverCatalog
+ * directly (the optional flag is unnecessary when the method is present); it
+ * does not require a startup handshake. See each adapter for the fail-closed
+ * reason attached to every unsupported operation.
+ */
 export const REQUIRED_ADAPTER_CAPABILITIES = [
   "startupAttestation",
   "supportsSessionPersistence",

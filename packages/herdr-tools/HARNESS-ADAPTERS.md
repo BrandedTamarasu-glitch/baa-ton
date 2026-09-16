@@ -7,8 +7,9 @@
 1. `preflight(profile)`: validate exact installed provider/model/thinking and the explicitly requested authentication policy. Never substitute a provider, model, or billing route.
 2. `launchArguments(profile, source)`: harness-specific CLI/config arguments; no workspace creation or controller-state mutation.
 3. `verifyStartup(nativeAgent, attestation)`: compare native identity and attestation and return a normalized `StartupProof`. Sessions may be native paths **or IDs**. Normalize harness tool aliases to the common protocol operations.
-4. Optional `startupHandshake`: an exact first prompt for harnesses that create a session lazily. Dispatch sends it once, after native agent start and before startup proof, with the same uncertain-terminal-input fence as assignment prompts.
-5. Explicit capabilities: distinguish native session identity, native versus screen-derived lifecycle, and verified startup attestation. Detection or a screen-derived idle state is not launch qualification.
+4. Optional `discoverCatalog(profile)`: return only live provider truth with the documented cache-key identity. If the harness exposes no authoritative discovery API at this boundary, omit the method and set `capabilities.supportsLiveCapabilityDiscovery: false` with the reason; never substitute a static registry snapshot.
+5. Optional `startupHandshake`: an exact first prompt for harnesses that create a session lazily. Dispatch sends it once, after native agent start and before startup proof, with the same uncertain-terminal-input fence as assignment prompts. A harness that does not need a first turn declares `supportsStartupHandshake: false`.
+6. Explicit capabilities: distinguish native session identity, native versus screen-derived lifecycle, verified startup attestation, and the optional operations above. Detection or a screen-derived idle state is not launch qualification.
 
 The common dispatcher additionally enforces workspace/pane/agent identity, startup nonce, bridge source, exact profile, required operations, and stable session identity. Registry registration is trusted local code, not evidence by itself: adapters need conformance tests and live qualification.
 
@@ -17,15 +18,165 @@ The common dispatcher additionally enforces workspace/pane/agent identity, start
 | Adapter | Source/local tests | Live qualification |
 | --- | --- | --- |
 | Pi / openai-codex subscription | Implemented in `pi-launch-adapter.ts`; maps Pi tool names to the neutral `plan`/`dispatch`/`complete` operations | Proven: `herdr-f3afd260` and `herdr-fc6d2a3e` dispatched with verified startup proof and durable completion receipts |
-| Codex | Synthetic ID-session adapter with native tool names proves normalized operations and shared dispatch sequencing without editing the core | No production launch adapter registered |
+| Synthetic Codex fixture (test-only) | The dispatch regression uses an ID-session adapter with native tool names to prove normalized operations and shared sequencing without editing the core | Not production qualification; the registered Codex adapter is listed below |
 | Missing-capability adapter | Registry regression rejects missing `supportsSessionPersistence` before topology mutation | Not launch-qualified |
-| Codex / openai-codex subscription | Implemented in `codex-launch-adapter.ts` (+ `codex-startup-attest.mjs` notify hook with thread-id attestation, handshake positional proof turn, per-invocation `-c` config incl. MCP env wiring, workspace-write sandbox): effort ladder maps 1:1 | Qualified live (`herdr-44fa8053`, items 3+6+broker, 17/17 serial, committed d3816c8). Known limitation: codex does not respawn dead MCP servers (a killed bridge orphans the lane tools for the session) and the workspace-write sandbox cannot write linked worktree git metadata, so lanes cannot self-commit or always reach the completion receipt; parent-proxy commit + operator reconciliation apply |
-| OpenCode / openai-codex subscription | Implemented in `opencode-launch-adapter.ts` (+ generated attest plugin and project `opencode.json`): model mapped `openai/gpt-5.6-luna`, reasoningEffort option, conservative bash permissions (push/merge/PR denied). The adapter declares the exact `Reply with exactly: READY` startup handshake so lazy session creation is automatic; the bridge merges operations independently | Qualified live (`herdr-c5795503`): manual READY handshake previously matched native session/plugin attestation and delivered assignment; source-level follow-up now fences and dispatches that handshake automatically |
-| Claude Code / claude-code subscription | Implemented in `claude-launch-adapter.ts` (+ `claude-startup-attest.mjs` SessionStart hook, `mcp-server.mjs` operations merge, `attest-merge.mjs`): exact model + `--effort` (identical ladder), generated settings/mcp config, conservative lane permissions (push/merge/PR denied), session attestation matched against native identity | In flight: first live dispatch qualifies it (durable-core batch) |
+| Codex / openai-codex subscription | Implemented in `codex-launch-adapter.ts` (+ `codex-startup-attest.mjs` notify hook with thread-id attestation, explicit `startupHandshake` proof turn, per-invocation `-c` config incl. MCP env wiring, workspace-write sandbox): effort ladder maps 1:1. Live catalog discovery is explicitly unsupported (`supportsLiveCapabilityDiscovery: false`): Codex exposes no stable authoritative catalog API at this adapter boundary, so static config is not used as a substitute | Qualified live (`herdr-44fa8053`, items 3+6+broker, 17/17 serial, committed d3816c8). Known limitation: codex does not respawn dead MCP servers (a killed bridge orphans the lane tools for the session) and the workspace-write sandbox cannot write linked worktree git metadata, so lanes cannot self-commit or always reach the completion receipt; parent-proxy commit + operator reconciliation apply |
+| OpenCode / openai-codex subscription | Implemented in `opencode-launch-adapter.ts` (+ generated attest plugin and project `opencode.json`): model mapped `openai/gpt-5.6-luna`, reasoningEffort option, conservative bash permissions (push/merge/PR denied). The adapter declares the exact `Reply with exactly: READY` startup handshake so lazy session creation is automatic; the bridge merges operations independently. Live catalog discovery is explicitly unsupported (`supportsLiveCapabilityDiscovery: false`): the adapter has no authoritative live provider catalog API | Qualified live (`herdr-c5795503`): manual READY handshake previously matched native session/plugin attestation and delivered assignment; source-level follow-up now fences and dispatches that handshake automatically |
+| Claude Code / claude-code subscription | Implemented in `claude-launch-adapter.ts` (+ `claude-startup-attest.mjs` SessionStart hook, `mcp-server.mjs` operations merge, `attest-merge.mjs`): exact model + `--effort` (identical ladder), generated settings/mcp config, conservative lane permissions (push/merge/PR denied), session attestation matched against native identity. SessionStart is the startup proof, so `supportsStartupHandshake: false`; live catalog discovery is explicitly unsupported (`supportsLiveCapabilityDiscovery: false`) because no stable authoritative catalog API is exposed at this adapter boundary | In flight: first live dispatch qualifies it (durable-core batch) |
 
 Unregistered adapters fail before topology mutation. The synthetic Codex test is **not** a claim that real Codex startup is qualified.
 
-`launch-profile.ts` validates common shape only; provider qualification belongs to the adapter. Subscription-only auth is the current policy, not an automatic fallback. The present workflow schema uses one profile per workflow; heterogeneous profiles require a versioned per-lane schema extension. Capability-discovery evidence is recorded today only for adapters implementing `discoverCatalog` (Pi); other agent kinds dispatch without discovery evidence until their adapters implement the operation.
+`launch-profile.ts` validates common shape only; provider qualification belongs to the adapter. Subscription-only auth is the current policy, not an automatic fallback. The present workflow schema uses one profile per workflow; heterogeneous profiles require a versioned per-lane schema extension. Pi is the only adapter with live `discoverCatalog` evidence today. Codex, Claude, and OpenCode deliberately omit that optional method and declare `supportsLiveCapabilityDiscovery: false` with an adapter-level reason; qualification records that declaration rather than treating the omission as a silent gap.
+
+## Live qualification procedure
+
+The parent executes one bounded, single-lane run per harness from the verified
+root. Do not run these dispatches from an adapter lane. Use a clean existing
+checkout, set `readOnly: true`, and keep the objective limited to startup proof,
+protocol-tool reachability, and a completion receipt; the lane must not edit,
+commit, push, merge, create a PR, deploy, delegate, or close resources.
+
+The checked-in Codex qualification evidence uses `openai-codex/gpt-5.6-luna`;
+that is the qualified equivalent to `openai-codex/gpt-5.2-codex` when the latter
+is not installed. Use `high` for this parity proof (the adapter maps it
+one-to-one). Claude uses the exact `claude-code/claude-sonnet-5/high` profile.
+OpenCode uses the same `openai-codex/gpt-5.6-luna/high` profile and maps it to
+OpenCode's `openai/gpt-5.6-luna` model.
+
+### Bounded proof objective
+
+Use this template, replacing only `<harness>` and the returned workflow ID:
+
+> Live-qualify the `<harness>` adapter only. Start this one read-only lane,
+> verify native pane/workspace/session identity, exact launch profile, startup
+> nonce/source, and all protocol operations plan/dispatch/complete; then report
+> one completion receipt. Do not edit files, delegate, push, merge, create a
+> PR, deploy, or close resources.
+
+For each harness, the parent makes these exact tool calls (the `herdr_plan`
+result's `details.workflow.id` is the `<workflow-id>` passed to dispatch):
+
+```js
+// Codex: provider/model/thinking/auth =
+// openai-codex / gpt-5.6-luna / high / subscription
+const plan = await herdr_plan({
+  objective: "Live-qualify the codex adapter only: one read-only startup/protocol/receipt proof; no edits or resource closure.",
+  worktreeCwd: "<existing-clean-checkout>",
+  lanes: [{
+    objective: "Verify native identity, exact profile, startup proof, plan/dispatch/complete, and report one receipt; do not edit or delegate.",
+    readOnly: true,
+    agentKind: "codex",
+    launchProfile: {
+      provider: "openai-codex",
+      model: "gpt-5.6-luna",
+      thinking: "high",
+      auth: "subscription"
+    }
+  }]
+});
+await herdr_dispatch({ workflowId: plan.details.workflow.id, execute: true });
+```
+
+```js
+// Claude: claude-code / claude-sonnet-5 / high / subscription
+const plan = await herdr_plan({
+  objective: "Live-qualify the claude adapter only: one read-only startup/protocol/receipt proof; no edits or resource closure.",
+  worktreeCwd: "<existing-clean-checkout>",
+  lanes: [{
+    objective: "Verify native identity, exact profile, SessionStart proof, plan/dispatch/complete, and report one receipt; do not edit or delegate.",
+    readOnly: true,
+    agentKind: "claude",
+    launchProfile: {
+      provider: "claude-code",
+      model: "claude-sonnet-5",
+      thinking: "high",
+      auth: "subscription"
+    }
+  }]
+});
+await herdr_dispatch({ workflowId: plan.details.workflow.id, execute: true });
+```
+
+```js
+// OpenCode: openai-codex / gpt-5.6-luna / high / subscription;
+// the adapter writes the OpenCode model as openai/gpt-5.6-luna.
+const plan = await herdr_plan({
+  objective: "Live-qualify the opencode adapter only: one read-only startup/protocol/receipt proof; no edits or resource closure.",
+  worktreeCwd: "<existing-clean-checkout>",
+  lanes: [{
+    objective: "Verify native identity, automatic READY handshake, exact profile, startup proof, plan/dispatch/complete, and report one receipt; do not edit or delegate.",
+    readOnly: true,
+    agentKind: "opencode",
+    launchProfile: {
+      provider: "openai-codex",
+      model: "gpt-5.6-luna",
+      thinking: "high",
+      auth: "subscription"
+    }
+  }]
+});
+await herdr_dispatch({ workflowId: plan.details.workflow.id, execute: true });
+```
+
+After dispatch, wait for the event-driven completion wake and call
+`herdr_observe({ workflowId: plan.details.workflow.id })` once to record the
+lane result. Capture all of the following in the parent receipt (without
+credentials or token contents):
+
+1. **Startup proof:** dispatch result, workflow/lane IDs, native `agent get`
+   identity, `.ready` attestation, pane/workspace binding, incarnation nonce,
+   source, exact profile, normalized `plan`/`dispatch`/`complete` operations,
+   and the stable native session path/ID.
+2. **Capability-discovery evidence:** Pi emits a live catalog and its
+   `cacheKey`. Codex, Claude, and OpenCode must emit *no fabricated catalog*;
+   record each adapter's `supportsLiveCapabilityDiscovery: false` and the
+   source comment explaining why discovery is explicitly unsupported. This is
+   the expected qualified result, not a missing evidence field.
+3. **Completion:** the child's durable `completionReceipt` and the parent
+   observation showing it delivered. If the harness limitation prevents a
+   child receipt, do not retry terminal input; record the dispatch evidence and
+   use the existing parent-proxy/operator-reconciliation procedure.
+4. **Focused regression:** from this checkout run
+   `env -u BAA_STARTUP_INTENT node --test packages/herdr-tools/test/<harness>-adapter.test.mjs`
+   (`codex`, `claude`, or `opencode`) and retain the pass count, plus the
+   source commit under test.
+
+Only after all four evidence groups are present should the parent replace the
+matrix cell with the corresponding wording below. A failed or incomplete run
+stays `Source/local tests: implemented; live qualification: pending` and must
+not be described as live-qualified.
+
+**Codex cell wording after success:**
+
+> Live qualified (`<workflow-id>`): exact `openai-codex/gpt-5.6-luna/high/subscription`
+> startup proof matched native Codex thread/rollout identity, workspace/pane,
+> nonce, source, and normalized protocol operations; automatic adapter
+> `startupHandshake` completed and a durable receipt was observed. Live catalog
+> discovery is explicitly unsupported (`supportsLiveCapabilityDiscovery: false`)
+> because no stable authoritative Codex catalog API is available at this boundary.
+> Preserve the existing no-MCP-respawn and workspace-write/git-metadata
+> limitations.
+
+**Claude cell wording after success:**
+
+> Live qualified (`<workflow-id>`): exact
+> `claude-code/claude-sonnet-5/high/subscription` startup proof from SessionStart
+> matched native Claude session identity, workspace/pane, nonce, source, and
+> normalized protocol operations; a durable receipt was observed. No startup
+> handshake is sent (`supportsStartupHandshake: false`); live catalog discovery
+> is explicitly unsupported (`supportsLiveCapabilityDiscovery: false`) because
+> no stable authoritative Claude catalog API is available at this boundary.
+
+**OpenCode cell wording after success:**
+
+> Live qualified (`<workflow-id>`): exact
+> `openai-codex/gpt-5.6-luna/high/subscription` startup proof matched native
+> OpenCode session identity, workspace/pane, nonce, source, and normalized
+> protocol operations; the adapter's automatic `Reply with exactly: READY`
+> handshake materialized the session and a durable receipt was observed. Live
+> catalog discovery is explicitly unsupported
+> (`supportsLiveCapabilityDiscovery: false`) because no authoritative live
+> provider catalog API is available at this boundary.
 
 ## Prior art: Paseo provider layer (design basis for contract evolution)
 

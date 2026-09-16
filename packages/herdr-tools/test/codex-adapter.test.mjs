@@ -21,12 +21,16 @@ const profile = {
   auth: "subscription",
 };
 
-test("codex launchArguments wires model, effort, notify, mcp env, and handshake", () => {
+test("codex launchArguments wires model, effort, notify, mcp env, and declares handshake", () => {
   const adapter = codexLaunchAdapter({
     bridge: "/bridge/mcp-server.mjs",
     attestHelper: "/bridge/codex-startup-attest.mjs",
   });
   adapter.preflight(profile);
+  assert.equal(adapter.startupHandshake, "Reply with exactly: READY");
+  assert.equal(adapter.capabilities.supportsLiveCapabilityDiscovery, false);
+  assert.equal(adapter.capabilities.supportsStartupHandshake, true);
+  assert.equal(adapter.discoverCatalog, undefined);
   const args = adapter.launchArguments(profile, "/src/index.ts", {
     startupIntentPath: "/intents/lane.json",
   });
@@ -41,7 +45,7 @@ test("codex launchArguments wires model, effort, notify, mcp env, and handshake"
     /mcp_servers\.herdr-orchestrator\.env\.BAA_STARTUP_INTENT="\/intents\/lane\.json"/,
   );
   assert.match(flat, /mcp_servers\.herdr-orchestrator\.env\.HERDR_ENV="1"/);
-  assert.equal(args[args.length - 1], "Reply with exactly: READY");
+  assert.equal(args.includes("Reply with exactly: READY"), false);
   assert.throws(
     () => adapter.launchArguments(profile, "/src/index.ts"),
     /startup intent path/,
