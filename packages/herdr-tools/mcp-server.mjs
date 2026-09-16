@@ -556,6 +556,10 @@ const ctx = {
   hasUI: false,
   modelRegistry,
   ui: {
+    // The JSON MCP bridge is intentionally headless. Chat-level user
+    // questions are not a native TUI confirmation callback, so tools that
+    // require confirmation must fail closed and tell the caller to ask the
+    // user before using a TUI-capable or exact manual cleanup path.
     confirm: async () => false,
     notify: () => {},
   },

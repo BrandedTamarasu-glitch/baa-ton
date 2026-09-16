@@ -77,6 +77,13 @@ worktree and branch removal. Dirty, open, changed, or failed resources remain
 in place and receive durable manifest evidence; session-log entries are marked
 `retired` or `gone` only when the corresponding cleanup succeeds.
 
+The JSON MCP bridge used by Codex is headless (`hasUI: false`) and cannot answer
+that native confirmation on the user's behalf. A Codex/root caller must run the
+dry-run, show its exact inventory in chat, and ask the user directly before
+continuing. The user's chat approval is not an argument that bypasses the guard:
+retry from a TUI-capable root or carry out only the exact approved manual cleanup,
+and do not report cleanup as complete when the confirmation call is unavailable.
+
 ## Run as MCP
 
 After `npm install` in the repository root, configure a local stdio MCP client with:

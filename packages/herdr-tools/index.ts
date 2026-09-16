@@ -6316,7 +6316,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       return { dryRun: true, ...inventory };
     if (ctx.mode !== "tui" || !ctx.hasUI)
       throw new Error(
-        "Cleanup sweep execution requires native TUI confirmation from the verified root orchestrator.",
+        "Cleanup sweep execution requires native TUI confirmation from the verified root orchestrator. Headless MCP/Codex callers cannot provide that confirmation; present the dry-run inventory to the user and ask for explicit approval, then retry from a TUI-capable root or perform only the exact approved cleanup manually.",
       );
     const approved = await ctx.ui.confirm(
       "Herdr cleanup sweep",
@@ -7745,6 +7745,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       "Enumerate and, after mandatory native confirmation, clean terminal lane tabs and unopened worktrees for this root.",
     promptGuidelines: [
       "Use herdr_sweep from the verified controller-mapped root. It is dry-run by default; execute=true always presents ctx.ui.confirm with the concrete bounded list, regardless of authorizationPolicy. Never use it to clean another root's resources.",
+      "A headless MCP/Codex caller cannot satisfy the native confirmation. If execute=true reports that confirmation is unavailable, do not retry blindly or claim cleanup completed: show the dry-run inventory in the parent response, ask the user directly for approval, and continue only through a TUI-capable root or the exact approved manual cleanup path.",
     ],
     parameters: Type.Object(
       { execute: Type.Optional(Type.Boolean()) },

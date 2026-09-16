@@ -292,6 +292,15 @@ function context(cwd, confirm) {
   };
 }
 
+function headlessContext(cwd) {
+  return {
+    cwd,
+    hasUI: false,
+    mode: "json",
+    ui: { async confirm() { return false; } },
+  };
+}
+
 async function sweep(fixtureData, execute, confirm = true) {
   return fixtureData.tools.get("herdr_sweep").execute(
     "cleanup-sweep-test",
@@ -319,6 +328,29 @@ test("cleanup sweep dry-runs the root-scoped tabs and unopened worktree, then de
     assert.equal(f.liveTabs.has("lane-tab"), true);
     assert.equal(await readFile(f.manifestPath, "utf8"), before);
     await git(f.cwd, "show-ref", "--verify", "refs/heads/orphan-branch");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("headless cleanup reports the user-confirmation handoff and never mutates", async () => {
+  const f = await fixture();
+  try {
+    await assert.rejects(
+      f.tools.get("herdr_sweep").execute(
+        "headless-cleanup-sweep-test",
+        { execute: true },
+        undefined,
+        undefined,
+        headlessContext(f.cwd),
+      ),
+      /Headless MCP\/Codex callers cannot provide that confirmation.*ask for explicit approval/i,
+    );
+    assert.equal(
+      f.calls.some((args) => args[0] === "tab" && args[1] === "close"),
+      false,
+    );
+    assert.equal(f.liveTabs.has("lane-tab"), true);
   } finally {
     await f.cleanup();
   }

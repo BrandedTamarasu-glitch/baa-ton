@@ -22,4 +22,14 @@ The orchestrator reuses an extension-owned, non-worktree workspace for later non
 4. Root supplies the evidence to `herdr_close` and explicitly confirms the close.
 5. If ownership, references, or controller cleanup are ambiguous, retain the workspace and record a `cleanup-pending` blocker; do not close it.
 
+## Headless MCP/Codex confirmation
+
+The stdio JSON MCP bridge is intentionally headless and cannot provide the
+native `ctx.ui.confirm` callback required by `herdr_sweep execute=true`. A
+headless root must run the dry-run, present the exact bounded inventory to the
+user in chat, and ask for explicit approval. Chat approval does not bypass the
+tool guard; use a TUI-capable root or perform only the exact approved manual
+cleanup. If native confirmation is unavailable, keep resources in place and do
+not claim that cleanup completed.
+
 This plan is intentionally non-executing: it authorizes no cleanup by itself.
