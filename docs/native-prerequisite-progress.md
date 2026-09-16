@@ -183,3 +183,25 @@ pattern-matches full command text including commit messages and heredoc bodies, 
 tests for the guard must be authored through non-bash tools or split literals until
 the matching scope narrows. Round pushed to origin/main at `04487b6` (mascot Baazle,
 assets/mascot.png).
+
+### Live qualification round close-out (2026-09-16, both remaining goal items)
+
+Queue system (`67af493`) and adapter parity (`12bf76a`) landed and pushed per the
+prior sections. Live qualification executed by the parent per HARNESS-ADAPTERS.md's
+runbook:
+
+- **Codex** (`herdr-9bbb9d23`, read-only): startup handshake, exact profile, and
+  normalized operations re-verified; `herdr_message` (non-mutating) delivered
+  successfully, but `herdr_complete`/`herdr_observe`/`herdr_doctor` were denied by
+  the host's `approval_policy = "never"` — codex-cli 0.154 has no per-server
+  tool-approval knob (`--strict-config` confirms `tool_approval` is unrecognized).
+  Reconciled via `herdr_operator_close` with full evidence. Matrix updated.
+- **Claude** (`herdr-27cde2e4`, read-only): full receipt — identity, exact profile
+  across cmdline/intent/SessionStart sidecar, nonce-matched attestation, doctor
+  capability matrix confirmed. Matrix updated with this plus the prior live lanes.
+
+New follow-up: the claude lane's `herdr_message` flagged that `herdr_doctor`'s
+`lane-bridge-liveness` check reports "no complete startup bridge attestation" for
+all 10 mapped lane-1 bridges even when the file-based `.ready` sidecar matches the
+session exactly (its own case). The check likely isn't reading the sidecar
+evidence path it should; worth reconciling next round.
