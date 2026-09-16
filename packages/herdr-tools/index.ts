@@ -12,7 +12,7 @@ import {
 } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { lstatSync, readFileSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { setTimeout as lockRetryDelay } from "node:timers/promises";
@@ -75,9 +75,34 @@ import {
   HarnessAdapterRegistry,
   STARTUP_PROOF_REQUIRED_OPERATIONS,
 } from "./harness-adapter.js";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { acknowledgeActivation } from "./activation-ack.mjs";
-import { routeChildMessage } from "../controller/controller.mjs";
+
+// routeChildMessage lives in the controller package, which is a sibling of
+// this package inside the baa-ton checkout. Pi may load this extension
+// through the ~/.pi/agent/extensions symlink, and that loader does not
+// resolve symlinks before resolving relative imports (the 4f8b38c lesson:
+// extensions must stay loadable across their symlink). Resolve from the
+// realpath of this module so the import works in both contexts.
+async function importRouteChildMessage() {
+  const fromRealPath = new URL(
+    "../controller/controller.mjs",
+    pathToFileURL(realpathSync(fileURLToPath(import.meta.url))),
+  );
+  const fromSpecifier = new URL("../controller/controller.mjs", import.meta.url);
+  for (const candidate of [fromRealPath, fromSpecifier]) {
+    try {
+      return (await import(fileURLToPath(candidate))) as typeof import("../controller/controller.mjs");
+    } catch {
+      continue;
+    }
+  }
+  throw new Error(
+    "Cannot load the controller package for child-message routing; the baa-ton checkout layout is unavailable from this extension path.",
+  );
+}
+
+const { routeChildMessage } = await importRouteChildMessage();
 
 const MANIFEST_DIR = ".pi/herdr-orchestrator";
 const MANIFEST_NAME = "manifest.json";
@@ -1809,13 +1834,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         throw new Error(`Unsupported controller Herdr request: ${method}`);
       },
     };
-    const routed = await routeChildMessage({
+    const routed = (await routeChildMessage({
       configDir: resolve(dirname(rootConfigPath())),
       workflowId,
       laneId: request.laneId,
       messageId: request.id,
       herdr,
-    });
+    })) as { delivery?: unknown } & Record<string, unknown>;
     return { ...persisted, ...routed, delivery: routed.delivery };
   }
 
