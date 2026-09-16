@@ -43,9 +43,10 @@ const jiti = createJiti(fileURLToPath(import.meta.url), {
 const extension = await jiti.import(join(root, "index.ts"));
 
 // The bridge must expose the same installed model registry the interactive
-// runtime uses, so launch-profile preflight validates against real catalog
-// and auth state instead of a fabricated context. The package exports map
-// does not expose internals, so resolve them by absolute file path.
+// runtime uses. Discovery refreshes the requested provider immediately before
+// preflight; keeping this bridge-start registry snapshot out of preflight is
+// important because a stale catalog must never authorize a launch. The package
+// exports map does not expose internals, so resolve them by absolute file path.
 const { existsSync } = await import("node:fs");
 let packageRoot = null;
 for (let dir = root; dir !== dirname(dir); dir = dirname(dir)) {
@@ -69,9 +70,12 @@ const importDist = (name) =>
   import(pathToFileURL(join(packageRoot, "dist", name)).href);
 const { ModelRuntime } = await importDist("core/model-runtime.js");
 const { ModelRegistry } = await importDist("core/model-registry.js");
+// Do not refresh at bridge startup. The registry is intentionally only a
+// runtime handle here; pi-launch-adapter's discoverCatalog performs a
+// provider-scoped live refresh and fails closed on any refresh error. This
+// prevents a frozen bridge-start snapshot from becoming a preflight fallback.
 const modelRuntime = await ModelRuntime.create({ refreshOnCreate: false });
 const modelRegistry = new ModelRegistry(modelRuntime);
-await modelRegistry.refresh();
 const tools = new Map();
 const lifecycleHandlers = new Map();
 const activeRequests = new Map();

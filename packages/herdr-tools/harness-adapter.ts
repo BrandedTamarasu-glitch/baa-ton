@@ -1,7 +1,15 @@
 import type { LaunchProfile } from "./launch-profile.js";
-import type { NativeSessionRef, PersistenceHandle } from "./contract.js";
+import type {
+  CapabilityCatalog,
+  NativeSessionRef,
+  PersistenceHandle,
+} from "./contract.js";
 
-export type { NativeSessionRef, PersistenceHandle } from "./contract.js";
+export type {
+  CapabilityCatalog,
+  NativeSessionRef,
+  PersistenceHandle,
+} from "./contract.js";
 
 export const PROTOCOL_OPERATIONS = {
   plan: "plan",
@@ -49,7 +57,17 @@ export interface HarnessLaunchAdapter {
   capabilities: HarnessCapabilityFlags;
   /** Honest lifecycle reporting: native, screen-derived, or unavailable. */
   lifecycle: HarnessLifecycle;
-  preflight(profile: LaunchProfile): void | Promise<void>;
+  /**
+   * Optional live capability discovery. Implementations must not return a
+   * static registry snapshot as a substitute when discovery fails.
+   */
+  discoverCatalog?(
+    profile: LaunchProfile,
+  ): CapabilityCatalog | Promise<CapabilityCatalog>;
+  preflight(
+    profile: LaunchProfile,
+    discovered?: CapabilityCatalog,
+  ): void | Promise<void>;
   /** Optional first turn needed to materialize lazy harness sessions. The
    * dispatcher submits this exact text after the native agent starts, with
    * the same durable terminal-input fence as assignment prompts. */

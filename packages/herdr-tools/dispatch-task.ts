@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
   toPersistenceHandle,
+  type CapabilityCatalog,
   type Lane,
   type Workflow,
 } from "./contract.js";
@@ -133,6 +134,11 @@ export async function dispatchTask(
     );
   });
   const adapters = workflow.lanes.map((lane) => port.adapter(lane.agentKind));
+  const discoveries: Array<{
+    laneId: string;
+    profile: (typeof profiles)[number];
+    catalog: CapabilityCatalog;
+  }> = [];
   for (const [index, adapter] of adapters.entries()) {
     const missing = missingRequiredAdapterCapabilities(adapter);
     if (adapter.version !== 1 || missing.length > 0)
@@ -141,7 +147,16 @@ export async function dispatchTask(
           missing.length ? `: ${missing.join(", ")}` : ""
         }.`,
       );
-    await adapter.preflight(profiles[index]);
+    const catalog = adapter.discoverCatalog
+      ? await adapter.discoverCatalog(profiles[index])
+      : undefined;
+    if (catalog)
+      discoveries.push({
+        laneId: workflow.lanes[index].id,
+        profile: profiles[index],
+        catalog,
+      });
+    await adapter.preflight(profiles[index], catalog);
   }
   const restart = options.restart === true;
   const workspaceId = workflow.taskBinding?.workspaceId;
@@ -310,6 +325,12 @@ export async function dispatchTask(
         attempt: (w.retry?.attempt ?? 0) + 1,
         retryCommand: `herdr_dispatch ${w.id} execute=true`,
       };
+      for (const discovery of discoveries)
+        w.evidence.push({
+          at: new Date().toISOString(),
+          kind: "capability-discovery",
+          text: JSON.stringify(discovery),
+        });
     });
     // Establish all routing before any assignment. Cwd only selects code location.
     for (let i = 0; i < workflow.lanes.length; i++) {

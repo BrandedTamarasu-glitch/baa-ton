@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { CapabilityCatalog } from "./contract.js";
 import type { LaunchProfile } from "./launch-profile.js";
 import {
   PROTOCOL_OPERATIONS,
@@ -29,18 +31,163 @@ export function mapPiToolNamesToProtocolOperations(
   return [...operations];
 }
 
-export function verifyAvailableProfile(
+const LIVE_DISCOVERY_SOURCE = "pi.modelRegistry.live-provider-refresh.v1";
+
+type DiscoveryDetails = {
+  reasoning: boolean;
+  explicitlyUnsupportedThinking: boolean;
+};
+type DiscoveryResult = {
+  catalog: CapabilityCatalog;
+  details: DiscoveryDetails;
+};
+
+type ModelRegistryLike = NonNullable<ExtensionContext["modelRegistry"]> & {
+  refresh?: (options?: { providers?: readonly string[] }) => Promise<unknown>;
+};
+
+/**
+ * Return the cache identity documented by CapabilityCatalog. Keep this helper
+ * exported so bridge and adapter tests can prove that resolvedAt and the
+ * enumerated options do not accidentally become cache identity.
+ */
+export function capabilityCatalogCacheKey(
+  catalog: Pick<CapabilityCatalog, "provider" | "model" | "auth" | "source">,
+): string {
+  const identity = JSON.stringify({
+    provider: catalog.provider,
+    model: catalog.model,
+    auth: {
+      subscriptionConfigured: catalog.auth.subscriptionConfigured,
+      usingOAuth: catalog.auth.usingOAuth,
+    },
+    source: catalog.source,
+  });
+  return `sha256:${createHash("sha256").update(identity, "utf8").digest("hex")}`;
+}
+
+function stringOptions(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [
+    ...new Set(value.filter((item): item is string => typeof item === "string")),
+  ].sort();
+}
+
+function discoveryError(profile: LaunchProfile, detail: unknown): Error {
+  const message = detail instanceof Error ? detail.message : String(detail);
+  return new Error(
+    `Capability discovery failed for ${profile.provider}/${profile.model}: ${message}`,
+  );
+}
+
+function providerRefreshError(result: any, provider: string): unknown {
+  const errors = result?.errors;
+  if (errors instanceof Map) return errors.get(provider);
+  if (errors && typeof errors === "object") return errors[provider];
+  return undefined;
+}
+
+async function discoverPiCatalog(
   profile: LaunchProfile,
   ctx: ExtensionContext,
-): void {
+): Promise<DiscoveryResult> {
   if (profile.provider !== "openai-codex")
     throw new Error(
       "Only the openai-codex subscription launch adapter is qualified in this prerequisite.",
     );
-  const model = ctx.modelRegistry?.find(profile.provider, profile.model);
+  const registry = ctx.modelRegistry as ModelRegistryLike | undefined;
+  if (!registry || typeof registry.refresh !== "function")
+    throw discoveryError(
+      profile,
+      "the live model registry refresh operation is unavailable; refusing a static registry snapshot",
+    );
+
+  let refreshed: any;
+  try {
+    // A provider-scoped refresh is the live runtime boundary. In particular,
+    // do not read find() until this completes and never use a prior snapshot
+    // when it reports an error.
+    refreshed = await registry.refresh({ providers: [profile.provider] });
+  } catch (error) {
+    throw discoveryError(profile, error);
+  }
+  const refreshFailure = providerRefreshError(refreshed, profile.provider);
+  if (refreshFailure)
+    throw discoveryError(profile, refreshFailure);
+  if (refreshed?.aborted)
+    throw discoveryError(profile, "the live provider refresh was aborted");
+
+  let model: any;
+  try {
+    model = registry.find(profile.provider, profile.model);
+  } catch (error) {
+    throw discoveryError(profile, error);
+  }
   if (!model)
+    throw discoveryError(
+      profile,
+      `Exact installed model not found in the live provider runtime`,
+    );
+  if (
+    typeof registry.hasConfiguredAuth !== "function" ||
+    typeof registry.isUsingOAuth !== "function"
+  )
+    throw discoveryError(
+      profile,
+      "live authentication state is unavailable; refusing to guess the billing route",
+    );
+
+  let subscriptionConfigured: boolean;
+  let usingOAuth: boolean;
+  try {
+    subscriptionConfigured = Boolean(registry.hasConfiguredAuth(model));
+    usingOAuth = Boolean(registry.isUsingOAuth(model));
+  } catch (error) {
+    throw discoveryError(profile, error);
+  }
+  const map = model.thinkingLevelMap;
+  const thinkingOptions = Object.keys(map ?? {}).filter(
+    (level) => map[level] !== null,
+  );
+  const modes = stringOptions(model.modes);
+  const catalog: CapabilityCatalog = {
+    provider: profile.provider,
+    model: profile.model,
+    thinkingOptions: stringOptions(thinkingOptions),
+    ...(modes.length ? { modes } : {}),
+    auth: { subscriptionConfigured, usingOAuth },
+    resolvedAt: new Date().toISOString(),
+    cacheKey: capabilityCatalogCacheKey({
+      provider: profile.provider,
+      model: profile.model,
+      auth: { subscriptionConfigured, usingOAuth },
+      source: LIVE_DISCOVERY_SOURCE,
+    }),
+    source: LIVE_DISCOVERY_SOURCE,
+  };
+  return {
+    catalog,
+    details: {
+      reasoning: Boolean(model.reasoning),
+      explicitlyUnsupportedThinking:
+        map?.[profile.thinking] === null,
+    },
+  };
+}
+
+function validateCatalog(
+  profile: LaunchProfile,
+  catalog: CapabilityCatalog,
+  details: DiscoveryDetails,
+): void {
+  if (
+    catalog.provider !== profile.provider ||
+    catalog.model !== profile.model ||
+    catalog.source !== LIVE_DISCOVERY_SOURCE ||
+    catalog.cacheKey !== capabilityCatalogCacheKey(catalog)
+  )
     throw new Error(
-      `Exact installed model not found: ${profile.provider}/${profile.model}.`,
+      "Capability discovery cache key does not match the current provider/model/auth/source inputs; refusing stale discovery.",
     );
   // Empirically settled by a 2026-09-15 live probe: Pi and the backend
   // accept thinking levels absent from the catalog map (gpt-5.6-luna served
@@ -49,28 +196,32 @@ export function verifyAvailableProfile(
   // null entry declares a level unsupported; absent levels are trusted to
   // runtime attestation, which fails the startup handshake unless the session
   // actually reports the requested level.
-  const map = model.thinkingLevelMap;
   if (
-    (!model.reasoning && profile.thinking !== "off") ||
-    map?.[profile.thinking] === null
+    (!details.reasoning && profile.thinking !== "off") ||
+    details.explicitlyUnsupportedThinking
   )
     throw new Error(
       `Thinking level ${profile.thinking} is unsupported by ${profile.model}.`,
     );
-  if (
-    !ctx.modelRegistry.hasConfiguredAuth(model) ||
-    !ctx.modelRegistry.isUsingOAuth(model)
-  )
+  if (!catalog.auth.subscriptionConfigured || !catalog.auth.usingOAuth)
     throw new Error(
       "Requested subscription authentication is not configured; API-key fallback is forbidden.",
     );
 }
 
-export function verifyActualProfile(
+export async function verifyAvailableProfile(
   profile: LaunchProfile,
   ctx: ExtensionContext,
-): void {
-  verifyAvailableProfile(profile, ctx);
+): Promise<void> {
+  const result = await discoverPiCatalog(profile, ctx);
+  validateCatalog(profile, result.catalog, result.details);
+}
+
+export async function verifyActualProfile(
+  profile: LaunchProfile,
+  ctx: ExtensionContext,
+): Promise<void> {
+  await verifyAvailableProfile(profile, ctx);
   if (
     ctx.model?.provider !== profile.provider ||
     ctx.model?.id !== profile.model ||
@@ -85,6 +236,14 @@ export function piLaunchAdapter(
   ctx: ExtensionContext,
   nativeIntegration: string,
 ): HarnessLaunchAdapter {
+  const discoveryDetails = new Map<string, DiscoveryDetails>();
+  const discoverCatalog = async (
+    profile: LaunchProfile,
+  ): Promise<CapabilityCatalog> => {
+    const result = await discoverPiCatalog(profile, ctx);
+    discoveryDetails.set(result.catalog.cacheKey, result.details);
+    return result.catalog;
+  };
   return {
     version: 1,
     kind: "pi",
@@ -94,7 +253,38 @@ export function piLaunchAdapter(
       supportsNativeSessionIdentity: true,
     },
     lifecycle: "native",
-    preflight: (profile) => verifyAvailableProfile(profile, ctx),
+    discoverCatalog,
+    preflight: async (profile, discovered) => {
+      let catalog = discovered;
+      let details = catalog ? discoveryDetails.get(catalog.cacheKey) : undefined;
+      if (catalog) {
+        if (
+          catalog.provider !== profile.provider ||
+          catalog.model !== profile.model ||
+          catalog.source !== LIVE_DISCOVERY_SOURCE ||
+          catalog.cacheKey !== capabilityCatalogCacheKey(catalog)
+        )
+          throw new Error(
+            "Capability discovery cache key does not match the current provider/model/auth/source inputs; refusing stale discovery.",
+          );
+        // A catalog supplied by an unrelated adapter or an older adapter
+        // incarnation is not trusted merely because its shape looks valid.
+        // Re-discover and compare identities before using it as a cache hit.
+        if (!details) {
+          const fresh = await discoverCatalog(profile);
+          if (fresh.cacheKey !== catalog.cacheKey)
+            throw new Error(
+              "Capability discovery cache key does not match the current live inputs; refusing stale discovery.",
+            );
+          catalog = fresh;
+          details = discoveryDetails.get(catalog.cacheKey);
+        }
+      } else {
+        catalog = await discoverCatalog(profile);
+        details = discoveryDetails.get(catalog.cacheKey);
+      }
+      validateCatalog(profile, catalog, details!);
+    },
     launchArguments: (profile, source) => [
       "--provider",
       profile.provider,

@@ -49,6 +49,11 @@ async function fixture(options = {}) {
   };
   const ctx = {
     modelRegistry: {
+      refresh: async () => ({
+        errors: options.discoveryFailure
+          ? new Map([[launchProfile.provider, new Error("provider unavailable")]])
+          : new Map(),
+      }),
       find: (provider, model) =>
       provider === launchProfile.provider && model === launchProfile.model
         || laneProfiles.some(
@@ -304,6 +309,7 @@ test("adapter startup handshakes are sent exactly once before startup proof and 
   const base = piLaunchAdapter(
     {
       modelRegistry: {
+        refresh: async () => ({ errors: new Map() }),
         find: () => ({ reasoning: true, thinkingLevelMap: { high: "high" } }),
         hasConfiguredAuth: () => true,
         isUsingOAuth: () => true,
@@ -336,6 +342,7 @@ test("an uncertain startup handshake is fenced and never submitted twice", async
   const base = piLaunchAdapter(
     {
       modelRegistry: {
+        refresh: async () => ({ errors: new Map() }),
         find: () => ({ reasoning: true, thinkingLevelMap: { high: "high" } }),
         hasConfiguredAuth: () => true,
         isUsingOAuth: () => true,
@@ -447,6 +454,21 @@ test("absent thinking level dispatches under runtime attestation", async () => {
   try {
     assert.equal((await f.run()).dispatched, true);
     assert.equal(f.calls.filter((c) => c[1] === "prompt").length, 2);
+    assert.equal(
+      f.state.evidence.filter((entry) => entry.kind === "capability-discovery").length,
+      2,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("a live capability discovery failure fails closed before topology", async () => {
+  const f = await fixture({ discoveryFailure: true });
+  try {
+    await assert.rejects(f.run(), /Capability discovery failed.*provider unavailable/);
+    assert.equal(f.calls.length, 0);
+    assert.deepEqual(f.state.ownership.paneIds, []);
   } finally {
     await f.close();
   }

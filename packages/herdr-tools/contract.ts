@@ -53,6 +53,34 @@ export type LaunchProfile = {
 };
 export type LaunchProfileVersion = 1;
 
+/**
+ * Normalized capabilities discovered from a live harness/provider runtime.
+ * `thinkingOptions` is an enumeration only; an adapter may still attest a
+ * thinking level that is absent from it.
+ */
+export type CapabilityCatalog = {
+  provider: string;
+  model: string;
+  thinkingOptions: string[];
+  modes?: string[];
+  auth: {
+    subscriptionConfigured: boolean;
+    usingOAuth: boolean;
+  };
+  resolvedAt: string;
+  /**
+   * Deterministic cache identity. This is `sha256:<hex>` over the UTF-8
+   * canonical JSON identity `{"provider":<provider>,"model":<model>,"auth":{"subscriptionConfigured":<bool>,"usingOAuth":<bool>},"source":<source>}`.
+   * The property order shown is part of the identity; `resolvedAt`, modes, and
+   * thinkingOptions are deliberately excluded. Consequently a cache entry is
+   * reusable only when its cacheKey matches the current provider/model,
+   * discovered auth state, and source identity.
+   */
+  cacheKey: string;
+  /** Stable identity of the live runtime and discovery operation. */
+  source: string;
+};
+
 export type AuthorizationPolicy = {
   version: 1;
   scope: { workflow: string; localOnly: true };

@@ -3902,7 +3902,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     if (startupPath) {
       const intent = parseJson(await readFile(startupPath, "utf8"));
       const profile = validateLaunchProfile(intent.profile);
-      verifyActualProfile(profile, ctx);
+      await verifyActualProfile(profile, ctx);
       if (
         intent.workspaceId !== process.env.HERDR_WORKSPACE_ID ||
         intent.paneId !== process.env.HERDR_PANE_ID ||
