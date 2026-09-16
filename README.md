@@ -5,30 +5,33 @@
 </p>
 
 Baa-ton is an orchestration core for [Herdr](https://github.com/herdrdev/herdr) (0.9+), the
-terminal multiplexer for coding agents. Herdr owns the terminals and agent processes;
-Baa-ton plans their work, verifies each agent before assigning it, and records what happened.
+terminal multiplexer for coding agents. Herdr owns the terminals and the agent processes;
+Baa-ton plans their work, checks each agent before handing it a task, and keeps a record of
+what actually happened.
 
 ## Why Baa-ton
 
-**What problem does it solve?** Running several coding agents is easy; trusting their
-output is not. Baa-ton makes delegation *durable and verifiable* instead of
+**What problem does it solve?** Running several coding agents at once is easy. Trusting
+what they tell you is not. Baa-ton makes delegation *durable and verifiable* instead of
 hope-and-scrollback.
 
-- *"The agent said tests passed."* — Claims aren't receipts. A lane completes only by
+- *"The agent said tests passed."* Claims aren't receipts. A lane only completes by
   storing a durable `herdr_complete` receipt, and the parent independently re-runs the
   checks before accepting anything.
-- *"My session died mid-round."* — Plans, lane assignments, events, and receipts live in
-  transactional manifests. Reload or restart, and the round picks up from the ledger.
-- *"Which of my six panes needs me?"* — The event controller wakes the parent only for
-  actionable events (done, blocked, a question only you can answer). Post-completion
-  noise is suppressed; `action-required` means *you* must act.
-- *"Don't let it push to prod."* — Lanes are fenced per harness (interception, deny-rules,
-  sandboxes). Push, merge, deploy, and resource closure always require the human.
-- *"I want Codex to implement and Claude to review."* — One versioned contract, any
-  qualified harness, heterogeneous lanes — with capability discovery instead of hoping
-  a model/thinking level exists.
+- *"My session died mid-round."* Plans, lane assignments, events, and receipts all live
+  in transactional manifests, so reloading or restarting just picks the round back up
+  from the ledger.
+- *"Which of my six panes needs me?"* The event controller only wakes the parent for
+  events that need a human: done, blocked, or a question only you can answer. It
+  suppresses everything else; `action-required` means *you* must act.
+- *"Don't let it push to prod."* Lanes are fenced per harness, through interception,
+  deny-rules, and sandboxes. Push, merge, deploy, and resource closure always require
+  a human.
+- *"I want Codex to implement and Claude to review."* One versioned contract works
+  across any qualified harness, so lanes can mix vendors freely. Capability discovery
+  checks that a model or thinking level actually exists, instead of just hoping.
 
-**Who is it for?** Anyone driving coding agents from a terminal through Herdr and wanting
+**Who is it for?** Anyone driving coding agents from a terminal through Herdr who wants
 parallel work they can actually trust.
 
 **What it is not.** Not a daemon, not a hosted service, not CI. It never spawns processes
@@ -36,10 +39,12 @@ parallel work they can actually trust.
 
 ## What it does
 
-- **Plans work into lanes** — one writer per worktree workflow, read-only lanes for review.
-- **Verifies before assigning** — exact provider/model/thinking/auth, startup attestation, live capability discovery. Unverified harnesses fail closed *before* any terminal is created.
-- **Bridges every harness** — all ten `herdr_*` tools over one MCP bridge.
-- **Wakes the parent durably** — lifecycle events become durable wakes and receipts; nothing polls.
+It plans work into lanes, one writer per worktree workflow, with read-only lanes set
+aside for review. Before it assigns anything, it checks the exact provider, model,
+thinking level, and auth, confirms startup attestation, and discovers capabilities
+live, so unverified harnesses fail closed *before* any terminal is created. Every
+harness talks to it through one MCP bridge covering all ten `herdr_*` tools, and
+lifecycle events turn into durable wakes and receipts, so nothing has to poll.
 
 ## Example prompts
 
@@ -107,9 +112,9 @@ flowchart TD
     K -->|"wake"| R
 ```
 
-Read it as one loop: the root plans and dispatches through the core, lanes are
-started only after verification, lanes use the bridge for tools, their events feed
-the controller, and the controller wakes the root.
+Read it as one loop: the root plans and dispatches through the core, lanes only start
+once they're verified, they call the bridge for tools, their events feed the
+controller, and the controller wakes the root back up.
 
 A delegation round looks like this:
 
@@ -127,22 +132,23 @@ sequenceDiagram
     U->>U: independent parent verification
 ```
 
-Parallel writers get one workflow per worktree with disjoint file ownership; lanes that
-share files are sequenced. Integration is the parent's job: land linearly, re-run the
-merged suite, cross-vendor review before shipping.
+Parallel writers each get their own workflow and worktree, with disjoint file
+ownership; if two lanes would touch the same files, they're sequenced instead.
+Integration is the parent's job: land the changes one at a time, re-run the merged
+test suite, and get a cross-vendor review before anything ships.
 
 ## Quick start
 
-Requires Node.js 20+, Herdr 0.9.0+, and (for adapter tests) the harness CLIs on `PATH`.
+You'll need Node.js 20+, Herdr 0.9.0+, and, for adapter tests, the harness CLIs on `PATH`.
 
 ```sh
 npm install
 npm test
 ```
 
-The suite runs the workflow smoke check, workflow tests, and controller tests. For one
-package: `npm run test:extension` or `npm run test:controller`. Local tests do not
-replace live harness qualification.
+The suite runs the workflow smoke check plus the workflow and controller tests. To run
+just one package, use `npm run test:extension` or `npm run test:controller`. Local
+tests don't replace live harness qualification.
 
 ## Go deeper
 
