@@ -3835,11 +3835,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     if (
       !isRecord(rootAgent) ||
       !isRecord(rootAgent.agent_session) ||
-      rootAgent.agent_session.kind !== "path" ||
+      (rootAgent.agent_session.kind !== "path" &&
+        rootAgent.agent_session.kind !== "id") ||
       typeof rootAgent.agent_session.value !== "string"
     )
       throw new Error(
-        "Task planning requires a verified native root session path.",
+        "Task planning requires a verified native root session path or id.",
       );
     const rootSessionPath = rootAgent.agent_session.value;
     const launchProfile =
