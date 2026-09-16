@@ -9,6 +9,173 @@ const require = createRequire(import.meta.url);
 const jiti = require("jiti")(import.meta.url);
 const { default: extension } = await jiti.import("../index.ts");
 
+async function parentGoalFixture({ workflowStatus = "completed", workflowOutcome = "completed" } = {}) {
+  const directory = await mkdtemp(join(tmpdir(), "baa-parent-goal-"));
+  const cwd = join(directory, "task");
+  const configDir = join(directory, "config");
+  const manifestDir = join(cwd, ".pi", "herdr-orchestrator");
+  const manifestPath = join(manifestDir, "manifest.json");
+  const root = {
+    target: "w1:p1",
+    target_kind: "pane_id",
+    pane_id: "w1:p1",
+    workspace_id: "w1",
+    agent_kind: "pi",
+  };
+  const parentGoal = {
+    version: 1,
+    id: "parent-old",
+    objective: "Finish the old round.",
+    status: "completed",
+    nextAction: "Review completion.",
+    signals: [],
+    createdAt: "2026-09-16T00:00:00.000Z",
+    updatedAt: "2026-09-16T00:00:00.000Z",
+  };
+  await mkdir(manifestDir, { recursive: true });
+  await mkdir(configDir, { recursive: true, mode: 0o700 });
+  await writeFile(
+    manifestPath,
+    JSON.stringify({
+      version: 2,
+      parentGoal,
+      workflows: [
+        {
+          id: "workflow-active",
+          status: workflowStatus,
+          outcome: workflowOutcome,
+          lanes: [],
+        },
+      ],
+    }),
+  );
+  await writeFile(
+    join(configDir, "config.json"),
+    JSON.stringify({
+      version: 2,
+      owner: "herdr-orchestrator",
+      orchestrators: [
+        {
+          id: "root",
+          root,
+          program: { id: cwd, workspace_id: "w1" },
+          workflows: [],
+        },
+      ],
+    }),
+    { mode: 0o600 },
+  );
+  const saved = Object.fromEntries(
+    ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_WORKSPACE_ID", "HERDR_PLUGIN_CONFIG_DIR"].map(
+      (key) => [key, process.env[key]],
+    ),
+  );
+  Object.assign(process.env, {
+    HERDR_ENV: "1",
+    HERDR_PANE_ID: root.pane_id,
+    HERDR_WORKSPACE_ID: root.workspace_id,
+    HERDR_PLUGIN_CONFIG_DIR: configDir,
+  });
+  const tools = new Map();
+  extension({
+    on() {},
+    registerTool(descriptor) {
+      tools.set(descriptor.name, descriptor);
+    },
+    registerCommand() {},
+  });
+  return {
+    directory,
+    cwd,
+    manifestPath,
+    tools,
+    ctx: { cwd, hasUI: false, mode: "json" },
+    restore() {
+      for (const [key, value] of Object.entries(saved))
+        value === undefined
+          ? delete process.env[key]
+          : (process.env[key] = value);
+    },
+    async cleanup() {
+      this.restore();
+      await rm(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+test("parent goal reset archives and clears the active record so a new round initializes", async () => {
+  const fixture = await parentGoalFixture();
+  try {
+    const reset = await fixture.tools.get("herdr_goal").execute(
+      "reset",
+      { action: "reset" },
+      undefined,
+      undefined,
+      fixture.ctx,
+    );
+    assert.deepEqual(reset.details, {
+      reset: true,
+      archivedGoalId: "parent-old",
+      historyLength: 1,
+    });
+    const archivedManifest = JSON.parse(await readFile(fixture.manifestPath, "utf8"));
+    assert.equal(archivedManifest.parentGoal, undefined);
+    assert.equal(archivedManifest.goalHistory.length, 1);
+    assert.equal(archivedManifest.goalHistory[0].version, 1);
+    assert.equal(archivedManifest.goalHistory[0].id, "parent-old");
+    assert.equal(archivedManifest.goalHistory[0].archivedAt.length > 0, true);
+
+    const initialized = await fixture.tools.get("herdr_goal").execute(
+      "initialize",
+      { action: "initialize", objective: "Start the new round." },
+      undefined,
+      undefined,
+      fixture.ctx,
+    );
+    assert.equal(initialized.details.goal.objective, "Start the new round.");
+    const status = await fixture.tools.get("herdr_goal").execute(
+      "status",
+      { action: "status" },
+      undefined,
+      undefined,
+      fixture.ctx,
+    );
+    assert.equal(status.details.goalHistoryCount, 1);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("parent goal reset refuses active workflows unless force records a reason", async () => {
+  const fixture = await parentGoalFixture({ workflowStatus: "running", workflowOutcome: "running" });
+  try {
+    await assert.rejects(
+      fixture.tools.get("herdr_goal").execute(
+        "reset-active",
+        { action: "reset" },
+        undefined,
+        undefined,
+        fixture.ctx,
+      ),
+      /non-terminal.*workflow-active/,
+    );
+    const forced = await fixture.tools.get("herdr_goal").execute(
+      "reset-force",
+      { action: "reset", force: true, reason: "Reconcile the stale parent round." },
+      undefined,
+      undefined,
+      fixture.ctx,
+    );
+    assert.equal(forced.details.archivedGoalId, "parent-old");
+    const archived = JSON.parse(await readFile(fixture.manifestPath, "utf8")).goalHistory[0];
+    assert.equal(archived.force, true);
+    assert.equal(archived.reason, "Reconcile the stale parent round.");
+    assert.equal(JSON.parse(await readFile(fixture.manifestPath, "utf8")).parentGoal, undefined);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("planning records a versioned scoped goal graph and per-lane profile", async () => {
   const directory = await mkdtemp(join(tmpdir(), "baa-goals-"));
   const cwd = join(directory, "task");

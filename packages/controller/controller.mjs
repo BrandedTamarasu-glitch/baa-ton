@@ -43,6 +43,21 @@ const MESSAGE_DELIVERY_STATUSES = new Set([
   "uncertain",
 ]);
 const ACTIONABLE_CLASSIFICATIONS = new Set(["done", "blocked", "goal-paused"]);
+const TERMINAL_PARENT_GOAL_STATES = new Set([
+  "completed",
+  "blocked",
+  "paused",
+]);
+const TERMINAL_WORKFLOW_STATES = new Set([
+  "completed",
+  "closed",
+  "operator-closed",
+]);
+const TERMINAL_LANE_STATES = new Set([
+  "completion-reported",
+  "completed",
+  "operator-closed",
+]);
 const USER_ACTIONABLE_REQUEST_STATUSES = new Set([
   "parent-question-required",
   "parent-approval-required",
@@ -870,6 +885,82 @@ function signalParentGoal(manifest, record) {
     goal.status = "review-requested";
   goal.nextAction = `Review durable ${record.classification} event ${record.identity} for ${record.workflow_id}/${record.lane_id}; continue authorized safe local work or persist a truthful waiting/blocked state.`;
   goal.updatedAt = now();
+}
+
+function workflowIsTerminal(workflow) {
+  if (!isRecord(workflow)) return true;
+  const hasStatus = typeof workflow.status === "string";
+  const hasOutcome = typeof workflow.outcome === "string";
+  const lanes = Array.isArray(workflow.lanes) ? workflow.lanes : [];
+  const hasLaneLifecycle = lanes.some(
+    (lane) =>
+      isRecord(lane) &&
+      ("status" in lane || "completionReceipt" in lane),
+  );
+  const nonTerminalLane = lanes.some(
+    (lane) =>
+      isRecord(lane) &&
+      !lane.completionReceipt &&
+      typeof lane.status === "string" &&
+      !TERMINAL_LANE_STATES.has(lane.status),
+  );
+  // Early diagnostic manifests omitted lifecycle fields. Keep those legacy
+  // records compatible; every explicit non-terminal state is active.
+  if (!hasStatus && !hasOutcome && !hasLaneLifecycle) return true;
+  return (
+    !nonTerminalLane &&
+    (!hasStatus || TERMINAL_WORKFLOW_STATES.has(workflow.status)) &&
+    (!hasOutcome || TERMINAL_WORKFLOW_STATES.has(workflow.outcome))
+  );
+}
+
+function signalParentGoalMismatch(manifest, routedWorkflows, timestamp = now()) {
+  if (!("parentGoal" in manifest)) return false;
+  const goal = validateParentGoal(manifest.parentGoal);
+  if (!TERMINAL_PARENT_GOAL_STATES.has(goal.status)) return false;
+  const active = routedWorkflows
+    .map((route) => ({
+      route,
+      workflow: manifest.workflows.find(
+        (candidate) =>
+          isRecord(candidate) && candidate.id === route.workflow_id,
+      ),
+    }))
+    .filter(({ workflow }) => workflow && !workflowIsTerminal(workflow));
+  if (active.length === 0) return false;
+
+  const workflowIds = [
+    ...new Set(active.map(({ route }) => route.workflow_id)),
+  ].sort();
+  let changed = false;
+  for (const { route } of active) {
+    const identity = `parent-goal-mismatch:${goal.id}:${route.workflow_id}`;
+    if (
+      goal.signals.some(
+        (signal) => isRecord(signal) && signal.identity === identity,
+      )
+    )
+      continue;
+    goal.signals.push({
+      identity,
+      workflowId: route.workflow_id,
+      // ParentGoal's additive signal contract is lane-shaped. Use the first
+      // routed lane as the stable source marker for this workflow-level fact.
+      laneId: route.lanes[0]?.lane_id ?? route.workflow_id,
+      classification: "blocked",
+      receivedAt: timestamp,
+    });
+    changed = true;
+  }
+  const nextAction =
+    `Parent goal ${goal.id} is stale while routed workflow(s) remain active: ${workflowIds.join(", ")}. Run herdr_goal action=reset before initializing a fresh goal.`;
+  if (goal.status !== "review-requested" || goal.nextAction !== nextAction) {
+    goal.status = "review-requested";
+    goal.nextAction = nextAction;
+    goal.updatedAt = timestamp;
+    changed = true;
+  }
+  return changed;
 }
 
 function pendingParentAction(manifest, workflows = manifest.workflows) {
@@ -1791,6 +1882,18 @@ export async function runSupervisorTick({
             api,
           );
       }
+      // A terminal parent goal must not silently coexist with a newly routed
+      // workflow. This check is deliberately separate from ordinary lane
+      // review signals and is also run when no wake is pending.
+      if (signalParentGoalMismatch(manifest, workflows, timestamp)) {
+        await atomicWriteJson(manifestPath, manifest);
+        if ("parentGoal" in manifest)
+          await publishParentGoalSidebar(
+            validateParentGoal(manifest.parentGoal),
+            orchestrator.root,
+            api,
+          );
+      }
       // Event-driven pending-outbox reconciliation. A lane wake that could
       // not be delivered earlier (root busy or unavailable) previously
       // retried only if an identical hook happened to recur later, and was
@@ -2256,6 +2359,10 @@ export async function handleHook({
       // pane hook. Reconcile after the lane breadcrumb so a user request wins
       // over the review-only status and next action from this event.
       signalParentGoalForUserAction(manifest);
+      // A mapped event also reevaluates terminal parent-goal state. Keep this
+      // after ordinary event/user signals so the mismatch action remains the
+      // durable instruction presented to the root.
+      signalParentGoalMismatch(manifest, mapping.orchestrator.workflows);
       inboxMessage = await persistControllerMessage(configDir, {
         logicalKey: `lane-event:${record.workflow_id}/${record.lane_id}/${record.classification}`,
         occurrenceId: record.identity,
@@ -2282,7 +2389,11 @@ export async function handleHook({
         );
     } else {
       const userActionChanged = signalParentGoalForUserAction(manifest);
-      if (userActionChanged) {
+      const mismatchChanged = signalParentGoalMismatch(
+        manifest,
+        mapping.orchestrator.workflows,
+      );
+      if (userActionChanged || mismatchChanged) {
         await atomicWriteJson(mapping.workflow.manifest_path, manifest);
         if ("parentGoal" in manifest)
           await publishParentGoalSidebar(

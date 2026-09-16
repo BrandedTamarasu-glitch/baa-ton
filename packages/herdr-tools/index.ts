@@ -120,6 +120,23 @@ const HERDR_PLUGIN_CONFIG_DIR_ENV = "HERDR_PLUGIN_CONFIG_DIR";
 const CONTROLLER_PLUGIN_ID = "herdr-orchestrator-controller";
 const CONTROLLER_CONFIG_NAME = "config.json";
 const SCOPED_GOALS_SCHEMA_VERSION = 1 as const;
+const GOAL_HISTORY_SCHEMA_VERSION = 1 as const;
+type GoalHistoryRecord = ParentGoal & {
+  version: typeof GOAL_HISTORY_SCHEMA_VERSION;
+  archivedAt: string;
+  force?: boolean;
+  reason?: string;
+};
+type ManifestWithGoalHistory = Manifest & {
+  goalHistory?: GoalHistoryRecord[];
+};
+type ParentGoalActionResult =
+  | { goal: ParentGoal; goalHistoryCount: number }
+  | {
+      reset: true;
+      archivedGoalId: string;
+      historyLength: number;
+    };
 const now = () => new Date().toISOString();
 const manifestPath = (cwd: string) => join(cwd, MANIFEST_DIR, MANIFEST_NAME);
 const jsonText = (value: unknown) => JSON.stringify(value, null, 2);
@@ -285,7 +302,7 @@ function normalizeWorkflowGoals(workflow: Workflow): Workflow {
   return workflow;
 }
 
-async function loadManifest(cwd: string): Promise<Manifest> {
+async function loadManifest(cwd: string): Promise<ManifestWithGoalHistory> {
   try {
     const parsed = JSON.parse(await readFile(manifestPath(cwd), "utf8")) as {
       version?: unknown;
@@ -293,6 +310,7 @@ async function loadManifest(cwd: string): Promise<Manifest> {
       parentGoal?: ParentGoal;
       questionRequests?: ParentQuestionRequest[];
       messageRequests?: MessageRecord[];
+      goalHistory?: unknown;
     };
     if (
       (parsed.version === 1 || parsed.version === 2) &&
@@ -306,6 +324,9 @@ async function loadManifest(cwd: string): Promise<Manifest> {
         parentGoal: parsed.parentGoal,
         questionRequests: parsed.questionRequests,
         messageRequests: parsed.messageRequests,
+        ...(Array.isArray(parsed.goalHistory)
+          ? { goalHistory: parsed.goalHistory as GoalHistoryRecord[] }
+          : {}),
       };
     return { version: 2, workflows: [] };
   } catch (error: unknown) {
@@ -420,6 +441,46 @@ type WorkflowWithLaneRetirement = Workflow & {
 
 const MAX_PARENT_GOAL_NUDGE_INTERVAL_SECONDS = 86_400;
 
+const TERMINAL_WORKFLOW_STATUSES = new Set([
+  "completed",
+  "closed",
+  "operator-closed",
+]);
+const TERMINAL_WORKFLOW_OUTCOMES = new Set([
+  "completed",
+  "closed",
+  "operator-closed",
+]);
+
+function nonTerminalWorkflowIds(manifest: ManifestWithGoalHistory): string[] {
+  return manifest.workflows
+    .filter((workflow) => {
+      const hasStatus = typeof workflow.status === "string";
+      const hasOutcome = typeof workflow.outcome === "string";
+      const hasLaneLifecycle = workflow.lanes.some(
+        (lane) => lane.status !== undefined || lane.completionReceipt !== undefined,
+      );
+      const nonTerminalLane = workflow.lanes.some(
+        (lane) =>
+          !lane.completionReceipt &&
+          lane.status !== undefined &&
+          !TERMINAL_LANE_STATUSES.has(lane.status),
+      );
+      // Old diagnostic manifests omitted lifecycle fields. Preserve their
+      // ability to be rewritten while treating every explicitly non-terminal
+      // state conservatively during a parent-goal reset. If a legacy record
+      // does carry lane telemetry, use it as the lifecycle evidence.
+      if (!hasStatus && !hasOutcome && !hasLaneLifecycle)
+        return false;
+      return (
+        nonTerminalLane ||
+        (hasStatus && !TERMINAL_WORKFLOW_STATUSES.has(workflow.status)) ||
+        (hasOutcome && !TERMINAL_WORKFLOW_OUTCOMES.has(workflow.outcome))
+      );
+    })
+    .map((workflow) => workflow.id);
+}
+
 function parentGoalNudgeInterval(value: number | undefined): number {
   const interval = value ?? MIN_PARENT_GOAL_NUDGE_INTERVAL_SECONDS;
   if (
@@ -451,22 +512,67 @@ function requireRootOperator(): void {
 
 async function parentGoal(
   cwd: string,
-  action: "initialize" | "set-state" | "status" | "start" | "stop" | "pause",
+  action:
+    | "initialize"
+    | "set-state"
+    | "status"
+    | "start"
+    | "stop"
+    | "pause"
+    | "reset",
   objective?: string,
   status?: string,
   nextAction?: string,
   nudgeIntervalSeconds?: number,
   pauseReason?: string,
+  force = false,
+  reason?: string,
   rootTurn?: RootTurn,
-): Promise<ParentGoal> {
+): Promise<ParentGoalActionResult> {
   requireRootGoalExecutor();
   const release = await acquireManifestLock(cwd);
   try {
     const manifest = await loadManifest(cwd);
+    const history = Array.isArray(manifest.goalHistory)
+      ? manifest.goalHistory
+      : [];
     if (action === "status") {
       if (!manifest.parentGoal)
         throw new Error("No parent goal is registered.");
-      return manifest.parentGoal;
+      return {
+        goal: manifest.parentGoal,
+        goalHistoryCount: history.length,
+      };
+    }
+    if (action === "reset") {
+      const goal = manifest.parentGoal;
+      if (!goal)
+        throw new Error("No parent goal is registered; initialize one first.");
+      const activeWorkflowIds = nonTerminalWorkflowIds(manifest);
+      const normalizedReason = reason?.trim();
+      if (activeWorkflowIds.length > 0 && !force)
+        throw new Error(
+          `Cannot reset parent goal while routed workflow(s) are non-terminal: ${activeWorkflowIds.join(", ")}. Use force=true with a reason to archive it anyway.`,
+        );
+      if (force && !normalizedReason)
+        throw new Error("reason is required when force=true.");
+      const timestamp = now();
+      const archived = JSON.parse(JSON.stringify(goal)) as GoalHistoryRecord;
+      archived.version = GOAL_HISTORY_SCHEMA_VERSION;
+      archived.archivedAt = timestamp;
+      if (force) {
+        archived.force = true;
+        archived.reason = normalizedReason!;
+      }
+      history.push(archived);
+      manifest.goalHistory = history;
+      delete manifest.parentGoal;
+      await saveManifest(cwd, manifest);
+      return {
+        reset: true,
+        archivedGoalId: goal.id,
+        historyLength: history.length,
+      };
     }
     if (action === "initialize") {
       if (manifest.parentGoal)
@@ -597,7 +703,10 @@ async function parentGoal(
     if (rootTurn && manifest.parentGoal?.supervisor)
       manifest.parentGoal.supervisor.rootTurn = rootTurn;
     await saveManifest(cwd, manifest);
-    return manifest.parentGoal!;
+    return {
+      goal: manifest.parentGoal!,
+      goalHistoryCount: history.length,
+    };
   } finally {
     await release();
   }
@@ -4618,6 +4727,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           Type.Literal("start"),
           Type.Literal("stop"),
           Type.Literal("pause"),
+          Type.Literal("reset"),
         ]),
         objective: Type.Optional(Type.String()),
         status: Type.Optional(Type.String()),
@@ -4629,11 +4739,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           }),
         ),
         pauseReason: Type.Optional(Type.String()),
+        force: Type.Optional(Type.Boolean()),
+        reason: Type.Optional(Type.String()),
       },
       { additionalProperties: false },
     ),
     async execute(_id, params, signal, _update, ctx) {
-      const goal = await parentGoal(
+      const result = await parentGoal(
         ctx.cwd,
         params.action,
         params.objective,
@@ -4641,15 +4753,32 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         params.nextAction,
         params.nudgeIntervalSeconds,
         params.pauseReason,
+        params.force ?? false,
+        params.reason,
         currentRootTurn("active"),
       );
-      if (ctx.hasUI) await publishParentGoalSidebar(goal, signal);
+      if ("reset" in result) {
+        if (ctx.hasUI) await clearParentGoalSidebar(signal);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Archived parent goal ${result.archivedGoalId}; reset complete (${result.historyLength} archived goal${result.historyLength === 1 ? "" : "s"}).`,
+            },
+          ],
+          details: result,
+        };
+      }
+      if (ctx.hasUI) await publishParentGoalSidebar(result.goal, signal);
 
       return {
         content: [
-          { type: "text", text: `Parent goal ${goal.id}: ${goal.status}` },
+          {
+            type: "text",
+            text: `Parent goal ${result.goal.id}: ${result.goal.status} (${result.goalHistoryCount} archived goal${result.goalHistoryCount === 1 ? "" : "s"})`,
+          },
         ],
-        details: { goal },
+        details: { goal: result.goal, goalHistoryCount: result.goalHistoryCount },
       };
     },
   });

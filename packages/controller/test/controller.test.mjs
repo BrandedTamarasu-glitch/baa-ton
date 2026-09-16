@@ -1104,6 +1104,161 @@ test("a new actionable lane event requests root review once", async () => {
   }
 });
 
+test("terminal parent goals emit one durable mismatch signal for active routed workflows", async () => {
+  for (const status of ["completed", "blocked", "paused"]) {
+    const fixture = await createFixture({
+      parentGoal: {
+        version: 1,
+        id: `parent-mismatch-${status}`,
+        objective: "Finish the previous round.",
+        status,
+        nextAction: "Previous round is complete.",
+        signals: [],
+        createdAt: "2026-09-16T00:00:00.000Z",
+        updatedAt: "2026-09-16T00:00:00.000Z",
+      },
+      workflowStatus: "running",
+      workflowOutcome: "running",
+      piGoalPauseDetection: false,
+    });
+    const mock = await startHerdrMock((request) => {
+      if (request.method === "pane.report_metadata") return { result: {} };
+      throw new Error(`Unexpected method: ${request.method}`);
+    });
+    try {
+      const event = {
+        event: "pane_agent_status_changed",
+        data: {
+          type: "pane_agent_status_changed",
+          pane_id: CHILD.pane_id,
+          workspace_id: CHILD.workspace_id,
+          agent_status: "working",
+          agent: "pi",
+        },
+      };
+      await handleHook({
+        eventName: "pane.agent_status_changed",
+        eventJson: event,
+        stateDir: fixture.stateDir,
+        herdr: client(mock),
+      });
+      await handleHook({
+        eventName: "pane.agent_status_changed",
+        eventJson: event,
+        stateDir: fixture.stateDir,
+        herdr: client(mock),
+      });
+      const goal = (await fixture.manifest()).parentGoal;
+      const mismatchSignals = goal.signals.filter((signal) =>
+        signal.identity.startsWith("parent-goal-mismatch:"),
+      );
+      assert.equal(goal.status, "review-requested");
+      assert.equal(mismatchSignals.length, 1);
+      assert.match(goal.nextAction, /parent-mismatch/);
+      assert.match(goal.nextAction, /remain active/);
+      assert.match(goal.nextAction, /herdr_goal action=reset/);
+    } finally {
+      await mock.close();
+      await fixture.cleanup();
+    }
+  }
+});
+
+test("non-terminal parent goals do not get a mismatch signal from mapped events", async () => {
+  for (const status of ["active", "waiting-for-event", "action-required", "review-requested"]) {
+    const fixture = await createFixture({
+      parentGoal: {
+        version: 1,
+        id: `parent-not-mismatch-${status}`,
+        objective: "Continue the current round.",
+        status,
+        nextAction: "Continue current work.",
+        signals: [],
+        createdAt: "2026-09-16T00:00:00.000Z",
+        updatedAt: "2026-09-16T00:00:00.000Z",
+      },
+      workflowStatus: "running",
+      workflowOutcome: "running",
+      piGoalPauseDetection: false,
+    });
+    try {
+      await handleHook({
+        eventName: "pane.agent_status_changed",
+        eventJson: {
+          event: "pane_agent_status_changed",
+          data: {
+            type: "pane_agent_status_changed",
+            pane_id: CHILD.pane_id,
+            workspace_id: CHILD.workspace_id,
+            agent_status: "working",
+            agent: "pi",
+          },
+        },
+        stateDir: fixture.stateDir,
+        herdr: {
+          async request(method) {
+            assert.equal(method, "pane.report_metadata");
+            return { result: {} };
+          },
+        },
+      });
+      const goal = (await fixture.manifest()).parentGoal;
+      assert.equal(goal.status, status);
+      assert.equal(
+        goal.signals.some((signal) => signal.identity.startsWith("parent-goal-mismatch:")),
+        false,
+      );
+    } finally {
+      await fixture.cleanup();
+    }
+  }
+});
+
+test("supervisor tick detects a terminal parent goal with a non-terminal routed workflow", async () => {
+  const fixture = await createFixture({
+    parentGoal: {
+      version: 1,
+      id: "parent-supervisor-mismatch",
+      objective: "Finish the previous round.",
+      status: "completed",
+      nextAction: "Previous round is complete.",
+      signals: [],
+      createdAt: "2026-09-16T00:00:00.000Z",
+      updatedAt: "2026-09-16T00:00:00.000Z",
+    },
+    workflowStatus: "running",
+    workflowOutcome: "running",
+    piGoalPauseDetection: false,
+  });
+  const mock = await startHerdrMock((request) => {
+    if (request.method === "pane.report_metadata") return { result: {} };
+    throw new Error(`Unexpected method: ${request.method}`);
+  });
+  try {
+    const first = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: client(mock),
+      timestamp: "2026-09-16T00:00:01.000Z",
+    });
+    const second = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: client(mock),
+      timestamp: "2026-09-16T00:00:02.000Z",
+    });
+    assert.equal(first.results[0].status, "supervisor-stopped");
+    assert.equal(second.results[0].status, "supervisor-stopped");
+    const goal = (await fixture.manifest()).parentGoal;
+    assert.equal(goal.status, "review-requested");
+    assert.equal(
+      goal.signals.filter((signal) => signal.identity.startsWith("parent-goal-mismatch:")).length,
+      1,
+    );
+  } finally {
+    await mock.close();
+    await fixture.cleanup();
+  }
+});
+
 test("persisted parent questions and approvals mark the goal as user-action-required", async () => {
   const cases = [
     {
