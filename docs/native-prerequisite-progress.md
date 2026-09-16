@@ -169,3 +169,17 @@ noted follow-up: in 3+-lane workflows, re-closing an already-closed lane with
 different evidence is unguarded once another lane's closure holds the single
 workflow-level operatorClosure record. Suite after fix: 73/73 extension + 37/37
 controller, tsc 7.0.2 clean, diff-check clean. Local main tip: `48a1f91` (not pushed).
+
+### Root push carve-out (2026-09-16, user ruling)
+
+The bash guard blocked `git push` from the verified controller-mapped root even with
+explicit user approval recorded — the guard's job is fencing lanes, not handcuffing
+the parent executor acting with the user present. Ruling landed in `04487b6`: a plain
+push-class command is allowed only at the verified root; lanes/unmapped panes and
+every other mutation (merge, PR, deploy, Herdr closure) stay blocked for everyone,
+and compound commands carrying a non-push mutation keep the strict block
+(regression in guards.test.mjs). Note for the papercut ledger: the guard
+pattern-matches full command text including commit messages and heredoc bodies, so
+tests for the guard must be authored through non-bash tools or split literals until
+the matching scope narrows. Round pushed to origin/main at `04487b6` (mascot Baazle,
+assets/mascot.png).
