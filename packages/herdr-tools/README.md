@@ -49,3 +49,17 @@ The deterministic smoke check mocks Herdr and filesystem interactions; it never 
 - [Parent-goal protocol](./GOAL-ADAPTER-PROTOCOL.md)
 - [Topology and cleanup](./TOPOLOGY-CLEANUP-PLAN.md)
 - [Defect ledger](./DEFECTS.md)
+
+## Planning parallel and sequential lanes
+
+A worktree-bound workflow carries exactly one writer lane; multi-lane worktree
+workflows must be all read-only. To parallelize writers, plan one workflow per
+worktree with disjoint file ownership and dispatch them concurrently — lanes that
+touch the same files must be sequenced (plan the second after the first verifies).
+Integration is the parent's job: land lanes linearly, resolve the expected
+type-move conflicts, and re-run the merged suite before calling the round green.
+
+Worktree note: `herdr worktree create` auto-opens a workspace, which plan-time
+inspection rejects. Create the branch, `herdr worktree remove` it, then a plain
+`git worktree add <path> <branch>` registers it with Herdr without an open
+workspace. An upstream `--no-open` flag request is tracked in the progress log.

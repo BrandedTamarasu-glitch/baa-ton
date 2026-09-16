@@ -109,3 +109,47 @@ Genuinely remaining (open):
 - Codex upstream: no MCP-server respawn (dead bridge orphans lane tools for the session); sandbox cannot write linked worktree git metadata; no native wait-for-shell (our 60s process-info gate approximates it).
 - Controller records post-completion lane idles as non-actionable observations (no wake), while blocked and goal-paused transitions remain actionable.
 - Bridge session env must be passed explicitly to codex MCP children (fixed in 42e77c1); any future harness with non-inheriting MCP children needs the same.
+
+## Documented-gap closeout round (2026-09-15 evening, fresh v2 root in w18)
+
+All four writer lanes were gpt-5.6-luna/xhigh via Pi (BB-029 scope, preauthorized
+dispatch), run as parallel-first single-lane workflows over two worktrees
+(astra-paseo-closeout: controller; astra-paseo-contract: herdr-tools), parent-verified
+between lanes, then landed linearly on local main. Note the merge-gate mechanics:
+the extension's own bash guard blocks root `git merge`/`git push` regardless of
+recorded approval, so integration used the established parent-landing pattern
+(cherry-pick), with the lane 3b enum ported into contract.ts where lane 2 moved
+the types; the amended commit carries the runtime-set fix.
+
+Landed (local main): `28a5927` neutral contract module + PersistenceHandle
+(Paseo 3+7) with planted-import neutrality regression; `32752ec` live capability
+discovery (Paseo 4) — optional `discoverCatalog`, documented sha256 cacheKey
+identity {provider,model,auth,source}, provider-scoped live registry refresh,
+bridge refuses frozen startup snapshots, fail-closed on discovery errors;
+`7bd4d4a` post-completion wake-noise suppression (done/idle after a receipt or
+terminal workflow status -> non-actionable; blocked/goal-paused stay actionable);
+`0ac1c33` goal-status semantics (lane events -> `review-requested`; parent
+questions/approvals -> `action-required`; enum additions live in contract.ts).
+Merged suite 72/72 extension + 36/36 controller, tsc 7.0.2 clean, diff-check
+clean. Root extension reloaded post-merge; controller hook path live
+(resident supervisor still on pre-round code until the next server restart —
+its paths are secondary to the hook-side suppression).
+
+Cross-vendor review (Claude, read-only) recorded separately below when complete.
+
+New papercuts/observations from this round:
+
+- `herdr worktree create` auto-opens a workspace that plan-time inspection rejects;
+  documented recipe above; upstream `--no-open` flag request stands.
+- Concurrent dispatches race on `mkdir config.json.lock` (EEXIST for the loser;
+  fails closed, retry succeeds). Lock acquisition should retry rather than die.
+- Reload-ack only journals within an explicit activation window; ad-hoc `/reload`
+  of a fresh root records no ack (observed on the round's root reload).
+- The main checkout had no unsaved dev deps (typescript/@earendil-works/@types/node),
+  so merged-main verification initially showed 5 cancelled tests and a fake-tsc
+  failure. Consider carrying devDependencies in package.json so checkouts are
+  self-sufficient, or a documented `npm run verify` that installs them.
+
+Design philosophy now written down: [DESIGN-PHILOSOPHY.md](DESIGN-PHILOSOPHY.md) —
+enforced interface, truthful capabilities, fail-closed, bridge as transport,
+ACP tier, pane-based root authority (any qualified harness can host the root).
