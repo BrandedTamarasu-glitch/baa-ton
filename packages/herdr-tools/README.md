@@ -63,6 +63,18 @@ removed. `herdr_observe` returns the current root's root-plus-lane entries in
 `details.sessionLog`; the manifest is the durable source of truth. Resume and
 cleanup/retirement are follow-up rounds built on this trace.
 
+## Cleanup sweep
+
+`herdr_sweep` is a root-only, dry-run-by-default inventory of terminal lane tabs
+and unopened orphaned Git worktrees belonging to the current root. Passing
+`execute: true` always shows the complete bounded tab/worktree list in the
+native `ctx.ui.confirm` dialog; no authorization policy can bypass that human
+gate. A decline has zero side effects. After confirmation it retires recorded
+lane tabs, verifies worktrees are clean, then runs direct non-forced Git
+worktree and branch removal. Dirty, open, changed, or failed resources remain
+in place and receive durable manifest evidence; session-log entries are marked
+`retired` or `gone` only when the corresponding cleanup succeeds.
+
 ## Run as MCP
 
 After `npm install` in the repository root, configure a local stdio MCP client with:

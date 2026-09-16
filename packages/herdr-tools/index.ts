@@ -12,9 +12,11 @@ import {
 } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
+import { execFile as execFileCallback } from "node:child_process";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { promisify } from "node:util";
 import { setTimeout as lockRetryDelay } from "node:timers/promises";
 import type {
   ExtensionAPI,
@@ -112,6 +114,7 @@ const MANIFEST_NAME = "manifest.json";
 const OWNER = "herdr-orchestrator";
 const BB029_AUTHORIZATION_SCOPE = "BB-029";
 const HERDR_COMMAND_TIMEOUT_MS = 35_000;
+const execFile = promisify(execFileCallback);
 const RECENT_AGENT_OUTPUT_LINES = 120;
 const GOAL_PAUSE_OUTPUT_LIMIT = 6000;
 const MESSAGE_SUMMARY_MAX_LENGTH = 4000;
@@ -183,6 +186,36 @@ const manifestPath = (cwd: string) => join(cwd, MANIFEST_DIR, MANIFEST_NAME);
 const jsonText = (value: unknown) => JSON.stringify(value, null, 2);
 const clip = (text: string, limit = 6000) =>
   text.length > limit ? `${text.slice(0, limit)}\n[truncated]` : text;
+
+async function runDirectGit(
+  args: string[],
+  signal?: AbortSignal,
+): Promise<string> {
+  try {
+    const result = await execFile("git", args, {
+      encoding: "utf8",
+      maxBuffer: 2 * 1024 * 1024,
+      signal,
+      timeout: HERDR_COMMAND_TIMEOUT_MS,
+    });
+    return result.stdout.trim();
+  } catch (error) {
+    const failure = error as {
+      message?: unknown;
+      stderr?: unknown;
+      stdout?: unknown;
+    };
+    const detail =
+      typeof failure.stderr === "string" && failure.stderr.trim()
+        ? failure.stderr.trim()
+        : typeof failure.stdout === "string" && failure.stdout.trim()
+          ? failure.stdout.trim()
+          : typeof failure.message === "string"
+            ? failure.message
+            : String(error);
+    throw new Error(`git ${args.join(" ")} failed: ${clip(detail, 1600)}`);
+  }
+}
 
 async function rootBootstrapPrompt(cwd: string): Promise<string> {
   if (!isRootOrchestrator()) return "";
@@ -680,6 +713,27 @@ type LaneRetirementRecord = {
 
 type WorkflowWithLaneRetirement = Workflow & {
   laneRetirement?: LaneRetirementRecord;
+};
+
+type CleanupTabCandidate = {
+  workflowId: string;
+  tabId: string;
+  label: string;
+  workspaceId: string;
+};
+
+type CleanupWorktreeCandidate = {
+  workflowId: string;
+  path: string;
+  branch: string;
+  openWorkspaceId?: string | null;
+};
+
+type CleanupInventory = {
+  root: { paneId: string; workspaceId: string; orchestratorId: string };
+  laneTabs: CleanupTabCandidate[];
+  worktrees: CleanupWorktreeCandidate[];
+  issues: Array<{ workflowId?: string; resource?: string; error: string }>;
 };
 
 const MAX_PARENT_GOAL_NUDGE_INTERVAL_SECONDS = 86_400;
@@ -5045,6 +5099,586 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     };
   }
 
+  async function cleanupSweepInventory(
+    cwd: string,
+    signal?: AbortSignal,
+  ): Promise<{
+    inventory: CleanupInventory;
+    workflows: Map<string, Workflow>;
+    retirementWorkflowIds: string[];
+  }> {
+    requireHerdr();
+    if (!isRootOrchestrator())
+      throw new Error(
+        "Cleanup sweep is root-only: only the verified controller-mapped root may enumerate or retire resources.",
+      );
+    const root = await currentPaneRoot(signal);
+    // Inventory must be genuinely read-only: controllerConfigPath() repairs
+    // directory permissions and may create the directory, which is appropriate
+    // for writers but not for a dry-run.
+    const config = await loadControllerConfig(rootConfigPath());
+    if (!config)
+      throw new Error("Cleanup sweep requires a registered controller root.");
+    const targetManifestPath = resolve(manifestPath(cwd));
+    const records = config.orchestrators.filter(
+      (record) =>
+        sameControllerRoot(record.root, root) &&
+        (record.program.id === "legacy-global" ||
+          samePath(record.program.id, cwd) ||
+          (record.program.parent_manifest_path !== undefined &&
+            samePath(record.program.parent_manifest_path, targetManifestPath))),
+    );
+    if (records.length !== 1)
+      throw new Error(
+        records.length === 0
+          ? "The verified controller-mapped root does not own this cleanup manifest."
+          : "Cleanup sweep refused: the current root has an ambiguous controller mapping for this manifest.",
+      );
+    const orchestrator = records[0];
+    const manifest = await loadManifest(cwd);
+    const routedIds = new Set(
+      orchestrator.workflows
+        .filter((mapping) => samePath(mapping.manifest_path, targetManifestPath))
+        .map((mapping) => mapping.workflow_id),
+    );
+    // A retired workflow has intentionally had its controller route removed.
+    // Keep it in scope only when its task binding still proves ownership by
+    // this root; never search manifests belonging to another orchestrator.
+    const workflows = new Map<string, Workflow>();
+    for (const workflow of manifest.workflows) {
+      if (workflow.ownership?.createdBy !== OWNER) continue;
+      const taskOwned =
+        workflow.taskBinding?.rootPaneId === root.pane_id &&
+        workflow.taskBinding.workspaceId === root.workspace_id;
+      if (routedIds.has(workflow.id) || taskOwned)
+        workflows.set(workflow.id, workflow);
+    }
+
+    const issues: CleanupInventory["issues"] = [];
+    const retirementWorkflowIds: string[] = [];
+    const laneTabs: CleanupTabCandidate[] = [];
+    const pendingTabIdsByWorkflow = new Map<string, string[]>();
+    const tabWorkspaceIds = new Set<string>();
+    for (const workflow of workflows.values()) {
+      const retirement = (workflow as WorkflowWithLaneRetirement).laneRetirement;
+      const allTerminal =
+        workflow.lanes.length > 0 &&
+        workflow.lanes.every(
+          (lane) =>
+            Boolean(lane.completionReceipt) ||
+            TERMINAL_LANE_STATUSES.has(lane.status),
+        );
+      if (!allTerminal || !workflow.taskBinding) continue;
+      if (retirement?.status === "retired") continue;
+      const recordedTabs = Array.isArray(workflow.ownership.tabIds)
+        ? workflow.ownership.tabIds.filter(
+            (tabId): tabId is string =>
+              typeof tabId === "string" && Boolean(tabId.trim()),
+          )
+        : [];
+      if (
+        workflow.ownership.workspaceId &&
+        workflow.ownership.workspaceId !== workflow.taskBinding.workspaceId
+      ) {
+        issues.push({
+          workflowId: workflow.id,
+          resource: "lane-tabs",
+          error:
+            "recorded ownership workspace differs from the task workspace; tabs were not made sweep candidates",
+        });
+        continue;
+      }
+      const closed = new Set(retirement?.closedTabIds ?? []);
+      // Match retireTaskLaneTabs exactly: ownership.tabIds is authoritative,
+      // while a partial record's pending list is only a derived breadcrumb.
+      const pending = recordedTabs.filter(
+        (tabId, index, list) =>
+          !closed.has(tabId) && list.indexOf(tabId) === index,
+      );
+      retirementWorkflowIds.push(workflow.id);
+      pendingTabIdsByWorkflow.set(workflow.id, pending);
+      tabWorkspaceIds.add(workflow.taskBinding.workspaceId);
+    }
+
+    const labelsByWorkspace = new Map<string, Map<string, string>>();
+    for (const workspaceId of tabWorkspaceIds) {
+      const labels = new Map<string, string>();
+      try {
+        const listed = responseRecord(
+          await runHerdr(["tab", "list", "--workspace", workspaceId], signal),
+          "cleanup task workspace tab list",
+        );
+        if (!Array.isArray(listed.tabs))
+          throw new Error("Herdr task workspace tab list returned no tabs.");
+        for (const item of listed.tabs) {
+          if (!isRecord(item) || typeof item.tab_id !== "string") continue;
+          if (item.workspace_id !== undefined && item.workspace_id !== workspaceId)
+            continue;
+          const label = [item.label, item.name, item.title].find(
+            (value): value is string => typeof value === "string" && Boolean(value),
+          );
+          labels.set(item.tab_id, label ?? "<unlabeled tab>");
+        }
+      } catch (error) {
+        issues.push({
+          resource: `tabs in ${workspaceId}`,
+          error: `could not read tab labels: ${(error as Error).message}`,
+        });
+      }
+      labelsByWorkspace.set(workspaceId, labels);
+    }
+    for (const workflow of workflows.values()) {
+      const pending = pendingTabIdsByWorkflow.get(workflow.id);
+      if (!pending || !workflow.taskBinding) continue;
+      const labels = labelsByWorkspace.get(workflow.taskBinding.workspaceId)!;
+      for (const tabId of pending)
+        laneTabs.push({
+          workflowId: workflow.id,
+          tabId,
+          label: labels.get(tabId) ?? "<tab label unavailable>",
+          workspaceId: workflow.taskBinding.workspaceId,
+        });
+    }
+
+    const worktrees: CleanupWorktreeCandidate[] = [];
+    const worktreePaths = new Map<string, string>();
+    for (const workflow of workflows.values()) {
+      const allTerminal =
+        workflow.lanes.length > 0 &&
+        workflow.lanes.every(
+          (lane) =>
+            Boolean(lane.completionReceipt) ||
+            TERMINAL_LANE_STATUSES.has(lane.status),
+        );
+      const retirement = (workflow as WorkflowWithLaneRetirement).laneRetirement;
+      // Worktree removal is confirmed as a separate, already-fully-retired
+      // resource. A tab retirement completed during this invocation is not
+      // enough to authorize a worktree that was absent from the confirmation
+      // list; the next sweep will enumerate it.
+      if (!allTerminal || !workflow.worktree || retirement?.status !== "retired")
+        continue;
+      const path = resolve(workflow.worktree);
+      if (worktreePaths.has(path)) {
+        issues.push({
+          workflowId: workflow.id,
+          resource: "worktree",
+          error: `recorded worktree duplicates workflow ${worktreePaths.get(path)}; neither duplicate was made a candidate`,
+        });
+        continue;
+      }
+      worktreePaths.set(path, workflow.id);
+      let details: Awaited<ReturnType<typeof lstat>>;
+      try {
+        details = await lstat(path);
+        if (!details.isDirectory() || details.isSymbolicLink())
+          throw new Error("path is not a real directory");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        issues.push({
+          workflowId: workflow.id,
+          resource: "worktree",
+          error: `recorded worktree is not a usable on-disk directory: ${(error as Error).message}`,
+        });
+        continue;
+      }
+      try {
+        const listed = responseRecord(
+          await runHerdr(["worktree", "list", "--cwd", path], signal),
+          "cleanup worktree list",
+        );
+        if (!Array.isArray(listed.worktrees))
+          throw new Error("Herdr worktree list returned no worktrees.");
+        const matches = listed.worktrees.filter(
+          (item: unknown): item is Record<string, unknown> =>
+            isRecord(item) &&
+            typeof item.path === "string" &&
+            samePath(item.path, path),
+        );
+        if (matches.length !== 1)
+          throw new Error(`expected one registered worktree, found ${matches.length}`);
+        const openWorkspaceId = matches[0].open_workspace_id;
+        if (typeof openWorkspaceId === "string" && openWorkspaceId) {
+          issues.push({
+            workflowId: workflow.id,
+            resource: "worktree",
+            error: `worktree is open in Herdr workspace ${openWorkspaceId}; it was not made a candidate`,
+          });
+          continue;
+        }
+        const git = await cleanupGitWorktreeDetails(
+          path,
+          workflow.worktreeBinding,
+          signal,
+          cwd,
+        );
+        worktrees.push({
+          workflowId: workflow.id,
+          path,
+          branch: git.branch,
+          ...(openWorkspaceId === null ? { openWorkspaceId: null } : {}),
+        });
+      } catch (error) {
+        issues.push({
+          workflowId: workflow.id,
+          resource: "worktree",
+          error: `worktree is not a cleanable unopened Git worktree: ${(error as Error).message}`,
+        });
+      }
+    }
+    return {
+      inventory: {
+        root: {
+          paneId: root.pane_id,
+          workspaceId: root.workspace_id,
+          orchestratorId: orchestrator.id,
+        },
+        laneTabs,
+        worktrees,
+        issues,
+      },
+      workflows,
+      retirementWorkflowIds,
+    };
+  }
+
+  async function cleanupGitWorktreeDetails(
+    path: string,
+    binding: WorktreeBinding | undefined,
+    signal?: AbortSignal,
+    expectedRepositoryParent?: string,
+  ): Promise<{ branch: string; parent: string }> {
+    const canonicalPath = await realpath(path);
+    const checkout = await runDirectGit(["-C", path, "rev-parse", "--show-toplevel"], signal);
+    if (!samePath(await realpath(checkout), canonicalPath))
+      throw new Error("recorded path is not the Git worktree root");
+    const metadata = await gitMetadataDirectories(path);
+    const common = resolve(metadata.commonDirectory);
+    if (basename(common) !== ".git")
+      throw new Error("Git common metadata does not identify a normal repository parent");
+    const commonCanonical = await realpath(common);
+    const recordedParent = binding?.repoParent?.checkoutPath
+      ? await realpath(binding.repoParent.checkoutPath)
+      : undefined;
+    const expectedParent = expectedRepositoryParent
+      ? await realpath(expectedRepositoryParent)
+      : undefined;
+    if (recordedParent) {
+      const recordedMetadata = await gitMetadataDirectories(recordedParent);
+      if (
+        !samePath(
+          await realpath(recordedMetadata.commonDirectory),
+          commonCanonical,
+        )
+      )
+        throw new Error("recorded repository parent differs from Git metadata");
+    }
+    // The current root may itself be a linked worktree. In that case Git's
+    // common metadata parent is the main checkout, while either the recorded
+    // parent or current root is still a valid command surface for removal.
+    const parent = expectedParent ?? recordedParent ?? (await realpath(dirname(common)));
+    if (samePath(parent, canonicalPath))
+      throw new Error("refusing to remove the root checkout");
+    const parentMetadata = await gitMetadataDirectories(parent);
+    if (!samePath(await realpath(parentMetadata.commonDirectory), commonCanonical))
+      throw new Error("worktree repository parent is outside the current root checkout");
+    const parentRoot = await runDirectGit(
+      ["-C", parent, "rev-parse", "--show-toplevel"],
+      signal,
+    );
+    if (!samePath(await realpath(parentRoot), parent))
+      throw new Error("repository parent is not a Git checkout root");
+    const records = parseGitWorktreeRecords(
+      await runDirectGit(["-C", parent, "worktree", "list", "--porcelain"], signal),
+    );
+    let record: { path: string; branch?: string } | undefined;
+    for (const item of records) {
+      try {
+        if (samePath(await realpath(item.path), canonicalPath)) {
+          record = item;
+          break;
+        }
+      } catch {
+        // A stale Git registration is not a removable worktree candidate.
+      }
+    }
+    if (!record) throw new Error("Git does not register the recorded worktree");
+    const branch = await runDirectGit(["-C", path, "branch", "--show-current"], signal);
+    if (!branch) throw new Error("recorded worktree is detached and has no branch to remove");
+    if (record.branch !== `refs/heads/${branch}`)
+      throw new Error("Git worktree branch differs from the recorded branch");
+    return { branch, parent };
+  }
+
+  function parseGitWorktreeRecords(
+    output: string,
+  ): Array<{ path: string; branch?: string }> {
+    const records: Array<{ path: string; branch?: string }> = [];
+    let current: { path: string; branch?: string } | undefined;
+    for (const line of output.split(/\r?\n/)) {
+      if (line.startsWith("worktree ")) {
+        if (current) records.push(current);
+        current = { path: line.slice("worktree ".length) };
+      } else if (current && line.startsWith("branch ")) {
+        current.branch = line.slice("branch ".length);
+      }
+    }
+    if (current) records.push(current);
+    return records;
+  }
+
+  async function recordCleanupSweepEvidence(
+    cwd: string,
+    workflowId: string,
+    kind: string,
+    text: string,
+  ): Promise<void> {
+    await withManifestTransaction(cwd, (manifest) => {
+      const workflow = workflowFor(manifest, workflowId);
+      workflow.evidence.push({ at: now(), kind, text: clip(text, 4000) });
+      workflow.updatedAt = now();
+    });
+  }
+
+  async function cleanupWorktreeOpenWorkspace(
+    path: string,
+    signal?: AbortSignal,
+  ): Promise<string | null | undefined> {
+    const listed = responseRecord(
+      await runHerdr(["worktree", "list", "--cwd", path], signal),
+      "cleanup worktree list",
+    );
+    if (!Array.isArray(listed.worktrees))
+      throw new Error("Herdr worktree list returned no worktrees.");
+    const matches = listed.worktrees.filter(
+      (item: unknown): item is Record<string, unknown> =>
+        isRecord(item) &&
+        typeof item.path === "string" &&
+        samePath(item.path, path),
+    );
+    if (matches.length !== 1)
+      throw new Error(`expected one registered worktree, found ${matches.length}`);
+    const openWorkspaceId = matches[0].open_workspace_id;
+    if (openWorkspaceId !== undefined && openWorkspaceId !== null && typeof openWorkspaceId !== "string")
+      throw new Error("Herdr worktree list returned an invalid open workspace ID");
+    return openWorkspaceId as string | null | undefined;
+  }
+
+  function cleanupSweepSummary(inventory: CleanupInventory): string {
+    const lines = [
+      `Cleanup sweep will retire ${inventory.laneTabs.length} lane tab(s) and remove ${inventory.worktrees.length} unopened worktree(s).`,
+      "Lane tabs:",
+      ...(inventory.laneTabs.length
+        ? inventory.laneTabs.map(
+            (item) =>
+              `- ${item.workflowId}: ${item.tabId} (${item.label}) [workspace ${item.workspaceId}]`,
+          )
+        : ["- none"]),
+      "Worktrees:",
+      ...(inventory.worktrees.length
+        ? inventory.worktrees.map(
+            (item) =>
+              `- ${item.workflowId}: ${item.path} [branch ${item.branch}]`,
+          )
+        : ["- none"]),
+    ];
+    if (inventory.issues.length) {
+      lines.push("Retained / not touched:");
+      lines.push(
+        ...inventory.issues.map(
+          (issue) =>
+            `- ${issue.workflowId ? `${issue.workflowId}: ` : ""}${
+              issue.resource ? `${issue.resource}: ` : ""
+            }${issue.error}`,
+        ),
+      );
+    }
+    return clip(lines.join("\n"), 9000);
+  }
+
+  async function cleanupSweep(
+    cwd: string,
+    execute: boolean,
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+  ) {
+    const scoped = await cleanupSweepInventory(cwd, signal);
+    const { inventory } = scoped;
+    if (!execute)
+      return { dryRun: true, ...inventory };
+    if (ctx.mode !== "tui" || !ctx.hasUI)
+      throw new Error(
+        "Cleanup sweep execution requires native TUI confirmation from the verified root orchestrator.",
+      );
+    const approved = await ctx.ui.confirm(
+      "Herdr cleanup sweep",
+      `${cleanupSweepSummary(inventory)}\n\nProceed? This confirmation is always required; no authorization policy can bypass it.`,
+    );
+    if (!approved) return { cancelled: true, ...inventory };
+
+    const errors: Array<{ workflowId?: string; resource: string; error: string }> = [];
+    const retirementResults: Array<Record<string, unknown>> = [];
+    const tabWorkflowIds = new Set(scoped.retirementWorkflowIds);
+    for (const workflowId of tabWorkflowIds) {
+      const workflow = scoped.workflows.get(workflowId);
+      if (!workflow) continue;
+      const tabIds = inventory.laneTabs
+        .filter((item) => item.workflowId === workflowId)
+        .map((item) => item.tabId);
+      try {
+        const result = await retireTaskLaneTabs(
+          cwd,
+          workflowId,
+          workflow,
+          [
+            `Cleanup sweep approved; confirmed lane tabs: ${
+              tabIds.length ? tabIds.join(", ") : "none"
+            }.`,
+          ],
+          true,
+          signal,
+        );
+        retirementResults.push({
+          workflowId,
+          laneRetired: result.laneRetired,
+          closedTabIds: result.closedTabIds,
+          failedTabIds: result.failedTabIds,
+          partialFailure: result.partialFailure,
+        });
+        if (result.partialFailure)
+          for (const failure of result.closeErrors ?? [])
+            errors.push({
+              workflowId,
+              resource: "lane-tabs",
+              error: `${failure.tabId}: ${failure.error}`,
+            });
+      } catch (error) {
+        const message = (error as Error).message;
+        errors.push({ workflowId, resource: "lane-tabs", error: message });
+        try {
+          await recordCleanupSweepEvidence(
+            cwd,
+            workflowId,
+            "cleanup-sweep-lane-retirement-failed",
+            message,
+          );
+        } catch (evidenceError) {
+          errors.push({
+            workflowId,
+            resource: "manifest evidence",
+            error: `could not persist lane failure evidence: ${(evidenceError as Error).message}`,
+          });
+        }
+      }
+    }
+
+    const worktreeResults: Array<Record<string, unknown>> = [];
+    for (const candidate of inventory.worktrees) {
+      try {
+        const workflow = workflowFor(await loadManifest(cwd), candidate.workflowId) as WorkflowWithLaneRetirement;
+        const currentRetirement = workflow.laneRetirement;
+        if (currentRetirement?.status !== "retired")
+          throw new Error("lane tabs did not become fully retired; worktree remains");
+        if (!workflow.worktree || !samePath(workflow.worktree, candidate.path))
+          throw new Error("recorded worktree changed after confirmation");
+        const openWorkspaceId = await cleanupWorktreeOpenWorkspace(candidate.path, signal);
+        if (typeof openWorkspaceId === "string" && openWorkspaceId)
+          throw new Error(`worktree became open in Herdr workspace ${openWorkspaceId}`);
+        const git = await cleanupGitWorktreeDetails(
+          candidate.path,
+          workflow.worktreeBinding,
+          signal,
+          cwd,
+        );
+        if (git.branch !== candidate.branch)
+          throw new Error("worktree branch changed after confirmation");
+        const dirty = await runDirectGit(
+          ["-C", candidate.path, "status", "--porcelain", "--untracked-files=all"],
+          signal,
+        );
+        if (dirty)
+          throw new Error("worktree is dirty; refusing removal without force");
+        await runDirectGit(
+          ["-C", git.parent, "worktree", "remove", candidate.path],
+          signal,
+        );
+        let branchError: string | undefined;
+        try {
+          await runDirectGit(
+            ["-C", git.parent, "branch", "-D", "--", candidate.branch],
+            signal,
+          );
+        } catch (error) {
+          branchError = (error as Error).message;
+        }
+        await withManifestTransaction(cwd, (manifest) => {
+          const stored = workflowFor(manifest, candidate.workflowId);
+          for (const lane of stored.lanes)
+            if (
+              lane.sessionLog &&
+              (!lane.sessionLog.worktree ||
+                samePath(lane.sessionLog.worktree, candidate.path))
+            )
+              lane.sessionLog = { ...lane.sessionLog, status: "gone" };
+          const timestamp = now();
+          stored.evidence.push({
+            at: timestamp,
+            kind: "cleanup-sweep-worktree-gone",
+            text: JSON.stringify({
+              path: candidate.path,
+              branch: candidate.branch,
+              branchRemoved: !branchError,
+              ...(branchError ? { branchError } : {}),
+            }),
+          });
+          stored.updatedAt = timestamp;
+        });
+        worktreeResults.push({
+          workflowId: candidate.workflowId,
+          path: candidate.path,
+          branch: candidate.branch,
+          removed: true,
+          branchRemoved: !branchError,
+          ...(branchError ? { branchError } : {}),
+        });
+        if (branchError)
+          errors.push({
+            workflowId: candidate.workflowId,
+            resource: "branch",
+            error: branchError,
+          });
+      } catch (error) {
+        const message = (error as Error).message;
+        errors.push({
+          workflowId: candidate.workflowId,
+          resource: "worktree",
+          error: message,
+        });
+        try {
+          await recordCleanupSweepEvidence(
+            cwd,
+            candidate.workflowId,
+            "cleanup-sweep-worktree-retained",
+            `${candidate.path}: ${message}`,
+          );
+        } catch (evidenceError) {
+          errors.push({
+            workflowId: candidate.workflowId,
+            resource: "manifest evidence",
+            error: `could not persist worktree failure evidence: ${(evidenceError as Error).message}`,
+          });
+        }
+      }
+    }
+    return {
+      swept: true,
+      partialFailure: errors.length > 0,
+      ...inventory,
+      retirementResults,
+      worktreeResults,
+      errors,
+    };
+  }
+
   async function close(
     cwd: string,
     id: string,
@@ -6262,6 +6896,54 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                   : laneRetirementResult.cancelled
                     ? "Close cancelled"
                     : `Closed ${params.workflowId}`,
+          },
+        ],
+        details: result,
+      };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_sweep",
+    label: "Herdr Cleanup Sweep",
+    description:
+      "Root-only cleanup sweep for recorded terminal lane tabs and unopened orphaned Git worktrees; dry-run by default and always requires native confirmation before mutation.",
+    promptSnippet:
+      "Enumerate and, after mandatory native confirmation, clean terminal lane tabs and unopened worktrees for this root.",
+    promptGuidelines: [
+      "Use herdr_sweep from the verified controller-mapped root. It is dry-run by default; execute=true always presents ctx.ui.confirm with the concrete bounded list, regardless of authorizationPolicy. Never use it to clean another root's resources.",
+    ],
+    parameters: Type.Object(
+      { execute: Type.Optional(Type.Boolean()) },
+      { additionalProperties: false },
+    ),
+    async execute(_id, params, signal, _update, ctx) {
+      const result = await cleanupSweep(
+        ctx.cwd,
+        params.execute ?? false,
+        ctx,
+        signal,
+      );
+      const details = result as {
+        dryRun?: boolean;
+        cancelled?: boolean;
+        swept?: boolean;
+        laneTabs?: CleanupTabCandidate[];
+        worktrees?: CleanupWorktreeCandidate[];
+        partialFailure?: boolean;
+      };
+      const tabCount = details.laneTabs?.length ?? 0;
+      const worktreeCount = details.worktrees?.length ?? 0;
+      return {
+        content: [
+          {
+            type: "text",
+            text: details.dryRun
+              ? `Dry-run cleanup sweep: ${tabCount} lane tab(s), ${worktreeCount} worktree(s).`
+              : details.cancelled
+                ? "Cleanup sweep cancelled; no resources were touched."
+                : details.partialFailure
+                  ? `Cleanup sweep partially completed: ${tabCount} lane tab(s), ${worktreeCount} worktree(s) considered; see errors.`
+                  : `Cleanup sweep completed: ${tabCount} lane tab(s), ${worktreeCount} worktree(s) considered.`,
           },
         ],
         details: result,
