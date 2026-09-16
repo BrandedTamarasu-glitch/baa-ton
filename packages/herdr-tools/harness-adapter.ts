@@ -1,4 +1,7 @@
 import type { LaunchProfile } from "./launch-profile.js";
+import type { NativeSessionRef, PersistenceHandle } from "./contract.js";
+
+export type { NativeSessionRef, PersistenceHandle } from "./contract.js";
 
 export const PROTOCOL_OPERATIONS = {
   plan: "plan",
@@ -15,7 +18,6 @@ export const STARTUP_PROOF_REQUIRED_OPERATIONS = [
   PROTOCOL_OPERATIONS.complete,
 ] as const satisfies readonly ProtocolOperation[];
 
-export type NativeSessionRef = { kind: "path" | "id"; value: string };
 export type HarnessLifecycle = "native" | "screen" | "unavailable";
 
 /**
@@ -35,7 +37,9 @@ export type StartupProof = {
   source: string;
   profile: LaunchProfile;
   operations: ProtocolOperation[];
+  /** Legacy native view; generalized persistence is stored alongside it. */
   session: NativeSessionRef;
+  persistence?: PersistenceHandle;
 };
 
 /** Versioned boundary. No Pi context, TUI or screen-parser types in this contract. */

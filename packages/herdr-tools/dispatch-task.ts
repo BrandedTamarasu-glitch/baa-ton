@@ -2,7 +2,11 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import type { Workflow, Lane } from "./index.js";
+import {
+  toPersistenceHandle,
+  type Lane,
+  type Workflow,
+} from "./contract.js";
 import {
   LAUNCH_PROFILE_SCHEMA_VERSION,
   validateLaunchProfile,
@@ -266,6 +270,7 @@ export async function dispatchTask(
           delete current.promptAttemptedAt;
           delete current.promptedAt;
           delete current.nativeSession;
+          delete current.persistenceHandle;
           delete current.agentSessionPath;
           delete current.agentSessionId;
           delete current.piSessionPath;
@@ -611,6 +616,10 @@ export async function dispatchTask(
       await update((w) => {
         const current = w.lanes[i];
         current.nativeSession = proof.session;
+        current.persistenceHandle = toPersistenceHandle(
+          proof.persistence ?? proof.session,
+          profile.provider,
+        );
         current.incarnationStartedAt = new Date().toISOString();
         if (proof.session.kind === "path")
           current.agentSessionPath = proof.session.value;

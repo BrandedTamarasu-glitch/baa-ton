@@ -22,6 +22,38 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { blocksUnmanagedAgentCommand } from "./command-policy.js";
+import {
+  AUTHORIZATION_CAPABILITIES,
+  SUPPORTED_AGENT_KINDS,
+  toPersistenceHandle,
+  type AgentKind,
+  type ApprovalRequest,
+  type AuthorizationCapability,
+  type AuthorizationDecision,
+  type AuthorizationPolicy,
+  type AutonomousOperation,
+  type ControllerConfig,
+  type ControllerLaneMapping,
+  type ControllerOrchestrator,
+  type ControllerRootMapping,
+  type ControllerWorkflowMapping,
+  type EventControllerRegistration,
+  type ExecResult,
+  type GoalOutcome,
+  type GoalRecord,
+  type GoalStatus,
+  type GoalResumeReceipt,
+  type Lane,
+  type LaneInput,
+  type Manifest,
+  type NativeSessionRef,
+  type ParentGoal,
+  type ParentGoalStatus,
+  type ParentQuestionRequest,
+  type RootTurn,
+  type WorktreeBinding,
+  type Workflow,
+} from "./contract.js";
 import { dispatchTask } from "./dispatch-task.js";
 import {
   LAUNCH_PROFILE_SCHEMA_VERSION,
@@ -36,7 +68,6 @@ import { opencodeLaunchAdapter } from "./opencode-launch-adapter.js";
 import {
   HarnessAdapterRegistry,
   STARTUP_PROOF_REQUIRED_OPERATIONS,
-  type NativeSessionRef,
 } from "./harness-adapter.js";
 import { fileURLToPath } from "node:url";
 import { acknowledgeActivation } from "./activation-ack.mjs";
@@ -45,396 +76,6 @@ const MANIFEST_DIR = ".pi/herdr-orchestrator";
 const MANIFEST_NAME = "manifest.json";
 const OWNER = "herdr-orchestrator";
 const BB029_AUTHORIZATION_SCOPE = "BB-029";
-// Exact installed Herdr `agent start --kind` compatibility set (2026-09-13).
-const SUPPORTED_AGENT_KINDS = [
-  "pi",
-  "claude",
-  "codex",
-  "gemini",
-  "cursor",
-  "devin",
-  "agy",
-  "cline",
-  "omp",
-  "mastracode",
-  "opencode",
-  "copilot",
-  "kimi",
-  "kiro",
-  "droid",
-  "amp",
-  "grok",
-  "hermes",
-  "kilo",
-  "qodercli",
-  "qwen",
-  "maki",
-  "muse",
-] as const;
-type AgentKind = (typeof SUPPORTED_AGENT_KINDS)[number];
-const AUTHORIZATION_CAPABILITIES = [
-  "local-herdr-topology",
-  "clean-local-worktrees",
-  "foreground-tests",
-  "observe-retry-review",
-  "durable-ledger",
-  "paused-goal-recovery",
-] as const;
-type AuthorizationCapability = (typeof AUTHORIZATION_CAPABILITIES)[number];
-type AutonomousOperation = "dispatch" | "retry" | "resume";
-type AuthorizationPolicy = {
-  version: 1;
-  scope: { workflow: typeof BB029_AUTHORIZATION_SCOPE; localOnly: true };
-  capabilities: AuthorizationCapability[];
-};
-type AuthorizationDecision = {
-  allowed: boolean;
-  operation: AutonomousOperation;
-  reason: string;
-  policy?: AuthorizationPolicy;
-};
-
-type ReadinessCheck = {
-  source: "herdr agent start --timeout";
-  checkedAt: string;
-  initialShellForeground: boolean;
-  agentStartTimeoutMs: number;
-};
-type RetryState = {
-  state: "dispatching" | "retryable";
-  attempt: number;
-  retryCommand: string;
-  resumedAt?: string;
-  failedAt?: string;
-  failedLaneId?: string;
-  failedStage?: string;
-  error?: string;
-};
-type ApprovalRequest = {
-  id: string;
-  action: "dispatch" | "close" | "resume";
-  status: "parent-approval-required" | "approved" | "cancelled";
-  requestedAt: string;
-  resolvedAt?: string;
-  request: string;
-};
-type ParentQuestionRequest = {
-  id: string;
-  kind: "question";
-  status: "parent-question-required" | "answered" | "answer-delivery-pending";
-  requestedAt: string;
-  workflowId?: string;
-  paneId?: string;
-  question: string;
-  answer?: string;
-  answeredAt?: string;
-  delivery?: {
-    status: "pending" | "sending" | "delivered" | "uncertain";
-    updatedAt: string;
-    reason?: string;
-  };
-};
-type GoalPauseRecord = {
-  status: "goal-paused";
-  goalIds: string[];
-  detectedAt: string;
-  source: "herdr agent read recent-unwrapped";
-  output: string;
-};
-type GoalResumeReceipt = {
-  command: "/goal-resume";
-  requestedAt: string;
-  receipt: string;
-};
-type ControllerTargetKind = "name" | "pane_id";
-type ControllerRootMapping = {
-  target: string;
-  target_kind: ControllerTargetKind;
-  pane_id: string;
-  workspace_id: string;
-  agent_kind?: string;
-};
-type ControllerLaneMapping = {
-  lane_id: string;
-  target: string;
-  target_kind: ControllerTargetKind;
-  pane_id: string;
-  workspace_id: string;
-  relationship_id?: string;
-};
-type ControllerWorkflowMapping = {
-  workflow_id: string;
-  manifest_path: string;
-  pi_goal_pause_detection?: boolean;
-  lanes: ControllerLaneMapping[];
-};
-type ControllerOrchestrator = {
-  id: string;
-  root: ControllerRootMapping;
-  program: {
-    id: string;
-    workspace_id: string;
-    parent_manifest_path?: string;
-  };
-  workflows: ControllerWorkflowMapping[];
-};
-type ControllerConfig = {
-  version: 2;
-  owner: typeof OWNER;
-  orchestrators: ControllerOrchestrator[];
-};
-type EventControllerRegistration = {
-  version: 1;
-  status: "pending" | "registered" | "cleanup-pending" | "removed";
-  updatedAt: string;
-  reason?: string;
-  configPath?: string;
-  root?: ControllerRootMapping;
-  workflow?: ControllerWorkflowMapping;
-};
-export type Lane = {
-  goalId?: string;
-  goalRevision?: number;
-  dependencies?: string[];
-  goalOwnership?: GoalOwnership;
-  launchProfile?: LaunchProfile;
-  launchProfileVersion?: LaunchProfileVersion;
-  incarnationId?: string;
-  incarnationRevision?: number;
-  incarnationStartedAt?: string;
-  restart?: {
-    version: 1;
-    status: "requested" | "starting" | "bound";
-    requestedAt: string;
-    previousIncarnationId?: string;
-    incarnationId: string;
-  };
-  nativeSession?: NativeSessionRef;
-  completionReceipt?: {
-    id: string;
-    summary: string;
-    delivery: "pending" | "sending" | "delivered" | "uncertain";
-  };
-  startupIntentPath?: string;
-  startupNonce?: string;
-  tabCreateAttemptedAt?: string;
-  agentStartAttemptedAt?: string;
-  id: string;
-  objective: string;
-  readOnly: boolean;
-  agentKind: AgentKind;
-  status: string;
-  agentName?: string;
-  relationshipId?: string;
-  tabId?: string;
-  paneId?: string;
-  resourceCreatedAt?: string;
-  tabRenamedAt?: string;
-  readiness?: ReadinessCheck;
-  agentStartedAt?: string;
-  startupHandshakeAttemptedAt?: string;
-  startupHandshakeSentAt?: string;
-  promptAttemptedAt?: string;
-  promptedAt?: string;
-  agentSessionPath?: string;
-  agentSessionId?: string;
-  // Retained for Pi manifests written before agentKind.
-  piSessionPath?: string;
-  piSessionId?: string;
-  herdrState?: string;
-  goalPaused?: GoalPauseRecord;
-  goalResumeReceipts?: GoalResumeReceipt[];
-};
-type WorktreeBinding = {
-  checkoutPath: string;
-  repoParent: {
-    workspaceId: string;
-    checkoutPath: string;
-    repoKey: string;
-    repoRoot: string;
-  };
-  workspaceId?: string;
-  openResult?: unknown;
-};
-type LaneInput =
-  | string
-  | {
-      objective: string;
-      readOnly?: boolean;
-      agentKind?: AgentKind;
-      launchProfile?: unknown;
-      dependencies?: string[];
-      dependsOn?: string[];
-    };
-
-type GoalStatus =
-  | "planned"
-  | "ready"
-  | "running"
-  | "blocked"
-  | "completed"
-  | "paused";
-type GoalOutcome = "unresolved" | "success" | "failure" | "cancelled";
-export type GoalOwnership = {
-  scope: "workflow" | "lane";
-  workflowId: string;
-  laneId?: string;
-  authority: "authorized-root" | "lane";
-};
-export type GoalRecord = {
-  version: 1;
-  id: string;
-  revision: number;
-  parentId?: string;
-  dependencies: string[];
-  objective: string;
-  status: GoalStatus;
-  outcome: GoalOutcome;
-  ownership: GoalOwnership;
-  updatedAt: string;
-};
-export type OperatorClosure = {
-  version: 1;
-  id: string;
-  laneId: string;
-  who: string;
-  why: string;
-  evidence: string[];
-  recordedAt: string;
-};
-export type Workflow = {
-  taskBinding?: {
-    workspaceId: string;
-    rootPaneId: string;
-    rootSessionPath: string;
-  };
-  launchProfile?: LaunchProfile;
-  launchProfileVersion?: LaunchProfileVersion;
-  goalSchemaVersion: 1;
-  rootGoalId: string;
-  goals: GoalRecord[];
-  id: string;
-  objective: string;
-  outcome:
-    | "planned"
-    | "running"
-    | "completed"
-    | "closed"
-    | "operator-closed"
-    | "unknown";
-  status: string;
-  lanes: Lane[];
-  herdr: {
-    workspaceId?: string;
-    tabId?: string;
-    paneId?: string;
-    testPaneId?: string;
-    agentName?: string;
-  };
-  agent: { sessionPath?: string; sessionId?: string };
-  // Retained only for compatibility with manifests written before agentKind.
-  pi?: { sessionPath?: string; sessionId?: string };
-  agentKind: AgentKind;
-  cwd: string;
-  worktree: string | null;
-  worktreeBinding?: WorktreeBinding;
-  evidence: Array<{ at: string; kind: string; text: string }>;
-  ownership: {
-    createdBy: typeof OWNER;
-    workspaceId?: string;
-    // The workflow that originally created this durable workspace. Later
-    // same-cwd workflows use new tabs/panes in it rather than creating a
-    // workspace per trivial lane.
-    workspaceOwnerWorkflowId?: string;
-    tabIds?: string[];
-    paneIds: string[];
-  };
-  retry?: RetryState;
-  authorizationPolicy?: AuthorizationPolicy;
-  approvalRequests?: ApprovalRequest[];
-  questionRequests?: ParentQuestionRequest[];
-  eventControllerRegistration?: EventControllerRegistration;
-  createdAt: string;
-  updatedAt: string;
-  dispatchedAt?: string;
-  observedAt?: string;
-  closeRequestedAt?: string;
-  closedAt?: string;
-  operatorClosedAt?: string;
-  /** Explicit reconciliation when a lane could not persist its own receipt. */
-  operatorClosure?: OperatorClosure;
-};
-type ParentGoalStatus =
-  | "active"
-  | "waiting-for-event"
-  | "action-required"
-  | "blocked"
-  | "completed"
-  | "paused";
-type ParentGoalSignal = {
-  identity: string;
-  workflowId: string;
-  laneId: string;
-  classification: "done" | "blocked" | "goal-paused";
-  receivedAt: string;
-};
-type ParentGoalSupervisorState = "running" | "stopped" | "paused";
-type RootTurn = {
-  state: "active" | "idle" | "unknown";
-  runId: string;
-  paneId: string;
-  workspaceId: string;
-  updatedAt: string;
-};
-type ParentGoalSupervisor = {
-  version: 1;
-  state: ParentGoalSupervisorState;
-  intervalSeconds: number;
-  nudgeCount: number;
-  nextNudgeAt: string | null;
-  createdAt: string;
-  updatedAt: string;
-  pauseReason?: string;
-  lastNudgeAt?: string;
-  lastAttemptAt?: string;
-  lastDelivery?: {
-    status: "sending" | "delivered" | "pending" | "uncertain";
-    attemptedAt: string;
-    deliveredAt?: string;
-    acknowledgedAt?: string;
-    reason?: string;
-  };
-  // Only the root Pi lifecycle writer may authorize idle; Herdr snapshots are telemetry.
-  rootTurn?: RootTurn;
-  rootActivity?: {
-    status: "idle" | "working" | "blocked" | "done" | "unknown";
-    observedAt: string;
-  };
-};
-type ParentGoal = {
-  version: 1;
-  id: string;
-  objective: string;
-  status: ParentGoalStatus;
-  nextAction: string;
-  signals: ParentGoalSignal[];
-  supervisor?: ParentGoalSupervisor;
-  createdAt: string;
-  updatedAt: string;
-};
-type Manifest = {
-  version: 2;
-  workflows: Workflow[];
-  parentGoal?: ParentGoal;
-  questionRequests?: ParentQuestionRequest[];
-};
-type ExecResult = {
-  stdout: string;
-  stderr: string;
-  code: number | null;
-  killed?: boolean;
-};
-
 const HERDR_COMMAND_TIMEOUT_MS = 35_000;
 const RECENT_AGENT_OUTPUT_LINES = 120;
 const GOAL_PAUSE_OUTPUT_LIMIT = 6000;
@@ -538,6 +179,16 @@ function normalizeWorkflowGoals(workflow: Workflow): Workflow {
   };
   const laneGoals: GoalRecord[] = [];
   for (const lane of workflow.lanes) {
+    if (lane.nativeSession && !lane.persistenceHandle) {
+      lane.persistenceHandle = toPersistenceHandle(
+        lane.nativeSession,
+        lane.launchProfile?.provider ??
+          workflow.launchProfile?.provider ??
+          lane.agentKind ??
+          workflow.agentKind ??
+          "herdr",
+      );
+    }
     const goalId =
       typeof lane.goalId === "string" && lane.goalId
         ? lane.goalId
