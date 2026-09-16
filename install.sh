@@ -37,8 +37,16 @@ ln -s "$BAA_TON_DIR/packages/herdr-tools" "$target"
 say "Pi extension linked: $target"
 
 if command -v herdr >/dev/null 2>&1; then
-  say "Linking the Herdr event controller plugin"
-  herdr plugin link "$BAA_TON_DIR/packages/controller"
+  baa_ton_real="$(cd "$BAA_TON_DIR" && pwd -P)"
+  existing="$(herdr plugin list 2>/dev/null | grep -F 'herdr-orchestrator-controller' || true)"
+  if [ -n "$existing" ] && ! printf '%s' "$existing" | grep -qF "$baa_ton_real/packages/controller"; then
+    say "Controller plugin already linked elsewhere; leaving it alone:"
+    printf '      %s\n' "$existing"
+    say "To re-point it here instead, run: herdr plugin link \"$BAA_TON_DIR/packages/controller\""
+  else
+    say "Linking the Herdr event controller plugin"
+    herdr plugin link "$BAA_TON_DIR/packages/controller"
+  fi
 else
   say "Herdr CLI not found. Install Herdr 0.9+ (https://github.com/herdrdev/herdr), then run:"
   printf '      herdr plugin link "%s/packages/controller"\n' "$BAA_TON_DIR"

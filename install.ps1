@@ -43,8 +43,16 @@ New-Item -ItemType Junction -Path $target -Target (Join-Path $BaaTonDir "package
 Say "Pi extension linked: $target"
 
 if (Get-Command herdr -ErrorAction SilentlyContinue) {
-  Say "Linking the Herdr event controller plugin"
-  herdr plugin link (Join-Path $BaaTonDir "packages\controller")
+  $controllerPath = Join-Path $BaaTonDir "packages\controller"
+  $existing = herdr plugin list 2>$null | Select-String "herdr-orchestrator-controller"
+  if ($existing -and -not ($existing -match [regex]::Escape((Resolve-Path $controllerPath).Path))) {
+    Say "Controller plugin already linked elsewhere; leaving it alone:"
+    Say "  $existing"
+    Say "To re-point it here instead, run: herdr plugin link `"$controllerPath`""
+  } else {
+    Say "Linking the Herdr event controller plugin"
+    herdr plugin link $controllerPath
+  }
 } else {
   Say "Herdr CLI not found. Install Herdr 0.9+ (https://github.com/herdrdev/herdr), then run:"
   Say "  herdr plugin link `"$(Join-Path $BaaTonDir 'packages\controller')`""
