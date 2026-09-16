@@ -57,6 +57,21 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
       "/bridge/mcp-server.mjs",
     );
     assert.equal(args.includes("--permission-prompt-tool"), false);
+    const resumed = adapter.resumeArguments(
+      profile,
+      {
+        provider: CLAUDE_PROVIDER,
+        sessionId: "claude-session-123",
+        nativeHandle: { kind: "id", value: "claude-session-123" },
+      },
+      "/source/index.ts",
+    );
+    assert.deepEqual(
+      resumed.slice(0, 2),
+      ["--resume", "claude-session-123"],
+    );
+    assert.equal(resumed[resumed.indexOf("--model") + 1], profile.model);
+    assert.equal(resumed[resumed.indexOf("--effort") + 1], profile.thinking);
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }

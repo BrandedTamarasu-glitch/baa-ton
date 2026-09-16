@@ -1,11 +1,12 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   toPersistenceHandle,
   type CapabilityCatalog,
   type Lane,
+  type PersistenceHandle,
   type Workflow,
 } from "./contract.js";
 import {
@@ -26,10 +27,83 @@ export type DispatchPorts = {
   update(id: string, edit: (workflow: Workflow) => void): Promise<Workflow>;
   verifyRoot(workflow: Workflow): Promise<void>;
   authorize(workflow: Workflow): Promise<boolean>;
-  register(workflow: Workflow): Promise<void>;
+  register(
+    workflow: Workflow,
+    options?: { allowLaneRebind?: boolean },
+  ): Promise<void>;
   contract(workflow: Workflow, lane: Lane): string;
   busyRetryDelayMs?: number;
 };
+
+export type ResumePorts = Omit<DispatchPorts, "contract">;
+
+const RESUMABLE_SESSION_STATUSES = new Set(["done", "gone"]);
+
+function persistedResumeHandle(lane: Lane, workflow: Workflow): PersistenceHandle {
+  const log = lane.sessionLog;
+  const logged = log?.sessionRef;
+  const persisted = lane.persistenceHandle;
+  if (!logged)
+    throw new Error(
+      `Lane ${lane.id} has no durable session-log entry; native session resume is unsupported without one.`,
+    );
+  if (
+    persisted &&
+    (persisted.provider !== logged.provider ||
+      persisted.sessionId !== logged.sessionId)
+  )
+    throw new Error(
+      `Lane ${lane.id} persistence handle differs from its authoritative session log; resume is refused.`,
+    );
+  if (
+    log?.kind !== "lane" ||
+    log.workflowId !== workflow.id ||
+    log.laneId !== lane.id ||
+    (log.workspaceId !== undefined &&
+      log.workspaceId !== workflow.taskBinding?.workspaceId)
+  )
+    throw new Error(
+      `Lane ${lane.id} session-log ownership or workspace scope does not match workflow ${workflow.id}; resume is refused.`,
+    );
+  return logged;
+}
+
+async function verifyRecordedWorktree(workflow: Workflow, lane: Lane): Promise<string> {
+  const logged = lane.sessionLog?.worktree;
+  const workflowPath = workflow.worktree;
+  if (logged && workflowPath && resolvePath(logged) !== resolvePath(workflowPath))
+    throw new Error(
+      `Lane ${lane.id} session log worktree differs from workflow worktree; resume is refused.`,
+    );
+  const path = logged ?? workflowPath ?? workflow.cwd;
+  if (!path)
+    throw new Error(`Lane ${lane.id} has no recorded worktree for native resume.`);
+  let details;
+  try {
+    details = await lstat(path);
+  } catch {
+    throw new Error(`Recorded worktree does not exist for lane ${lane.id}: ${path}`);
+  }
+  if (!details.isDirectory() || details.isSymbolicLink())
+    throw new Error(`Recorded worktree is not a real directory for lane ${lane.id}: ${path}`);
+  return path;
+}
+
+function resolvePath(path: string): string {
+  // Resume only compares already-recorded paths. `resolve` intentionally does
+  // not canonicalize a symlink that the lstat check will reject.
+  return resolve(path);
+}
+
+function resumeCandidates(workflow: Workflow): Array<{ lane: Lane; index: number }> {
+  return workflow.lanes
+    .map((lane, index) => ({ lane, index }))
+    .filter(({ lane }) => {
+      if (lane.completionReceipt || lane.sessionLog?.status === "completed" || lane.sessionLog?.status === "retired")
+        return false;
+      return RESUMABLE_SESSION_STATUSES.has(lane.sessionLog?.status ?? lane.status);
+    });
+}
 
 export type DispatchOptions = {
   /** Rebind each lane to a new, orchestrator-authorized incarnation. */
@@ -145,6 +219,11 @@ function laneSessionLog(
       lane.incarnationStartedAt ??
       workflow.dispatchedAt ??
       workflow.createdAt,
+    ...(lane.incarnationStartedAt
+      ? { incarnationStartedAt: lane.incarnationStartedAt }
+      : lane.sessionLog?.incarnationStartedAt
+        ? { incarnationStartedAt: lane.sessionLog.incarnationStartedAt }
+        : {}),
     ...(lane.sessionLog?.lastResponseAt
       ? { lastResponseAt: lane.sessionLog.lastResponseAt }
       : {}),
@@ -165,7 +244,7 @@ function laneSessionLog(
  * the only foreground process (shell_pid set and matching). Gating on it
  * removes the tab-create/agent-start race without prompt-string matching. */
 async function waitForShellReady(
-  port: DispatchPorts,
+  port: Pick<DispatchPorts, "run">,
   paneId: string,
   signal?: AbortSignal,
 ) {
@@ -823,6 +902,526 @@ export async function dispatchTask(
         text: `${stage}: ${error}`,
       });
     });
+    throw error;
+  } finally {
+    await rm(lock, { recursive: true, force: true });
+  }
+}
+
+/** Reattach lanes to their provider-native persisted sessions. This is kept
+ * separate from dispatch/restart: it never creates a new provider session and
+ * never sends the original assignment again. */
+export async function resumeTask(
+  workflow: Workflow,
+  execute: boolean,
+  port: ResumePorts,
+  signal?: AbortSignal,
+) {
+  const candidates = resumeCandidates(workflow);
+  const preview = candidates.map(({ lane }) => ({
+    laneId: lane.id,
+    agentKind: lane.agentKind,
+    status: lane.sessionLog?.status ?? lane.status,
+    sessionId: lane.sessionLog?.sessionRef.sessionId,
+    worktree: lane.sessionLog?.worktree ?? workflow.worktree ?? workflow.cwd,
+  }));
+  if (!execute)
+    return {
+      dryRun: true,
+      workflow,
+      resumableLanes: preview,
+      commands: preview.map(
+        (item) =>
+          `${item.agentKind} native resume for lane ${item.laneId}: session ${item.sessionId ?? "UNAVAILABLE"} in ${item.worktree ?? "UNAVAILABLE"}`,
+      ),
+    };
+  await port.verifyRoot(workflow);
+  const workspaceId = workflow.taskBinding?.workspaceId;
+  if (
+    !workspaceId ||
+    (workflow.ownership.workspaceId &&
+      workflow.ownership.workspaceId !== workspaceId)
+  )
+    throw new Error(
+      "Missing or mismatched task workspace binding; native resume cannot choose a replacement workspace.",
+    );
+  if (candidates.length === 0)
+    throw new Error(
+      `Workflow ${workflow.id} has no done or gone lane session in its durable session log; nothing can be natively resumed.`,
+    );
+  const infos = candidates.map(({ lane, index }) => {
+    const session = persistedResumeHandle(lane, workflow);
+    const profile = validateLaunchProfile(
+      lane.launchProfile ?? workflow.launchProfile,
+      `Lane ${lane.id} launchProfile`,
+    );
+    if (session.provider !== profile.provider)
+      throw new Error(
+        `Lane ${lane.id} persisted session provider ${session.provider} does not match its exact launch profile provider ${profile.provider}; native resume is refused.`,
+      );
+    const adapter = port.adapter(lane.agentKind);
+    const missing = missingRequiredAdapterCapabilities(adapter);
+    if (adapter.version !== 1 || missing.length > 0)
+      throw new Error(
+        `Harness ${lane.agentKind} lacks the required versioned capabilities${
+          missing.length ? `: ${missing.join(", ")}` : ""
+        }; native resume is refused.`,
+      );
+    if (
+      adapter.capabilities.supportsSessionResume !== true ||
+      typeof adapter.resumeSessionId !== "function" ||
+      typeof adapter.resumeArguments !== "function"
+    )
+      throw new Error(
+        `Harness ${lane.agentKind} native session resume is unsupported: its adapter does not declare and implement an exact resume invocation.`,
+      );
+    const resumeSessionId = adapter.resumeSessionId;
+    const resumeArguments = adapter.resumeArguments;
+    const sessionId = resumeSessionId(session);
+    return {
+      lane,
+      index,
+      session,
+      sessionId,
+      profile,
+      adapter,
+      resumeSessionId,
+      resumeArguments,
+    };
+  });
+  for (const info of infos) {
+    await verifyRecordedWorktree(workflow, info.lane);
+    await info.adapter.preflight(info.profile);
+    if (info.lane.sessionLog?.status === "done" && info.lane.paneId) {
+      try {
+        const existing = await port.run(["agent", "get", info.lane.paneId], signal);
+        if (existing)
+          throw new Error(
+            `Lane ${info.lane.id} still has a live terminal agent; native resume will not duplicate its session.`,
+          );
+      } catch (error) {
+        if (/still has a live terminal/.test(String(error))) throw error;
+        if (!/agent_not_found/.test(String(error))) throw error;
+      }
+    }
+  }
+  if (!(await port.authorize(workflow))) return { cancelled: true, workflow };
+  const workspaceResponse = await port.run(
+    ["workspace", "get", workspaceId],
+    signal,
+  );
+  const workspace = (workspaceResponse.result ?? workspaceResponse).workspace;
+  if (workspace?.workspace_id !== workspaceId)
+    throw new Error(
+      "Native resume workspace lookup did not return the designated task workspace; no topology mutation is trusted.",
+    );
+
+  await mkdir(port.directory, { recursive: true, mode: 0o700 });
+  const lock = join(port.directory, `${workflow.id}.resume-lock`);
+  const ownerPath = join(lock, "owner.json");
+  try {
+    await mkdir(lock, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    let owner: { pid?: number } | null = null;
+    try {
+      owner = JSON.parse(await readFile(ownerPath, "utf8")) as { pid?: number };
+    } catch {
+      owner = null;
+    }
+    if (typeof owner?.pid !== "number")
+      throw new Error(
+        "Native session resume lock exists without a verifiable owner; inspect it before retrying.",
+      );
+    let alive = false;
+    try {
+      process.kill(owner.pid, 0);
+      alive = true;
+    } catch (signalError) {
+      alive = (signalError as NodeJS.ErrnoException).code === "EPERM";
+    }
+    if (alive)
+      throw new Error("Native session resume is already active; no duplicate start allowed.");
+    await rm(lock, { recursive: true, force: true });
+    await mkdir(lock, { mode: 0o700 });
+  }
+  await writeFile(
+    ownerPath,
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }),
+    { mode: 0o600 },
+  );
+  let currentWorkflow = workflow;
+  const update = async (edit: (workflow: Workflow) => void) => {
+    currentWorkflow = await port.update(currentWorkflow.id, edit);
+    return currentWorkflow;
+  };
+  let stage = "resume-request";
+  let staleSnapshot = false;
+  try {
+    // Preflight and authorization intentionally happen before the effect lock,
+    // but the caller's snapshot may have gone stale while they were running.
+    // Reconcile once under the lock so a second invocation cannot create
+    // another pane from the same durable done/gone snapshot after the first
+    // one landed.
+    if (typeof workflow.updatedAt === "string") {
+      await update((current) => {
+        if (current.updatedAt !== workflow.updatedAt) {
+          staleSnapshot = true;
+          throw new Error(
+            "Workflow changed while native resume was being authorized; retry from a fresh observation.",
+          );
+        }
+      });
+    }
+    await update((w) => {
+      w.status = "starting";
+      w.outcome = "unknown";
+      w.evidence.push({
+        at: new Date().toISOString(),
+        kind: "native-session-resume-requested",
+        text: `Reattaching ${infos.map((info) => `${info.lane.id}=${info.sessionId}`).join(", ")} in task workspace ${workspaceId}.`,
+      });
+    });
+
+    // Bind every replacement pane and route before starting any harness. A
+    // lost tab-create response is fenced by resumeTabCreateAttemptedAt.
+    for (const info of infos) {
+      const { lane, index, profile } = info;
+      let currentLane = currentWorkflow.lanes[index];
+      if (!currentLane.resume || currentLane.resume.status === "bound") {
+        const incarnationId = `incarnation-${randomUUID().slice(0, 12)}`;
+        await update((w) => {
+          const current = w.lanes[index];
+          current.resume = {
+            version: 1,
+            status: "requested",
+            requestedAt: new Date().toISOString(),
+            ...(current.incarnationId
+              ? { previousIncarnationId: current.incarnationId }
+              : {}),
+            ...(current.paneId ? { previousPaneId: current.paneId } : {}),
+            ...(current.tabId ? { previousTabId: current.tabId } : {}),
+            incarnationId,
+          };
+          current.incarnationId = incarnationId;
+          delete current.incarnationStartedAt;
+          delete current.agentStartedAt;
+          delete current.resumeTabCreateAttemptedAt;
+          delete current.resumeAgentStartAttemptedAt;
+          delete current.resumeStartupHandshakeAttemptedAt;
+          delete current.resumeStartupHandshakeSentAt;
+          delete current.startupIntentPath;
+          delete current.startupNonce;
+          current.status = "resuming";
+        });
+        currentLane = currentWorkflow.lanes[index];
+      }
+      const recordedWorktree = await verifyRecordedWorktree(
+        currentWorkflow,
+        currentLane,
+      );
+      if (!currentLane.startupIntentPath) {
+        const intentPath = join(
+          port.directory,
+          `${currentWorkflow.id}-${currentLane.id}-resume-${randomUUID().slice(0, 8)}-startup.json`,
+        );
+        const nonce = randomUUID();
+        await writeFile(
+          intentPath,
+          JSON.stringify({
+            version: 1,
+            workflowId: currentWorkflow.id,
+            laneId: currentLane.id,
+            manifestDirectory: port.directory,
+            workspaceId,
+            worktree: recordedWorktree,
+            profile,
+            profileVersion: LAUNCH_PROFILE_SCHEMA_VERSION,
+            incarnationId: currentLane.resume!.incarnationId,
+            resumeSessionId: info.sessionId,
+            nonce,
+            source: port.source,
+          }),
+          { mode: 0o600 },
+        );
+        await update((w) => {
+          const current = w.lanes[index];
+          current.startupIntentPath = intentPath;
+          current.startupNonce = nonce;
+        });
+        currentLane = currentWorkflow.lanes[index];
+      }
+      if (!currentLane.resumeTabCreateAttemptedAt) {
+        stage = "resume-tab-create";
+        await update((w) => {
+          w.lanes[index].resumeTabCreateAttemptedAt = new Date().toISOString();
+        });
+        const created = await port.run(
+          [
+            "tab",
+            "create",
+            "--workspace",
+            workspaceId,
+            "--cwd",
+            recordedWorktree,
+            "--label",
+            laneTabLabel(currentLane.objective ?? currentLane.id),
+            "--env",
+            `BAA_STARTUP_INTENT=${currentLane.startupIntentPath}`,
+            "--no-focus",
+          ],
+          signal,
+        );
+        const result = created.result ?? created;
+        const tab = result.tab;
+        const pane = result.root_pane;
+        if (
+          !tab?.tab_id ||
+          !pane?.pane_id ||
+          (tab.workspace_id && tab.workspace_id !== workspaceId) ||
+          (pane.workspace_id && pane.workspace_id !== workspaceId)
+        )
+          throw new Error(
+            `Resumed lane ${currentLane.id} tab response lacks a matching task workspace/pane binding.`,
+          );
+        const live = await port.run(["pane", "get", pane.pane_id], signal);
+        const details = (live.result ?? live).pane;
+        if (
+          details?.workspace_id !== workspaceId ||
+          details?.tab_id !== tab.tab_id ||
+          details?.pane_id !== pane.pane_id
+        )
+          throw new Error("Created resume lane is outside its designated task workspace.");
+        await update((w) => {
+          const current = w.lanes[index];
+          current.paneId = pane.pane_id;
+          current.tabId = tab.tab_id;
+          current.agentName ??= childAgentName(w.id, index + 1);
+          w.ownership.tabIds ??= [];
+          w.ownership.tabIds.push(tab.tab_id);
+          w.ownership.paneIds.push(pane.pane_id);
+        });
+      } else if (!currentLane.paneId || !currentLane.tabId) {
+        throw new Error(
+          `Lane ${currentLane.id} resume tab creation outcome is uncertain; inspect before retrying.`,
+        );
+      } else {
+        const live = await port.run(["pane", "get", currentLane.paneId], signal);
+        const details = (live.result ?? live).pane;
+        if (
+          details?.workspace_id !== workspaceId ||
+          details?.tab_id !== currentLane.tabId ||
+          details?.pane_id !== currentLane.paneId
+        )
+          throw new Error("Recorded resume pane is outside its designated task workspace.");
+      }
+    }
+    await update((w) => {
+      for (const info of infos) {
+        const current = w.lanes[info.index];
+        if (current.resume) current.resume.status = "starting";
+      }
+    });
+    await port.register(currentWorkflow, { allowLaneRebind: true });
+
+    for (const info of infos) {
+      const {
+        index,
+        profile,
+        adapter,
+        sessionId,
+        resumeSessionId,
+        resumeArguments,
+      } = info;
+      let lane = currentWorkflow.lanes[index];
+      const intent = JSON.parse(await readFile(lane.startupIntentPath!, "utf8"));
+      const intentProfile = validateLaunchProfile(
+        intent.profile,
+        `Lane ${lane.id} resume startup intent profile`,
+      );
+      if (
+        JSON.stringify(intentProfile) !== JSON.stringify(profile) ||
+        intent.incarnationId !== lane.resume?.incarnationId ||
+        intent.resumeSessionId !== sessionId
+      )
+        throw new Error(`Lane ${lane.id} resume startup intent is not bound to its exact session/profile.`);
+
+      let rawAgent: any = null;
+      try {
+        rawAgent = await port.run(["agent", "get", lane.paneId!], signal);
+      } catch (error) {
+        if (!/agent_not_found/.test(String(error))) throw error;
+      }
+      if (rawAgent) {
+        const occupied = nativeAgent(rawAgent);
+        if (
+          !occupied ||
+          occupied.agent !== lane.agentKind ||
+          occupied.pane_id !== lane.paneId ||
+          occupied.workspace_id !== workspaceId
+        )
+          throw new Error(`Lane ${lane.id} resume pane is occupied by an unrelated agent.`);
+      }
+      if (lane.resumeAgentStartAttemptedAt && !rawAgent) {
+        const priorReady = await readFile(`${lane.startupIntentPath}.ready`, "utf8")
+          .then((text) => JSON.parse(text))
+          .catch(() => null);
+        if (priorReady)
+          throw new Error(
+            `Lane ${lane.id} resume agent vanished after startup attestation; inspect before retrying.`,
+          );
+        await update((w) => {
+          delete w.lanes[index].resumeAgentStartAttemptedAt;
+        });
+        lane = currentWorkflow.lanes[index];
+      }
+      if (!lane.resumeAgentStartAttemptedAt) {
+        stage = "resume-agent-start";
+        await update((w) => {
+          w.lanes[index].resumeAgentStartAttemptedAt = new Date().toISOString();
+        });
+        await waitForShellReady(port, lane.paneId!, signal);
+        const argumentsForResume = resumeArguments(
+          profile,
+          info.session,
+          port.source,
+          { startupIntentPath: lane.startupIntentPath },
+        );
+        await port.run(
+          [
+            "agent",
+            "start",
+            lane.agentName!,
+            "--kind",
+            lane.agentKind,
+            "--pane",
+            lane.paneId!,
+            "--timeout",
+            "60000",
+            "--",
+            ...argumentsForResume,
+          ],
+          signal,
+          65_000,
+        );
+        await update((w) => {
+          w.lanes[index].agentStartedAt = new Date().toISOString();
+        });
+        lane = currentWorkflow.lanes[index];
+      }
+      const startupHandshake = adapter.startupHandshake;
+      if (startupHandshake !== undefined && !lane.resumeStartupHandshakeSentAt) {
+        if (lane.resumeStartupHandshakeAttemptedAt)
+          throw new Error("Resume startup handshake submission is uncertain; do not repeat terminal input.");
+        stage = "resume-startup-handshake";
+        await update((w) => {
+          w.lanes[index].resumeStartupHandshakeAttemptedAt = new Date().toISOString();
+        });
+        await port.run(["agent", "prompt", lane.paneId!, startupHandshake], signal);
+        await update((w) => {
+          w.lanes[index].resumeStartupHandshakeSentAt = new Date().toISOString();
+        });
+        lane = currentWorkflow.lanes[index];
+      }
+      stage = "resume-startup-proof";
+      const raw = await port.run(["agent", "get", lane.paneId!], signal);
+      const agent = nativeAgent(raw);
+      let hello: any = null;
+      const deadline = Date.now() + 90_000;
+      const complete = (value: unknown) => adapter.attestationComplete?.(value) ?? true;
+      while (Date.now() < deadline) {
+        hello = await readFile(`${lane.startupIntentPath}.ready`, "utf8")
+          .then((text) => JSON.parse(text))
+          .catch(() => null);
+        if (hello && complete(hello)) break;
+        await delay(500, { signal });
+      }
+      if (!hello || !complete(hello))
+        throw new Error(`Lane ${lane.id} resume startup attestation is incomplete; native reattachment is refused.`);
+      const proof = adapter.verifyStartup(agent, hello);
+      const proofPersistence = toPersistenceHandle(
+        proof.persistence ?? proof.session,
+        profile.provider,
+      );
+      if (
+        proofPersistence.provider !== profile.provider ||
+        proofPersistence.provider !== info.session.provider
+      )
+        throw new Error(
+          `Lane ${lane.id} startup proof reports provider ${proofPersistence.provider}, not its persisted ${info.session.provider} session; native resume is refused.`,
+        );
+      const proofSessionId = resumeSessionId(proofPersistence);
+      if (
+        agent?.pane_id !== lane.paneId ||
+        agent?.workspace_id !== workspaceId ||
+        agent?.agent !== lane.agentKind ||
+        proof.paneId !== lane.paneId ||
+        proof.workspaceId !== workspaceId ||
+        proof.nonce !== lane.startupNonce ||
+        proof.source !== port.source ||
+        JSON.stringify(proof.profile) !== JSON.stringify(profile) ||
+        proofSessionId !== sessionId ||
+        !STARTUP_PROOF_REQUIRED_OPERATIONS.every((operation) =>
+          proof.operations?.includes(operation),
+        )
+      )
+        throw new Error(
+          `Lane ${lane.id} native resume startup proof does not match its exact persisted session; no reattachment was recorded.`,
+        );
+      const incarnationStartedAt = new Date().toISOString();
+      await update((w) => {
+        const current = w.lanes[index];
+        current.nativeSession = proof.session;
+        current.persistenceHandle = proofPersistence;
+        current.incarnationStartedAt = incarnationStartedAt;
+        current.sessionLog = {
+          ...current.sessionLog!,
+          sessionRef: proofPersistence,
+          startedAt: current.sessionLog!.startedAt,
+          incarnationStartedAt,
+          status: "dispatched",
+          paneId: current.paneId,
+          tabId: current.tabId,
+          workspaceId,
+          worktree: info.lane.sessionLog?.worktree ?? w.worktree ?? w.cwd,
+        };
+        current.resume!.status = "bound";
+        current.status = "agent-ready";
+        if (proof.session.kind === "path") {
+          current.agentSessionPath = proof.session.value;
+          delete current.agentSessionId;
+        } else {
+          current.agentSessionId = proof.session.value;
+          delete current.agentSessionPath;
+        }
+        w.evidence.push({
+          at: incarnationStartedAt,
+          kind: "native-session-resumed",
+          text: `Lane ${current.id} reattached to ${sessionId} in pane ${current.paneId}.`,
+        });
+      });
+      currentWorkflow = await port.update(currentWorkflow.id, (w) => {
+        w.status = "running";
+        w.outcome = "running";
+      });
+    }
+    return { resumed: true, workflow: currentWorkflow, resumedLanes: infos.map(({ lane, sessionId }) => ({ laneId: lane.id, sessionId })) };
+  } catch (error) {
+    if (!staleSnapshot) {
+      try {
+        await update((w) => {
+          w.status = "resume-failed";
+          w.outcome = "unknown";
+          w.evidence.push({
+            at: new Date().toISOString(),
+            kind: "native-session-resume-error",
+            text: `${stage}: ${error}`,
+          });
+        });
+      } catch {
+        // Preserve the original failure if the manifest itself became unavailable.
+      }
+    }
     throw error;
   } finally {
     await rm(lock, { recursive: true, force: true });

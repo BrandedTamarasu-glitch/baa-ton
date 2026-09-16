@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { LaunchProfile } from "./launch-profile.js";
+import type { PersistenceHandle } from "./contract.js";
 import {
   PROTOCOL_OPERATIONS,
   type HarnessLaunchAdapter,
@@ -31,6 +32,25 @@ function filterProtocolOperations(operations: unknown): ProtocolOperation[] {
   return operations.filter(
     (operation): operation is ProtocolOperation =>
       typeof operation === "string" && known.has(operation),
+  );
+}
+
+function opencodeResumeSessionId(session: PersistenceHandle): string {
+  const metadataId = session.metadata?.sessionId;
+  if (typeof metadataId === "string" && metadataId) return metadataId;
+  if (typeof session.sessionId === "string" && session.sessionId && !session.sessionId.includes("/"))
+    return session.sessionId;
+  const native = session.nativeHandle;
+  if (
+    native &&
+    typeof native === "object" &&
+    (native as { kind?: unknown }).kind === "id" &&
+    typeof (native as { value?: unknown }).value === "string" &&
+    (native as { value: string }).value
+  )
+    return (native as { value: string }).value;
+  throw new Error(
+    "OpenCode native resume requires the persisted OpenCode session id; a path or missing id is not a valid --session target.",
   );
 }
 
@@ -92,6 +112,64 @@ export const HerdrAttest = async () => {
 export function opencodeLaunchAdapter(
   paths: OpencodeAdapterPaths,
 ): HarnessLaunchAdapter {
+  const buildLaunchArguments = (
+    profile: LaunchProfile,
+    source: string,
+    context?: { startupIntentPath?: string },
+  ): string[] => {
+    if (!context?.startupIntentPath)
+      throw new Error("OpenCode launch requires the startup intent path.");
+    const repoRoot = resolve(dirname(source), "..", "..");
+    const toolsDirectory = dirname(fileURLToPath(import.meta.url));
+    mkdirSync(paths.scratchDirectory, { recursive: true, mode: 0o700 });
+    const pluginPath = join(
+      paths.scratchDirectory,
+      "opencode-attest-plugin.ts",
+    );
+    writeFileSync(
+      pluginPath,
+      pluginSource(
+        relative(
+          paths.scratchDirectory,
+          join(toolsDirectory, "attest-merge.mjs"),
+        ),
+      ),
+      { mode: 0o600 },
+    );
+    const config = {
+      model: `${OPENCODE_MODEL_PREFIX}/${profile.model}`,
+      plugin: [pluginPath],
+      mcp: {
+        "herdr-orchestrator": {
+          type: "local",
+          command: ["node", join(toolsDirectory, "mcp-server.mjs")],
+        },
+      },
+      agent: {
+        build: {
+          model: `${OPENCODE_MODEL_PREFIX}/${profile.model}`,
+          options: { reasoningEffort: profile.thinking },
+        },
+      },
+      permission: {
+        edit: "allow",
+        bash: {
+          "git push": "deny",
+          "git merge": "deny",
+          "gh pr create": "deny",
+          "*": "allow",
+        },
+        webfetch: "allow",
+      },
+    };
+    writeFileSync(
+      join(repoRoot, "opencode.json"),
+      JSON.stringify(config, null, 2) + "\n",
+      { mode: 0o600 },
+    );
+    return ["--model", `${OPENCODE_MODEL_PREFIX}/${profile.model}`];
+  };
+
   return {
     version: 1,
     kind: "opencode",
@@ -99,6 +177,7 @@ export function opencodeLaunchAdapter(
       startupAttestation: true,
       supportsSessionPersistence: true,
       supportsNativeSessionIdentity: true,
+      supportsSessionResume: true,
       // OpenCode's adapter only receives launch/config paths; its model list
       // is not an authoritative live provider catalog at this boundary.
       supportsLiveCapabilityDiscovery: false,
@@ -135,65 +214,13 @@ export function opencodeLaunchAdapter(
       // credential fails every turn, so no attestation ever appears and
       // dispatch fails closed rather than billing another route.
     },
-    launchArguments(
-      profile: LaunchProfile,
-      source: string,
-      context?: { startupIntentPath?: string },
-    ): string[] {
-      if (!context?.startupIntentPath)
-        throw new Error("OpenCode launch requires the startup intent path.");
-      const repoRoot = resolve(dirname(source), "..", "..");
-      const toolsDirectory = dirname(fileURLToPath(import.meta.url));
-      mkdirSync(paths.scratchDirectory, { recursive: true, mode: 0o700 });
-      const pluginPath = join(
-        paths.scratchDirectory,
-        "opencode-attest-plugin.ts",
-      );
-      writeFileSync(
-        pluginPath,
-        pluginSource(
-          relative(
-            paths.scratchDirectory,
-            join(toolsDirectory, "attest-merge.mjs"),
-          ),
-        ),
-        { mode: 0o600 },
-      );
-      const config = {
-        model: `${OPENCODE_MODEL_PREFIX}/${profile.model}`,
-        plugin: [pluginPath],
-        mcp: {
-          "herdr-orchestrator": {
-            type: "local",
-            command: ["node", join(toolsDirectory, "mcp-server.mjs")],
-          },
-        },
-        agent: {
-          build: {
-            model: `${OPENCODE_MODEL_PREFIX}/${profile.model}`,
-            options: { reasoningEffort: profile.thinking },
-          },
-        },
-        permission: {
-          edit: "allow",
-          bash: {
-            "git push": "deny",
-            "git merge": "deny",
-            "gh pr create": "deny",
-            "*": "allow",
-          },
-          webfetch: "allow",
-        },
-      };
-      writeFileSync(
-        join(repoRoot, "opencode.json"),
-        JSON.stringify(config, null, 2) + "\n",
-        {
-          mode: 0o600,
-        },
-      );
-      return ["--model", `${OPENCODE_MODEL_PREFIX}/${profile.model}`];
-    },
+    launchArguments: buildLaunchArguments,
+    resumeSessionId: opencodeResumeSessionId,
+    resumeArguments: (profile, session, source, context) => [
+      "--session",
+      opencodeResumeSessionId(session),
+      ...buildLaunchArguments(profile, source, context),
+    ],
     verifyStartup(nativeAgent: unknown, attestation: unknown): StartupProof {
       const agent = nativeAgent as {
         agent?: string;
@@ -247,6 +274,12 @@ export function opencodeLaunchAdapter(
         profile: hello.profile!,
         operations: filterProtocolOperations(hello.operations),
         session: { kind, value },
+        persistence: {
+          provider: OPENCODE_PROVIDER,
+          sessionId: hello.sessionId,
+          nativeHandle: { kind, value },
+          metadata: { sessionId: hello.sessionId },
+        },
       };
     },
   };

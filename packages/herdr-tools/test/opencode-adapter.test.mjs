@@ -51,6 +51,14 @@ test("opencode adapter generates project config, plugin, and model mapping", asy
     );
     assert.match(plugin, /BAA_STARTUP_INTENT/);
     assert.match(plugin, /mergeAttestation/);
+    const resumed = adapter.resumeArguments(
+      profile,
+      { provider: OPENCODE_PROVIDER, sessionId: "ses_123" },
+      join(root, "packages", "herdr-tools", "index.ts"),
+      { startupIntentPath: join(scratch, "resume.json") },
+    );
+    assert.deepEqual(resumed.slice(0, 2), ["--session", "ses_123"]);
+    assert.equal(resumed[resumed.indexOf("--model") + 1], "openai/gpt-5.6-luna");
     assert.throws(
       () => adapter.launchArguments(profile, "/src/index.ts"),
       /startup intent path/,

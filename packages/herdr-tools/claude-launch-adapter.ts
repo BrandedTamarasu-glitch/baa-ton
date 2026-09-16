@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { delimiter, join, resolve } from "node:path";
 import type { LaunchProfile } from "./launch-profile.js";
+import type { PersistenceHandle } from "./contract.js";
 import {
   PROTOCOL_OPERATIONS,
   type HarnessLaunchAdapter,
@@ -32,6 +33,32 @@ function claudeBinaryAvailable(): boolean {
     if (entry && existsSync(join(resolve(entry), "claude"))) return true;
   }
   return false;
+}
+
+function claudeResumeSessionId(session: PersistenceHandle): string {
+  const metadataId = session.metadata?.sessionId;
+  if (typeof metadataId === "string" && metadataId) return metadataId;
+  const native = session.nativeHandle;
+  if (
+    native &&
+    typeof native === "object" &&
+    (native as { kind?: unknown }).kind === "id" &&
+    typeof (native as { value?: unknown }).value === "string" &&
+    (native as { value: string }).value
+  )
+    return (native as { value: string }).value;
+  // Older logs used the transcript path as PersistenceHandle.sessionId. A
+  // path is not accepted by Claude's --resume flag, so fail closed rather
+  // than silently choosing the most recent conversation.
+  if (
+    typeof session.sessionId === "string" &&
+    session.sessionId &&
+    !session.sessionId.includes("/")
+  )
+    return session.sessionId;
+  throw new Error(
+    "Claude native resume requires the persisted Claude session id; a transcript path alone is not a valid --resume target.",
+  );
 }
 
 /** Conservative lane permissions: read/edit plus foreground test/build/git-read
@@ -73,6 +100,75 @@ const LANE_PERMISSIONS = {
   ],
 };
 
+function buildClaudeLaunchArguments(
+  paths: ClaudeAdapterPaths,
+  profile: LaunchProfile,
+): string[] {
+  mkdirSync(paths.scratchDirectory, { recursive: true, mode: 0o700 });
+  const tag = randomUUID().slice(0, 8);
+  const settingsPath = join(
+    paths.scratchDirectory,
+    `claude-settings-${tag}.json`,
+  );
+  const mcpConfigPath = join(
+    paths.scratchDirectory,
+    `claude-mcp-${tag}.json`,
+  );
+  const settings = {
+    hooks: {
+      SessionStart: [
+        {
+          hooks: [
+            {
+              type: "command",
+              command: `node ${JSON.stringify(paths.attestHelper)}`,
+            },
+          ],
+        },
+      ],
+    },
+    permissions: LANE_PERMISSIONS,
+  };
+  const mcpConfig = {
+    mcpServers: {
+      "herdr-orchestrator": {
+        command: "node",
+        args: [paths.bridge],
+      },
+    },
+  };
+  writeFileSync(settingsPath, JSON.stringify(settings), { mode: 0o600 });
+  writeFileSync(mcpConfigPath, JSON.stringify(mcpConfig), { mode: 0o600 });
+  const args = [
+    "--model",
+    profile.model,
+    "--effort",
+    profile.thinking,
+    "--settings",
+    settingsPath,
+    "--mcp-config",
+    mcpConfigPath,
+    "--strict-mcp-config",
+  ];
+  const permissionPromptTool =
+    paths.permissionPromptTool === undefined
+      ? process.env.BAA_CLAUDE_PERMISSION_PROMPT_TOOL === "1"
+        ? CLAUDE_PERMISSION_PROMPT_TOOL
+        : undefined
+      : paths.permissionPromptTool;
+  if (permissionPromptTool !== undefined && permissionPromptTool !== false) {
+    if (
+      typeof permissionPromptTool !== "string" ||
+      permissionPromptTool.trim() === ""
+    )
+      throw new Error(
+        "permissionPromptTool must be a non-empty string when enabled.",
+      );
+    args.push("--permission-prompt-tool", permissionPromptTool);
+  }
+  return args;
+}
+
 export function claudeLaunchAdapter(
   paths: ClaudeAdapterPaths,
 ): HarnessLaunchAdapter {
@@ -83,6 +179,7 @@ export function claudeLaunchAdapter(
       startupAttestation: true,
       supportsSessionPersistence: true,
       supportsNativeSessionIdentity: true,
+      supportsSessionResume: true,
       // Claude Code has no stable machine-readable live model/auth catalog API
       // at this adapter boundary; startup validity is still fail-closed.
       supportsLiveCapabilityDiscovery: false,
@@ -109,74 +206,13 @@ export function claudeLaunchAdapter(
       // claude exit before its SessionStart hook writes the handshake, so
       // dispatch fails closed rather than silently substituting a model.
     },
-    launchArguments(profile: LaunchProfile): string[] {
-      mkdirSync(paths.scratchDirectory, { recursive: true, mode: 0o700 });
-      const tag = randomUUID().slice(0, 8);
-      const settingsPath = join(
-        paths.scratchDirectory,
-        `claude-settings-${tag}.json`,
-      );
-      const mcpConfigPath = join(
-        paths.scratchDirectory,
-        `claude-mcp-${tag}.json`,
-      );
-      const settings = {
-        hooks: {
-          SessionStart: [
-            {
-              hooks: [
-                {
-                  type: "command",
-                  command: `node ${JSON.stringify(paths.attestHelper)}`,
-                },
-              ],
-            },
-          ],
-        },
-        permissions: LANE_PERMISSIONS,
-      };
-      const mcpConfig = {
-        mcpServers: {
-          "herdr-orchestrator": {
-            command: "node",
-            args: [paths.bridge],
-          },
-        },
-      };
-      writeFileSync(settingsPath, JSON.stringify(settings), { mode: 0o600 });
-      writeFileSync(mcpConfigPath, JSON.stringify(mcpConfig), { mode: 0o600 });
-      const args = [
-        "--model",
-        profile.model,
-        "--effort",
-        profile.thinking,
-        "--settings",
-        settingsPath,
-        "--mcp-config",
-        mcpConfigPath,
-        "--strict-mcp-config",
-      ];
-      const permissionPromptTool =
-        paths.permissionPromptTool === undefined
-          ? process.env.BAA_CLAUDE_PERMISSION_PROMPT_TOOL === "1"
-            ? CLAUDE_PERMISSION_PROMPT_TOOL
-            : undefined
-          : paths.permissionPromptTool;
-      if (
-        permissionPromptTool !== undefined &&
-        permissionPromptTool !== false
-      ) {
-        if (
-          typeof permissionPromptTool !== "string" ||
-          permissionPromptTool.trim() === ""
-        )
-          throw new Error(
-            "permissionPromptTool must be a non-empty string when enabled.",
-          );
-        args.push("--permission-prompt-tool", permissionPromptTool);
-      }
-      return args;
-    },
+    launchArguments: (profile) => buildClaudeLaunchArguments(paths, profile),
+    resumeSessionId: claudeResumeSessionId,
+    resumeArguments: (profile, session) => [
+      "--resume",
+      claudeResumeSessionId(session),
+      ...buildClaudeLaunchArguments(paths, profile),
+    ],
     verifyStartup(nativeAgent: unknown, attestation: unknown): StartupProof {
       const agent = nativeAgent as {
         agent?: string;
@@ -231,6 +267,19 @@ export function claudeLaunchAdapter(
         profile: hello.profile!,
         operations,
         session: { kind, value },
+        persistence: {
+          provider: CLAUDE_PROVIDER,
+          sessionId: hello.sessionId ?? value,
+          nativeHandle: { kind, value },
+          ...(hello.sessionPath || hello.sessionId
+            ? {
+                metadata: {
+                  ...(hello.sessionId ? { sessionId: hello.sessionId } : {}),
+                  ...(hello.sessionPath ? { sessionPath: hello.sessionPath } : {}),
+                },
+              }
+            : {}),
+        },
       };
     },
   };

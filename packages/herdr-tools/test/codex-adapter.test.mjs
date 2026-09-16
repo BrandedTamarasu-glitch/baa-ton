@@ -46,6 +46,15 @@ test("codex launchArguments wires model, effort, notify, mcp env, and declares h
   );
   assert.match(flat, /mcp_servers\.herdr-orchestrator\.env\.HERDR_ENV="1"/);
   assert.equal(args.includes("Reply with exactly: READY"), false);
+  const resumed = adapter.resumeArguments(
+    profile,
+    { provider: CODEX_PROVIDER, sessionId: "01a0a686-0a6d" },
+    "/src/index.ts",
+    { startupIntentPath: "/intents/resume.json" },
+  );
+  assert.deepEqual(resumed.slice(0, 2), ["resume", "01a0a686-0a6d"]);
+  assert.equal(resumed[resumed.indexOf("--model") + 1], profile.model);
+  assert.match(resumed.join(" "), /BAA_STARTUP_INTENT=\"\/intents\/resume\.json\"/);
   assert.throws(
     () => adapter.launchArguments(profile, "/src/index.ts"),
     /startup intent path/,
@@ -101,6 +110,29 @@ test("codex verifyStartup binds thread identity for id and path sessions", () =>
     attestation,
   );
   assert.equal(byPath.session.kind, "path");
+  const rolloutPath =
+    "/sessions/2026/09/15/rollout-2026-09-15T12-00-00-01a0a686-0a6d.jsonl";
+  assert.equal(
+    adapter.resumeSessionId({
+      provider: CODEX_PROVIDER,
+      sessionId: rolloutPath,
+      nativeHandle: { kind: "path", value: rolloutPath },
+    }),
+    "01a0a686-0a6d",
+  );
+  assert.deepEqual(
+    adapter.resumeArguments(
+      profile,
+      {
+        provider: CODEX_PROVIDER,
+        sessionId: rolloutPath,
+        nativeHandle: { kind: "path", value: rolloutPath },
+      },
+      "/src/index.ts",
+      { startupIntentPath: "/intents/resume.json" },
+    ).slice(0, 2),
+    ["resume", "01a0a686-0a6d"],
+  );
   assert.throws(
     () =>
       adapter.verifyStartup(

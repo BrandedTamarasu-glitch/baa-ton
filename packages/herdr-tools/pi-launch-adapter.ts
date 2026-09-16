@@ -244,6 +244,24 @@ export function piLaunchAdapter(
     discoveryDetails.set(result.catalog.cacheKey, result.details);
     return result.catalog;
   };
+  const launchArguments = (profile: LaunchProfile, source: string): string[] => [
+    "--provider",
+    profile.provider,
+    "--model",
+    profile.model,
+    "--thinking",
+    profile.thinking,
+    "--no-extensions",
+    "-e",
+    nativeIntegration,
+    "-e",
+    source,
+  ];
+  const resumeSessionId = (session: import("./contract.js").PersistenceHandle): string => {
+    if (!session || typeof session.sessionId !== "string" || !session.sessionId)
+      throw new Error("Pi native resume requires a persisted session path or id.");
+    return session.sessionId;
+  };
   return {
     version: 1,
     kind: "pi",
@@ -251,6 +269,8 @@ export function piLaunchAdapter(
       startupAttestation: true,
       supportsSessionPersistence: true,
       supportsNativeSessionIdentity: true,
+      supportsSessionResume: true,
+      supportsStartupHandshake: false,
     },
     lifecycle: "native",
     discoverCatalog,
@@ -285,18 +305,12 @@ export function piLaunchAdapter(
       }
       validateCatalog(profile, catalog, details!);
     },
-    launchArguments: (profile, source) => [
-      "--provider",
-      profile.provider,
-      "--model",
-      profile.model,
-      "--thinking",
-      profile.thinking,
-      "--no-extensions",
-      "-e",
-      nativeIntegration,
-      "-e",
-      source,
+    launchArguments,
+    resumeSessionId,
+    resumeArguments: (profile, session, source) => [
+      "--session",
+      resumeSessionId(session),
+      ...launchArguments(profile, source),
     ],
     verifyStartup(nativeAgent: unknown, attestation: unknown): StartupProof {
       const agent = nativeAgent as {
@@ -335,6 +349,11 @@ export function piLaunchAdapter(
         profile: hello.profile,
         operations: mapPiToolNamesToProtocolOperations(hello.tools),
         session: { kind: "path", value: hello.sessionPath },
+        persistence: {
+          provider: hello.profile.provider,
+          sessionId: hello.sessionPath,
+          nativeHandle: { kind: "path", value: hello.sessionPath },
+        },
       };
     },
   };

@@ -11,6 +11,7 @@ const {
   dispatchTask,
   laneSlug,
   laneTabLabel,
+  resumeTask,
 } = await jiti.import("../dispatch-task.ts");
 const { piLaunchAdapter } = await jiti.import("../pi-launch-adapter.ts");
 const { claudeLaunchAdapter } = await jiti.import(

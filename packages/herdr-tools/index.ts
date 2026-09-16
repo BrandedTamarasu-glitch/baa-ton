@@ -65,7 +65,11 @@ export type {
   GoalOwnership,
   OperatorClosure,
 } from "./contract.js";
-import { dispatchTask, laneSlug } from "./dispatch-task.js";
+import {
+  dispatchTask,
+  laneSlug,
+  resumeTask,
+} from "./dispatch-task.js";
 import {
   LAUNCH_PROFILE_SCHEMA_VERSION,
   type LaunchProfile,
@@ -4046,7 +4050,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             ))
           );
         },
-        async register(w) {
+        async register(w, options) {
           const configPath = await controllerConfigPath(signal);
           const lockPath = `${configPath}.lock`;
           await mkdir(lockPath, { mode: 0o700 });
@@ -4074,10 +4078,15 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             const previous = record.workflows.find(
               (item) => item.workflow_id === w.id,
             );
-            if (previous && !sameControllerWorkflow(previous, mapping))
-              throw new Error(
-                "Recorded lane route differs; authorized recovery is required.",
+            if (previous && !sameControllerWorkflow(previous, mapping)) {
+              if (!options?.allowLaneRebind)
+                throw new Error(
+                  "Recorded lane route differs; authorized recovery is required.",
+                );
+              record.workflows = record.workflows.map((item) =>
+                item.workflow_id === w.id ? mapping : item,
               );
+            }
             if (!previous) record.workflows.push(mapping);
             await saveControllerConfig(configPath, config!);
           } finally {
@@ -4304,6 +4313,171 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     };
   }
 
+  async function resumeNativeSessions(
+    cwd: string,
+    id: string,
+    execute: boolean,
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+  ) {
+    const manifest = await loadManifest(cwd);
+    const workflow = workflowFor(manifest, id);
+    if (execute) requireHerdr();
+    if (execute && !isRootOrchestrator()) {
+      const release = await acquireManifestLock(cwd, 10_000);
+      try {
+        const current = await loadManifest(cwd);
+        const stored = workflowFor(current, id);
+        const approvalRequest = requestParentApproval(stored, "resume");
+        await saveManifest(cwd, current);
+        return {
+          parentApprovalRequired: true,
+          approvalRequest,
+          workflow: stored,
+        };
+      } finally {
+        await release();
+      }
+    }
+    if (execute && !isRootForManifest(cwd))
+      throw new Error(
+        "The verified controller-mapped root does not own this workflow manifest; native resume is refused.",
+      );
+    const adapters = new HarnessAdapterRegistry();
+    adapters.register(
+      piLaunchAdapter(
+        ctx,
+        join(homedir(), ".pi/agent/extensions/herdr-agent-state.ts"),
+      ),
+    );
+    adapters.register(
+      claudeLaunchAdapter({
+        bridge: fileURLToPath(new URL("./mcp-server.mjs", import.meta.url)),
+        attestHelper: fileURLToPath(
+          new URL("./claude-startup-attest.mjs", import.meta.url),
+        ),
+        scratchDirectory: dirname(manifestPath(cwd)),
+      }),
+    );
+    adapters.register(
+      codexLaunchAdapter({
+        bridge: fileURLToPath(new URL("./mcp-server.mjs", import.meta.url)),
+        attestHelper: fileURLToPath(
+          new URL("./codex-startup-attest.mjs", import.meta.url),
+        ),
+        sessionRoot: join(homedir(), ".codex", "sessions"),
+      }),
+    );
+    adapters.register(
+      opencodeLaunchAdapter({
+        scratchDirectory: dirname(manifestPath(cwd)),
+      }),
+    );
+    return resumeTask(
+      workflow,
+      execute,
+      {
+        directory: dirname(manifestPath(cwd)),
+        source: fileURLToPath(import.meta.url),
+        adapter: (kind) => adapters.resolve(kind),
+        run: runHerdr,
+        async update(workflowId, mutate) {
+          const release = await acquireManifestLock(cwd, 10_000);
+          try {
+            const current = await loadManifest(cwd);
+            const stored = workflowFor(current, workflowId);
+            mutate(stored);
+            stored.updatedAt = now();
+            await saveManifest(cwd, current);
+            return stored;
+          } finally {
+            await release();
+          }
+        },
+        async verifyRoot(w) {
+          requireRootGoalExecutor();
+          const root = await currentPaneRoot(signal);
+          if (
+            root.pane_id !== w.taskBinding?.rootPaneId ||
+            root.workspace_id !== w.taskBinding.workspaceId
+          )
+            throw new Error(
+              "Current root does not match the designated task workspace; native resume cannot use a topology fallback.",
+            );
+          const native = responseRecord(
+            await runHerdr(["agent", "get", root.pane_id], signal),
+            "task root",
+          ).agent;
+          if (
+            !isRecord(native) ||
+            !isRecord(native.agent_session) ||
+            native.agent_session.value !== w.taskBinding.rootSessionPath
+          )
+            throw new Error(
+              "Root incarnation changed; authorized task recovery is required before native resume.",
+            );
+        },
+        async authorize(w) {
+          const decision = authorizationDecision(w, "resume");
+          if (decision.allowed) {
+            if (w.worktree) await assertCleanLocalWorktree(w.worktree, signal);
+            auditAuthorization(w, decision);
+            return true;
+          }
+          auditAuthorization(w, decision);
+          return confirmExecution(
+            ctx,
+            `Resume native sessions for ${w.id}`,
+          );
+        },
+        async register(w, options) {
+          const configPath = await controllerConfigPath(signal);
+          const lockPath = `${configPath}.lock`;
+          await mkdir(lockPath, { mode: 0o700 });
+          try {
+            const config = await loadControllerConfig(configPath);
+            const root = await currentPaneRoot(signal);
+            const record = config && findControllerRecord(config, root, cwd);
+            if (!record)
+              throw new Error(
+                "Task root routing must be registered before native resume.",
+              );
+            const mapping: ControllerWorkflowMapping = {
+              workflow_id: w.id,
+              manifest_path: resolve(manifestPath(cwd)),
+              pi_goal_pause_detection: false,
+              lanes: w.lanes.map((lane) => ({
+                lane_id: lane.id,
+                target: lane.paneId!,
+                target_kind: "pane_id",
+                pane_id: lane.paneId!,
+                workspace_id: w.taskBinding!.workspaceId,
+                relationship_id: lane.relationshipId,
+              })),
+            };
+            const previous = record.workflows.find(
+              (item) => item.workflow_id === w.id,
+            );
+            if (previous && !sameControllerWorkflow(previous, mapping)) {
+              if (!options?.allowLaneRebind)
+                throw new Error(
+                  "Recorded lane route differs; authorized native recovery is required.",
+                );
+              record.workflows = record.workflows.map((item) =>
+                item.workflow_id === w.id ? mapping : item,
+              );
+            }
+            if (!previous) record.workflows.push(mapping);
+            await saveControllerConfig(configPath, config!);
+          } finally {
+            await rm(lockPath, { recursive: true, force: true });
+          }
+        },
+      },
+      signal,
+    );
+  }
+
   async function resume(
     cwd: string,
     id: string,
@@ -4321,6 +4495,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           lane.status === "goal-paused" &&
           Boolean(lane.agentName),
       );
+    // `/goal-resume` remains the Pi goal protocol. Every other recovery uses
+    // the durable session log and the selected adapter's native invocation.
+    if (pausedLanes.length === 0)
+      return resumeNativeSessions(cwd, id, execute, ctx, signal);
     if (!execute)
       return {
         dryRun: true,
@@ -6818,18 +6996,18 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     name: "herdr_resume",
     label: "Herdr Resume",
     description:
-      "Preview or explicitly send /goal-resume through Herdr to lanes with a recorded paused Pi goal.",
+      "Preview or explicitly resume a recorded paused Pi goal, or reattach a done/gone lane to its exact native persisted session.",
     promptSnippet:
-      "Resume observed paused Pi goals through their recorded Herdr lane agents; dry-run by default.",
+      "Resume paused Pi goals or natively reattach terminal/gone Herdr lane sessions; dry-run by default.",
     promptGuidelines: [
-      "Use herdr_resume only after herdr_observe records a goal-paused workflow. A root bypasses UI only when the workflow's validated local authorizationPolicy grants paused-goal recovery; children remain UI-free and return parentApprovalRequired.",
+      "Use herdr_resume after herdr_observe. Pi goal-paused lanes receive /goal-resume; done/gone lanes use only their durable session log and harness-native resume invocation. A root bypasses UI only when the workflow's validated local authorizationPolicy grants resume; children remain UI-free and return parentApprovalRequired.",
     ],
     parameters: Type.Object({
       workflowId: Type.String(),
       execute: Type.Optional(Type.Boolean()),
     }),
     async execute(_id, params, signal, _update, ctx) {
-      const result = await resume(
+      const result: any = await resume(
         ctx.cwd,
         params.workflowId,
         params.execute ?? false,
@@ -6845,8 +7023,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               : result.parentApprovalRequired
                 ? `Parent approval required for ${params.workflowId}; the designated root must resume the observed goal through Herdr.`
                 : result.cancelled
-                  ? "Goal resume cancelled"
-                  : `Sent /goal-resume to ${result.receipts?.length ?? 0} lane agent(s) for ${params.workflowId}`,
+                  ? "Resume cancelled"
+                  : result.resumed
+                    ? `Resumed ${result.resumedLanes?.length ?? 0} lane session(s) for ${params.workflowId}`
+                    : `Sent /goal-resume to ${result.receipts?.length ?? 0} lane agent(s) for ${params.workflowId}`,
           },
         ],
         details: result,
@@ -7014,15 +7194,16 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   });
   pi.registerCommand("herdr-resume", {
     description:
-      "Preview or resume paused goals: /herdr-resume <id> [--execute]",
+      "Preview or resume paused goals or native sessions: /herdr-resume <id> [--execute]",
     handler: async (args, ctx) => {
       const [id, flag] = args.trim().split(/\s+/);
       if (!id) throw new Error("Usage: /herdr-resume <id> [--execute]");
-      const result = await resume(ctx.cwd, id, flag === "--execute", ctx);
+      const result: any = await resume(ctx.cwd, id, flag === "--execute", ctx);
       let message = `Sent /goal-resume for ${id}`;
       if (result.dryRun) message = `Dry-run: ${id}`;
       if (result.parentApprovalRequired) return;
-      if (result.cancelled) message = "Goal resume cancelled";
+      if (result.cancelled) message = "Resume cancelled";
+      if (result.resumed) message = `Resumed native sessions for ${id}`;
       ctx.ui.notify(message, "info");
     },
   });

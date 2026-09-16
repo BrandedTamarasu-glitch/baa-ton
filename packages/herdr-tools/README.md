@@ -12,7 +12,7 @@ Harness-neutral local workflow operations for Herdr. The local MCP bridge expose
 | `herdr_dispatch` | Preview or create owned Herdr workspace/tab/lane resources. |
 | `herdr_observe` | Record lane state and bounded recent output, including child messages. |
 | `herdr_message` | Send durable informational context from a child to its parent. |
-| `herdr_resume` | Recover lanes that have a recorded paused goal. |
+| `herdr_resume` | Recover paused Pi goals or reattach done/gone lanes through exact native session resume. |
 | `herdr_close` | Close only a completed, evidenced, extension-owned workspace. |
 
 All operations fail closed outside a Herdr session. Dispatch, resume, and close are previews by default. Non-root callers persist a parent-approval request rather than presenting approval UI.
@@ -60,8 +60,10 @@ when known. Lane `lastResponseAt` is derived from the controller's durable
 `eventController.events` ledger, so it does not drift through a second activity
 writer. The trace remains readable after a lane tab is retired or a worktree is
 removed. `herdr_observe` returns the current root's root-plus-lane entries in
-`details.sessionLog`; the manifest is the durable source of truth. Resume and
-cleanup/retirement are follow-up rounds built on this trace.
+`details.sessionLog`; the manifest is the durable source of truth. `herdr_resume` natively reattaches `done`/`gone` lanes through the parity
+adapter table in `HARNESS-ADAPTERS.md`; it retains the original `startedAt` and
+records the new incarnation's start separately. Cleanup/retirement remains a
+follow-up round built on this trace.
 
 ## Cleanup sweep
 

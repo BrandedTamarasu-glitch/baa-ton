@@ -13,6 +13,30 @@
 
 The common dispatcher additionally enforces workspace/pane/agent identity, startup nonce, bridge source, exact profile, required operations, and stable session identity. Registry registration is trusted local code, not evidence by itself: adapters need conformance tests and live qualification.
 
+## Native session-resume parity
+
+`herdr_resume` keeps the legacy `/goal-resume` path for an observed paused Pi
+*goal*. For a lane whose durable session-log status is `done` or `gone`, it
+uses only the adapter's exact native resume operation. It verifies the recorded
+worktree, creates a tab in the current root's task workspace, registers the
+updated pane route, starts the provider with a fresh nonce, and records the
+new incarnation only after startup proof and the persisted session identity
+match. The original `sessionLog.startedAt` is retained; the current launch is
+`sessionLog.incarnationStartedAt`.
+
+| Harness | Parity | Exact native invocation (inside `herdr agent start ... --`) |
+| --- | --- | --- |
+| Pi | Implemented | `pi --session <path-or-id> --provider <provider> --model <exact-model> --thinking <level> --no-extensions -e <herdr-agent-state> -e <herdr-tools-source>` |
+| Claude Code | Implemented | `claude --resume <session-id> --model <exact-model> --effort <level> --settings <generated-settings> --mcp-config <generated-mcp> --strict-mcp-config` |
+| Codex | Implemented | `codex resume <session-id> --model <exact-model> -s workspace-write -c model_reasoning_effort=<level> -c 'notify=["node","<attest-helper>"]' -c 'mcp_servers.herdr-orchestrator.command="node"' -c 'mcp_servers.herdr-orchestrator.args=["<bridge>"]' -c 'mcp_servers.herdr-orchestrator.env.BAA_STARTUP_INTENT="<intent>"' -c 'mcp_servers.herdr-orchestrator.env.HERDR_ENV="1"'` (`codex exec resume` is non-interactive and is not used for a Herdr lane) |
+| OpenCode | Implemented | `opencode --session <session-id> --model openai/<exact-model>` (before start, the adapter writes the generated attest plugin and MCP config used for startup proof) |
+
+The four installed harnesses therefore have no silent resume gap. An adapter
+that omits `supportsSessionResume`, `resumeSessionId`, or `resumeArguments` is
+explicitly unsupported and the root executor fails closed before creating a
+tab. No provider uses `--last`, most-recent, a picker, a transcript-path
+substitution, or an inferred different worktree.
+
 ## Current evidence
 
 | Adapter | Source/local tests | Live qualification |

@@ -246,7 +246,10 @@ export type SessionLogStatus =
 export type SessionLogEntry = {
   kind: "root" | "lane";
   sessionRef: PersistenceHandle;
+  /** Original incarnation start; retained as immutable session history. */
   startedAt: string;
+  /** Start time of the currently attached incarnation, when resumed. */
+  incarnationStartedAt?: string;
   lastResponseAt?: string;
   status: SessionLogStatus;
   workflowId?: string;
@@ -378,6 +381,21 @@ export type Lane = {
     previousIncarnationId?: string;
     incarnationId: string;
   };
+  /** Native-session reattachment state. It is separate from restart so an
+   * interrupted resume never gets mistaken for a fresh launch. */
+  resume?: {
+    version: 1;
+    status: "requested" | "starting" | "bound";
+    requestedAt: string;
+    previousIncarnationId?: string;
+    previousPaneId?: string;
+    previousTabId?: string;
+    incarnationId: string;
+  };
+  resumeTabCreateAttemptedAt?: string;
+  resumeAgentStartAttemptedAt?: string;
+  resumeStartupHandshakeAttemptedAt?: string;
+  resumeStartupHandshakeSentAt?: string;
   /** Legacy compatibility view retained for manifests written before v1. */
   nativeSession?: NativeSessionRef;
   /** Generalized provider/session persistence identity. */

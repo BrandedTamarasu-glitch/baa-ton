@@ -1,6 +1,7 @@
 import { existsSync, readdirSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import type { LaunchProfile } from "./launch-profile.js";
+import type { PersistenceHandle } from "./contract.js";
 import {
   PROTOCOL_OPERATIONS,
   type HarnessLaunchAdapter,
@@ -69,6 +70,75 @@ function filterProtocolOperations(operations: unknown): ProtocolOperation[] {
   );
 }
 
+function codexResumeSessionId(session: PersistenceHandle): string {
+  const metadataId = session.metadata?.sessionId;
+  if (typeof metadataId === "string" && metadataId) return metadataId;
+  const native = session.nativeHandle;
+  if (
+    native &&
+    typeof native === "object" &&
+    (native as { kind?: unknown }).kind === "id" &&
+    typeof (native as { value?: unknown }).value === "string" &&
+    (native as { value: string }).value
+  )
+    return (native as { value: string }).value;
+  if (
+    typeof session.sessionId === "string" &&
+    session.sessionId &&
+    !session.sessionId.includes("/")
+  )
+    return session.sessionId;
+  // cebdc84-era Codex logs may contain only the durable rollout path. Codex
+  // names that file with an ISO-like timestamp followed by the complete
+  // thread id. Preserve all of the UUID/ULID's hyphens; taking only the final
+  // filename component would silently resume a different (invalid) id.
+  const path =
+    typeof native === "object" && native &&
+    (native as { kind?: unknown }).kind === "path" &&
+    typeof (native as { value?: unknown }).value === "string"
+      ? (native as { value: string }).value
+      : session.sessionId;
+  const base = path?.split(/[\\/]/).pop() ?? "";
+  if (base.startsWith("rollout-") && base.endsWith(".jsonl")) {
+    let candidate = base.slice("rollout-".length, -".jsonl".length);
+    candidate = candidate.replace(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-/, "");
+    if (candidate) return candidate;
+  }
+  throw new Error(
+    "Codex native resume requires the persisted thread id or a rollout filename containing it; no --last fallback is allowed.",
+  );
+}
+
+function buildCodexLaunchArguments(
+  paths: CodexAdapterPaths,
+  profile: LaunchProfile,
+  context?: { startupIntentPath?: string },
+): string[] {
+  const intentPath = context?.startupIntentPath;
+  if (!intentPath)
+    throw new Error("Codex launch requires the startup intent path.");
+  return [
+    "--model",
+    profile.model,
+    "-s",
+    "workspace-write",
+    "-c",
+    `model_reasoning_effort=${profile.thinking}`,
+    "-c",
+    `notify=["node","${paths.attestHelper}"]`,
+    "-c",
+    'mcp_servers.herdr-orchestrator.command="node"',
+    "-c",
+    `mcp_servers.herdr-orchestrator.args=["${paths.bridge}"]`,
+    "-c",
+    `mcp_servers.herdr-orchestrator.env.BAA_STARTUP_INTENT="${intentPath}"`,
+    // Codex MCP children do NOT inherit pane env — every key the bridge
+    // needs must be passed explicitly, including the session marker.
+    "-c",
+    'mcp_servers.herdr-orchestrator.env.HERDR_ENV="1"',
+  ];
+}
+
 /** Codex lanes run on the same openai-codex subscription as Pi. The startup
  * proof turn is the adapter's startupHandshake; Codex's `notify` hook writes
  * the attestation (thread-id) when that turn completes, and the MCP bridge
@@ -84,6 +154,7 @@ export function codexLaunchAdapter(
       startupAttestation: true,
       supportsSessionPersistence: true,
       supportsNativeSessionIdentity: true,
+      supportsSessionResume: true,
       // Codex has no stable machine-readable live model/auth catalog API at
       // this adapter boundary; static config is not a discovery substitute.
       supportsLiveCapabilityDiscovery: false,
@@ -119,35 +190,14 @@ export function codexLaunchAdapter(
       // Reasoning effort maps 1:1 onto model_reasoning_effort; a rejected
       // value makes codex exit before attestation, failing dispatch closed.
     },
-    launchArguments(
-      profile: LaunchProfile,
-      _source: string,
-      context?: { startupIntentPath?: string },
-    ): string[] {
-      const intentPath = context?.startupIntentPath;
-      if (!intentPath)
-        throw new Error("Codex launch requires the startup intent path.");
-      return [
-        "--model",
-        profile.model,
-        "-s",
-        "workspace-write",
-        "-c",
-        `model_reasoning_effort=${profile.thinking}`,
-        "-c",
-        `notify=["node","${paths.attestHelper}"]`,
-        "-c",
-        'mcp_servers.herdr-orchestrator.command="node"',
-        "-c",
-        `mcp_servers.herdr-orchestrator.args=["${paths.bridge}"]`,
-        "-c",
-        `mcp_servers.herdr-orchestrator.env.BAA_STARTUP_INTENT="${intentPath}"`,
-        // Codex MCP children do NOT inherit pane env — every key the bridge
-        // needs must be passed explicitly, including the session marker.
-        "-c",
-        'mcp_servers.herdr-orchestrator.env.HERDR_ENV="1"',
-      ];
-    },
+    launchArguments: (profile, _source, context) =>
+      buildCodexLaunchArguments(paths, profile, context),
+    resumeSessionId: codexResumeSessionId,
+    resumeArguments: (profile, session, _source, context) => [
+      "resume",
+      codexResumeSessionId(session),
+      ...buildCodexLaunchArguments(paths, profile, context),
+    ],
     verifyStartup(nativeAgent: unknown, attestation: unknown): StartupProof {
       const agent = nativeAgent as {
         agent?: string;
@@ -219,6 +269,15 @@ export function codexLaunchAdapter(
         profile: hello.profile!,
         operations: filterProtocolOperations(hello.operations),
         session,
+        persistence: {
+          provider: CODEX_PROVIDER,
+          sessionId: hello.sessionId,
+          nativeHandle: session,
+          metadata: {
+            sessionId: hello.sessionId,
+            ...(session.kind === "path" ? { rolloutPath: session.value } : {}),
+          },
+        },
       };
     },
   };

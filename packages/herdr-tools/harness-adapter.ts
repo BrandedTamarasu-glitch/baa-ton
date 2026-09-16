@@ -39,8 +39,26 @@ export type HarnessLifecycle = "native" | "screen" | "unavailable";
 export type HarnessCapabilityFlags = Record<string, boolean | undefined> & {
   startupAttestation: boolean;
   supportsSessionPersistence: boolean;
+  /** Native exact-session reattachment is explicit; false is fail-closed. */
+  supportsSessionResume?: boolean;
   supportsLiveCapabilityDiscovery?: boolean;
   supportsStartupHandshake?: boolean;
+};
+
+/** Arguments are appended after `herdr agent start ... --`. The adapter owns
+ * the exact native invocation; callers must never invent provider flags. */
+export type ResumeLaunchContext = LaunchContext;
+
+export type ResumeLaunchAdapter = {
+  /** Return the exact native identity accepted by the provider's resume CLI. */
+  resumeSessionId(session: PersistenceHandle): string;
+  /** Build native resume arguments, including any proof/config wiring. */
+  resumeArguments(
+    profile: LaunchProfile,
+    session: PersistenceHandle,
+    source: string,
+    context?: ResumeLaunchContext,
+  ): string[];
 };
 
 export type StartupProof = {
@@ -86,6 +104,10 @@ export interface HarnessLaunchAdapter {
     source: string,
     context?: LaunchContext,
   ): string[];
+  /** Required when supportsSessionResume is true. Omission is unsupported,
+   * never a guessed provider invocation. */
+  resumeSessionId?: ResumeLaunchAdapter["resumeSessionId"];
+  resumeArguments?: ResumeLaunchAdapter["resumeArguments"];
   /** Must compare native identity with the harness's startup attestation.
    * Screen-derived idle alone is never startup attestation. */
   verifyStartup(nativeAgent: unknown, attestation: unknown): StartupProof;
@@ -101,15 +123,16 @@ export interface HarnessLaunchAdapter {
  * reason next to that declaration. The startup-handshake flag follows the
  * same rule for harnesses that do not need a first turn.
  *
- * | harness  | preflight  | launchArguments | verifyStartup | startupHandshake                                      | discoverCatalog                                                    | capabilities flags |
- * | codex    | implemented | implemented     | implemented   | GAP-fixed-now (implemented adapter field; READY turn) | explicitly-unsupported-with-reason (no stable live catalog API)    | implemented; required=true, discovery=false, handshake=true |
- * | claude   | implemented | implemented     | implemented   | explicitly-unsupported-with-reason (SessionStart)   | explicitly-unsupported-with-reason (no stable live catalog API)    | implemented; required=true, discovery=false, handshake=false |
- * | opencode | implemented | implemented     | implemented   | implemented (READY turn for lazy sessions)          | explicitly-unsupported-with-reason (no authoritative live catalog) | implemented; required=true, discovery=false, handshake=true |
+ * | harness  | preflight  | launchArguments | verifyStartup | resumeArguments | startupHandshake                                      | discoverCatalog                                                    | capabilities flags |
+ * | pi       | implemented | implemented     | implemented   | implemented (`pi --session <path|id>`) | explicitly unsupported (session_start is the proof) | implemented (live Pi model registry) | resume=true |
+ * | codex    | implemented | implemented     | implemented   | implemented (`codex resume <session-id>`; `exec resume` is non-interactive) | implemented (READY turn) | explicitly unsupported (no stable live catalog API) | resume=true |
+ * | claude   | implemented | implemented     | implemented   | implemented (`claude --resume <session-id>`) | explicitly unsupported (SessionStart) | explicitly unsupported (no stable live catalog API) | resume=true |
+ * | opencode | implemented | implemented     | implemented   | implemented (`opencode --session <session-id>`) | implemented (READY turn) | explicitly unsupported (no authoritative live catalog) | resume=true |
  *
- * Pi remains the reference implementation: it implements discoverCatalog
- * directly (the optional flag is unnecessary when the method is present); it
- * does not require a startup handshake. See each adapter for the fail-closed
- * reason attached to every unsupported operation.
+ * Resume support is a native provider operation, not `/goal-resume`. An
+ * adapter that does not implement both resume methods is unsupported and the
+ * root executor fails closed before topology mutation. See each adapter for
+ * the exact invocation and fail-closed identity checks.
  */
 export const REQUIRED_ADAPTER_CAPABILITIES = [
   "startupAttestation",
