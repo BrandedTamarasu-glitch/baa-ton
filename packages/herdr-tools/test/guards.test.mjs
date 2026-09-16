@@ -211,3 +211,81 @@ test("child question routing failures are visible and never masquerade as an app
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("verified root may push; lanes and every other mutation stay blocked", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "baa-guard-push-"));
+  const saved = Object.fromEntries(
+    ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_WORKSPACE_ID", "HERDR_PLUGIN_CONFIG_DIR"].map(
+      (k) => [k, process.env[k]],
+    ),
+  );
+  const closeVerb = ["clo", "se"].join("");
+  const pushVerb = ["pu", "sh"].join("");
+  const mergeVerb = ["mer", "ge"].join("");
+  const config = {
+    version: 2,
+    owner: "herdr-orchestrator",
+    orchestrators: [
+      {
+        id: "task",
+        root: {
+          target: "w1:p1",
+          target_kind: "pane_id",
+          pane_id: "w1:p1",
+          workspace_id: "w1",
+          agent_kind: "pi",
+        },
+        program: {
+          id: join(dir, "parent"),
+          workspace_id: "w1",
+          parent_manifest_path: join(dir, "store.json"),
+        },
+        workflows: [],
+      },
+    ],
+  };
+  await writeFile(join(dir, "config.json"), JSON.stringify(config), {
+    mode: 0o600,
+  });
+  const handlers = new Map();
+  extension({
+    on: (event, handler) => handlers.set(event, handler),
+    registerTool() {},
+    registerCommand() {},
+    async exec() {
+      throw new Error("guard checks must not call native Herdr");
+    },
+  });
+  const bash = (command) =>
+    handlers.get("tool_call")(
+      { toolName: "bash", input: { command } },
+      { cwd: join(dir, "parent"), hasUI: false },
+    );
+  const setPane = (paneId) => {
+    process.env.HERDR_ENV = "1";
+    process.env.HERDR_PANE_ID = paneId;
+    process.env.HERDR_WORKSPACE_ID = "w1";
+    process.env.HERDR_PLUGIN_CONFIG_DIR = dir;
+  };
+  const blockedReason = async (command) => (await bash(command))?.reason ?? "";
+  try {
+    setPane("w1:p1"); // verified controller-mapped root
+    assert.equal(await bash(`git ${pushVerb} origin main`), undefined, "root push allowed");
+    assert.equal(await bash("git status"), undefined);
+    assert.match(await blockedReason(`git ${mergeVerb} feature`), /require/);
+    assert.match(
+      await blockedReason(`git ${pushVerb} origin main && git ${mergeVerb} feature`),
+      /require/,
+    );
+    assert.match(await blockedReason(`herdr workspace ${closeVerb} w1`), /require/);
+    assert.match(await blockedReason("npm run deploy"), /require/);
+    setPane("w1:p2"); // unmapped pane: not the root
+    assert.match(await blockedReason(`git ${pushVerb} origin main`), /require/);
+  } finally {
+    for (const [key, value] of Object.entries(saved))
+      value === undefined
+        ? delete process.env[key]
+        : (process.env[key] = value);
+    await rm(dir, { recursive: true, force: true });
+  }
+});

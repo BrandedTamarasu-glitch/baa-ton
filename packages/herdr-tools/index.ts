@@ -4000,9 +4000,20 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     }
     const command = call.input?.command;
     if (call.toolName !== "bash" || typeof command !== "string") return;
+    const gitPush = /(?:^|[;&|]\s*)git(?:\s+\S+)*\s+push\b/im;
     const nonAutonomousMutation =
       /(?:^|[;&|]\s*)(?:git(?:\s+\S+)*\s+(?:push|merge)\b|gh\s+pr\s+create\b|glab\s+mr\s+create\b|hub\s+pull-request\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:deploy|publish|release)\b|(?:wrangler|vercel|netlify|flyctl|kubectl)\s+(?:deploy|publish|apply)\b|herdr\s+(?:workspace|tab|pane)\s+close\b)/im;
-    if (process.env.HERDR_ENV === "1" && nonAutonomousMutation.test(command)) {
+    // 2026-09-16 ruling: the verified controller-mapped root is the parent
+    // executor acting with the user present, so a plain `git push` is allowed
+    // there. Every other mutation stays blocked for every caller, and a
+    // compound command that also carries a non-push mutation keeps the block.
+    const nonPushMutation =
+      /(?:^|[;&|]\s*)(?:git(?:\s+\S+)*\s+merge\b|gh\s+pr\s+create\b|glab\s+mr\s+create\b|hub\s+pull-request\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:deploy|publish|release)\b|(?:wrangler|vercel|netlify|flyctl|kubectl)\s+(?:deploy|publish|apply)\b|herdr\s+(?:workspace|tab|pane)\s+close\b)/im;
+    if (
+      process.env.HERDR_ENV === "1" &&
+      (nonPushMutation.test(command) ||
+        (gitPush.test(command) && !isRootOrchestrator()))
+    ) {
       return {
         block: true,
         reason:
