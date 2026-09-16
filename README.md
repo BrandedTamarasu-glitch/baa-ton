@@ -139,6 +139,8 @@ delivered to the waiting lane. Lanes never prompt their own UI.
 
 Any qualified harness can host the root — `pi`, `claude`, `codex`, or `opencode` — via `root-setup.mjs` (Pi additionally gets the native extension with bash interception). Concurrent roots are supported: bootstrap a second root with `add: true` from a distinct pane and workspace.
 
+Concurrent roots may also share one checkout directory and its durable manifest. Each root is keyed by its own pane/workspace identity, so parent goals, goal history, queues, root session traces, and controller wake/review handling remain independent; the legacy single `parentGoal` projection stays owned by the originally registered root.
+
 Qualification covers the tested subscription profiles, not every model or configuration.
 Recovery and lifecycle integration still have rough edges — see the
 [progress log](docs/native-prerequisite-progress.md) for evidence and limitations.

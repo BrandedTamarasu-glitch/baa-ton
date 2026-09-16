@@ -205,3 +205,25 @@ New follow-up: the claude lane's `herdr_message` flagged that `herdr_doctor`'s
 all 10 mapped lane-1 bridges even when the file-based `.ready` sidecar matches the
 session exactly (its own case). The check likely isn't reading the sidecar
 evidence path it should; worth reconciling next round.
+
+### BB-029 same-directory co-rooting close-out (2026-09-16)
+
+This round executed the handoff's Job 1 proof and Job 2 split through the verified
+root in workspace `w1Y`:
+
+- **Job 1** (`herdr-c514e5f7`, read-only): native pane identity and the repository
+  test suite were independently verified; `env -u BAA_STARTUP_INTENT npm test`
+  passed 116 extension and 48 controller tests.
+- **Goal-scoping lane** (`herdr-20786933`): added root-scoped parent goals,
+  histories, queues, sessions, safe same-directory add/conflict checks, legacy
+  compatibility, and focused multi-root regressions. Parent commit: `0e3aae7`.
+- **Controller lane** (`herdr-1fa173c1`): added shared-manifest root routing for
+  completion signals, pending wakes, mismatch/stall handling, queues, messages,
+  and supervisor nudges, with controller regressions. Parent commit: `381f53b`.
+- **Prerequisite**: `9d63b9f` accepts verified Codex root session identities
+  reported as native ids as well as paths, enabling the root planning proof.
+
+Post-merge parent verification on `main`: `npm test` passed 118 extension and 49
+controller tests; `npx tsc --noEmit -p tsconfig.json`, controller syntax check,
+and `git diff --check` passed. README and adapter documentation were updated in
+this close-out; the verified result is pushed to `origin/main`.
