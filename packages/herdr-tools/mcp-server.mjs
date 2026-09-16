@@ -18,6 +18,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import { Value } from "typebox/value";
 import { Type } from "typebox";
 import {
@@ -148,6 +149,24 @@ const mutationKinds = new Map([
   ["herdr_close", "lifecycle"],
 ]);
 
+// MCP clients do not receive the Pi extension's before_agent_start prompt.
+// Keep this short, harness-neutral briefing next to the bridge so a manually
+// started non-Pi root gets the same operating contract after bootstrap.
+const ROOT_BRIEFING = [
+  "ROOT BRIEFING",
+  "You are the sole Baa-ton parent executor. The durable manifest is authoritative; inspect it before making workflow decisions.",
+  "Delegate only with herdr_plan, then herdr_dispatch. Every child is a new Herdr-created session; never create Pi subagents, background jobs, or detached work.",
+  "Treat child lifecycle, parent-question-required, parent-approval-required, and blocker records as durable signals. Children persist requests and Herdr wakes the root; do not poll or ask the user to operate a child pane or Pi goal UI. Persist a truthful goal state when waiting, blocked, paused, or complete.",
+  "Push, merge, PR, deploy, production mutation, and Herdr resource closure require explicit user approval. Close only extension-owned resources with evidence.",
+].join("\n");
+
+const ROOT_EXECUTOR_TOOLS = new Set([
+  "herdr_goal",
+  "herdr_question_answer",
+  "herdr_operator_close",
+  "herdr_plan",
+]);
+
 function isRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -157,9 +176,18 @@ function timestamp() {
 }
 
 function configDirectory() {
-  const directory = process.env.HERDR_PLUGIN_CONFIG_DIR ?? process.env.HERDR_PLUGIN_STATE_DIR;
-  if (!directory || !isAbsolute(directory)) return undefined;
-  return resolve(directory);
+  const directory =
+    process.env.HERDR_PLUGIN_CONFIG_DIR ?? process.env.HERDR_PLUGIN_STATE_DIR;
+  if (directory) return isAbsolute(directory) ? resolve(directory) : undefined;
+  // Match index.ts's rootConfigPath fallback so Claude/OpenCode callers that
+  // inherit only the pane identity still resolve the controller route.
+  return join(
+    homedir(),
+    ".config",
+    "herdr",
+    "plugins",
+    "herdr-orchestrator-controller",
+  );
 }
 
 async function readControllerConfig() {
@@ -588,6 +616,21 @@ function outputResult(output) {
   };
 }
 
+function withRootBriefing(output) {
+  const details =
+    output?.details && isRecord(output.details)
+      ? { ...output.details, rootBriefing: ROOT_BRIEFING }
+      : { rootBriefing: ROOT_BRIEFING };
+  const content = [...(output?.content ?? [])];
+  if (content[0]?.type === "text")
+    content[0] = {
+      ...content[0],
+      text: `${content[0].text}\n\n${ROOT_BRIEFING}`,
+    };
+  else content.unshift({ type: "text", text: ROOT_BRIEFING });
+  return { ...output, content, details };
+}
+
 function requestTimeout(params) {
   const value = params.timeoutMs ?? params.timeout_ms;
   if (value === undefined) return undefined;
@@ -623,6 +666,17 @@ async function callTool(id, params) {
       `Invalid arguments for ${params.name}: ${issues || "schema validation failed"}`,
     );
   }
+  // The extension's root checks intentionally use the live Herdr environment.
+  // The bridge additionally resolves the workspace-qualified route so a
+  // caller that merely reuses a pane ID from another workspace cannot act as
+  // the parent through MCP.
+  if (ROOT_EXECUTOR_TOOLS.has(params.name)) {
+    const route = await currentRoute();
+    if (route?.role !== "root")
+      return toolError(
+        "Only the verified controller-mapped root may perform this operation.",
+      );
+  }
 
   const controller = new AbortController();
   const key = requestKey(id);
@@ -657,13 +711,22 @@ async function callTool(id, params) {
           `Tool call ${params.name} is pending review because its previous delivery was uncertain.`,
         );
     }
-    const output = await definition.execute(
+    let output = await definition.execute(
       "mcp",
       args,
       controller.signal,
       undefined,
       lifecycleContext(controller, "active"),
     );
+    // Bootstrap is the explicit root handoff for a non-Pi harness. Include the
+    // operating contract in both the MCP content and durable replay result so
+    // a reconnecting client receives it without relying on Pi grounding.
+    if (
+      params.name === "herdr_bootstrap_root" &&
+      output?.details?.root?.agent_kind !== "pi"
+    ) {
+      output = withRootBriefing(output);
+    }
     await finishBridgeMessage(entry, output);
     return outputResult(output);
   } catch (caught) {

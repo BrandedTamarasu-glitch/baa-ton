@@ -36,6 +36,34 @@ node /Users/zchristmas/baa-ton/packages/herdr-tools/mcp-server.mjs
 
 The bridge exposes tools only when `HERDR_ENV=1` is present. It has no platform-specific dependency.
 
+## Any harness as root
+
+The bridge preserves root-role parity for `herdr_bootstrap_root`, `herdr_goal`,
+`herdr_plan`, `herdr_dispatch`, `herdr_observe`, `herdr_resume`,
+`herdr_close`, `herdr_operator_close`, `herdr_reparent`,
+`herdr_question_answer`, and `herdr_doctor`. A non-Pi root receives a concise
+`ROOT BRIEFING` when it bootstraps, covering the durable manifest, delegation,
+wake, and approval/closure gates.
+
+From the **current Herdr pane**, print exact setup instructions with:
+
+```sh
+node packages/herdr-tools/root-setup.mjs --harness claude
+# or: codex | opencode | pi
+```
+
+The helper is stdout-only unless `--write` is supplied; it prints an `export`
+line for the current pane identity as part of the setup commands. `--write` writes only
+the selected harness's normal config location: project `.mcp.json` for Claude,
+`~/.codex/config.toml` (only when absent) for Codex, or project
+`opencode.json` for OpenCode; it does not write a Pi config. Claude and
+OpenCode MCP processes inherit the current pane's `HERDR_*` identity, so keep
+the harness in that pane. Codex MCP children do **not** inherit it; the helper
+puts `HERDR_ENV`, `HERDR_WORKSPACE_ID`, `HERDR_PANE_ID`, and
+`HERDR_PLUGIN_CONFIG_DIR` explicitly in Codex's MCP configuration. Pi uses the
+extension directly. Live qualification of a non-Pi root remains the final
+step.
+
 ## Validate
 
 ```sh

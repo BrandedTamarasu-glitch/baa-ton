@@ -62,6 +62,60 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
   }
 }
 
+async function rootBridgeFixture() {
+  const directory = await mkdtemp(join(tmpdir(), "baa-mcp-root-"));
+  const stateDir = join(directory, "config");
+  const cwd = join(directory, "workspace");
+  const binDir = join(directory, "bin");
+  const herdr = join(binDir, "herdr");
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
+  await mkdir(cwd, { recursive: true });
+  await mkdir(binDir, { recursive: true, mode: 0o700 });
+  // This read-only native stub proves the bridge uses the live pane identity
+  // while keeping the test independent of a focused Herdr client.
+  await writeFile(
+    herdr,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const result = (value) => process.stdout.write(JSON.stringify({ result: value }) + "\\n");
+if (args[0] === "plugin" && args[1] === "config-dir") {
+  result({ config_dir: process.env.TEST_CONFIG_DIR });
+} else if (args[0] === "agent" && args[1] === "get") {
+  const pane = args[2];
+  const child = pane === "w-root:child";
+  result({
+    type: "agent_info",
+    agent: {
+      agent: child ? "pi" : "claude",
+      name: child ? "child" : "root",
+      pane_id: pane,
+      workspace_id: process.env.TEST_ROOT_WORKSPACE,
+      agent_session: { kind: "path", value: child ? "/sessions/child" : "/sessions/root" },
+      agent_status: "idle",
+    },
+  });
+} else {
+  process.stderr.write("unexpected fake herdr command: " + args.join(" ") + "\\n");
+  process.exitCode = 1;
+}
+`,
+    { mode: 0o755 },
+  );
+  return {
+    directory,
+    stateDir,
+    cwd,
+    binDir,
+    root: {
+      target: "w-root:root",
+      target_kind: "pane_id",
+      agent_kind: "claude",
+      pane_id: "w-root:root",
+      workspace_id: "w-root",
+    },
+  };
+}
+
 // Converts the audit's "MCP argument validation" fault probe (an action
 // outside the advertised herdr_goal enum was accepted rather than rejected)
 // into a passing regression.
@@ -108,6 +162,103 @@ test("tools/call rejects arguments outside a tool's declared schema before it re
       /Invalid arguments for herdr_dispatch/,
     );
   });
+});
+
+test("mapped root bridge exposes root-role parity and returns non-Pi root grounding", async () => {
+  const fixture = await rootBridgeFixture();
+  const env = {
+    HERDR_ENV: "1",
+    HERDR_PANE_ID: fixture.root.pane_id,
+    HERDR_WORKSPACE_ID: fixture.root.workspace_id,
+    HERDR_PLUGIN_CONFIG_DIR: fixture.stateDir,
+    TEST_CONFIG_DIR: fixture.stateDir,
+    TEST_ROOT_WORKSPACE: fixture.root.workspace_id,
+    PATH: `${fixture.binDir}:${process.env.PATH}`,
+  };
+  try {
+    let workflowId;
+    await withMcpServer(env, async (rpc) => {
+      const listed = await rpc("tools/list");
+      const names = new Set(listed.result.tools.map((tool) => tool.name));
+      for (const name of [
+        "herdr_bootstrap_root",
+        "herdr_goal",
+        "herdr_plan",
+        "herdr_dispatch",
+        "herdr_observe",
+        "herdr_resume",
+        "herdr_close",
+        "herdr_operator_close",
+        "herdr_reparent",
+        "herdr_question_answer",
+        "herdr_doctor",
+      ])
+        assert.equal(names.has(name), true, `${name} is exposed through MCP`);
+
+      const bootstrap = await rpc("tools/call", {
+        name: "herdr_bootstrap_root",
+        arguments: {},
+      });
+      assert.equal(bootstrap.result.isError, undefined);
+      assert.match(bootstrap.result.content.map((item) => item.text).join("\n"), /ROOT BRIEFING/);
+      assert.match(bootstrap.result.structuredContent.rootBriefing, /sole Baa-ton parent executor/);
+      assert.equal(bootstrap.result.structuredContent.root.agent_kind, "claude");
+
+      const goal = await rpc("tools/call", {
+        name: "herdr_goal",
+        arguments: { action: "initialize", objective: "Exercise root MCP parity" },
+      });
+      assert.equal(goal.result.isError, undefined);
+      assert.match(goal.result.content[0].text, /Parent goal/);
+
+      const plan = await rpc("tools/call", {
+        name: "herdr_plan",
+        arguments: { objective: "Plan through the root bridge", lanes: ["root lane"] },
+      });
+      assert.equal(plan.result.isError, undefined);
+      workflowId = plan.result.structuredContent.workflow.id;
+      assert.match(plan.result.content[0].text, new RegExp(workflowId));
+    }, { cwd: fixture.cwd });
+
+    const inbox = JSON.parse(await readFile(join(fixture.stateDir, "inbox.json"), "utf8"));
+    assert.equal(inbox.messages.some((message) => message.envelope.message.type === "goal"), true);
+    assert.equal(inbox.messages.some((message) => message.envelope.message.type === "lifecycle"), true);
+    for (const message of inbox.messages)
+      assert.deepEqual(message.envelope.to, {
+        workspace_id: fixture.root.workspace_id,
+        pane_id: fixture.root.pane_id,
+        agent: "claude",
+      });
+
+    const configPath = join(fixture.stateDir, "config.json");
+    const config = JSON.parse(await readFile(configPath, "utf8"));
+    const manifestPath = join(fixture.cwd, ".pi", "herdr-orchestrator", "manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    const lane = manifest.workflows[0].lanes[0];
+    config.orchestrators[0].workflows.push({
+      workflow_id: workflowId,
+      manifest_path: manifestPath,
+      lanes: [{
+        lane_id: lane.id,
+        target: "w-root:child",
+        target_kind: "pane_id",
+        pane_id: "w-root:child",
+        workspace_id: fixture.root.workspace_id,
+      }],
+    });
+    await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+
+    await withMcpServer({ ...env, HERDR_PANE_ID: "w-root:child" }, async (rpc) => {
+      const childGoal = await rpc("tools/call", {
+        name: "herdr_goal",
+        arguments: { action: "status" },
+      });
+      assert.equal(childGoal.result.isError, true);
+      assert.match(childGoal.result.content[0].text, /verified controller-mapped root/);
+    }, { cwd: fixture.cwd });
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
 });
 
 test("tools/call outside a Herdr session and unknown tools still fail predictably", async () => {
