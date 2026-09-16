@@ -110,9 +110,9 @@ test("root bootstrap labels the current tab and repeats the idempotent rename", 
     assert.equal(first.details.alreadyRegistered, false);
     assert.deepEqual(
       f.calls.find((args) => args[0] === "tab" && args[1] === "rename"),
-      ["tab", "rename", "w-labels:root-tab", "🐕 root"],
+      ["tab", "rename", "w-labels:root-tab", "🐕 pi·w-labels"],
     );
-    assert.match(first.details.evidence[0], /labeled 🐕 root/);
+    assert.match(first.details.evidence[0], /labeled 🐕 pi·w-labels/);
 
     const second = await bootstrap.execute(
       "bootstrap-again",
