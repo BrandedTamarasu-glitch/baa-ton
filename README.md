@@ -32,26 +32,26 @@ Recovery and lifecycle integration still have rough edges — see the
 ## How it fits together
 
 ```mermaid
-flowchart LR
-    subgraph Herdr["Herdr 0.9+ — owns terminals and agent processes"]
-        R["root pane\n(parent session)"]
-        L1["lane pane"]
-        L2["lane pane"]
+flowchart TD
+    subgraph herdr["Herdr — owns the terminals"]
+        R["root pane<br/>(parent session)"]
+        L["lane panes<br/>any qualified harness"]
     end
-    subgraph BaaTon["Baa-ton — orchestration core"]
-        C["contract\nneutral domain + capabilities"]
-        A["launch adapters\npi · claude · codex · opencode"]
-        B["MCP bridge\n10 herdr_* tools"]
-        K["event controller\ndurable wakes + receipts"]
+    subgraph core["Baa-ton core"]
+        P["plan · dispatch<br/>verify, then start"]
+        B["MCP bridge<br/>the herdr_* tools"]
+        K["event controller<br/>durable wakes + receipts"]
     end
-    R -->|"plan · dispatch · verify"| B
-    B --> A
-    A --> L1
-    A --> L2
-    L1 -.->|"lifecycle events"| K
-    L2 -.->|"lifecycle events"| K
-    K -->|"wake: done / blocked / question"| R
+    R --> P
+    P -->|"verified start"| L
+    L <-->|"tools"| B
+    L -->|"lifecycle events"| K
+    K -->|"wake"| R
 ```
+
+Read it as one loop: the root plans and dispatches through the core, lanes are
+started only after verification, lanes use the bridge for tools, their events feed
+the controller, and the controller wakes the root.
 
 A delegation round looks like this:
 
