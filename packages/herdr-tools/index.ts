@@ -367,6 +367,24 @@ const TERMINAL_LANE_STATUSES = new Set([
   "completion-reported",
   "completed",
 ]);
+
+type LaneRetirementRecord = {
+  version: 1;
+  status: "partial" | "retired";
+  workspaceId: string;
+  tabIds: string[];
+  closedTabIds: string[];
+  failedTabIds: string[];
+  pendingTabIds: string[];
+  requestedAt: string;
+  completedAt?: string;
+  evidence: string[];
+};
+
+type WorkflowWithLaneRetirement = Workflow & {
+  laneRetirement?: LaneRetirementRecord;
+};
+
 const MAX_PARENT_GOAL_NUDGE_INTERVAL_SECONDS = 86_400;
 
 function parentGoalNudgeInterval(value: number | undefined): number {
@@ -3474,6 +3492,283 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     };
   }
 
+  async function retireTaskLaneTabs(
+    cwd: string,
+    id: string,
+    workflow: Workflow,
+    evidence: string[],
+    execute: boolean,
+    signal?: AbortSignal,
+  ) {
+    const taskBinding = workflow.taskBinding;
+    if (!taskBinding)
+      throw new Error("Lane retirement requires a task workspace binding.");
+    const normalizedEvidence = (Array.isArray(evidence) ? evidence : [])
+      .map((item) => (typeof item === "string" ? item.trim() : ""))
+      .filter(Boolean);
+    if (normalizedEvidence.length === 0)
+      throw new Error("Lane retirement requires at least one evidence item.");
+
+    requireHerdr();
+    if (!isRootOrchestrator())
+      throw new Error(
+        "Lane retirement is root-only: only the verified controller-mapped root may retire lane tabs.",
+      );
+    const root = await currentPaneRoot(signal);
+    if (
+      root.pane_id !== taskBinding.rootPaneId ||
+      root.workspace_id !== taskBinding.workspaceId
+    )
+      throw new Error(
+        "Lane retirement requires the verified controller root in the workflow's recorded task workspace; no topology fallback is allowed.",
+      );
+
+    const nonTerminal = workflow.lanes.filter(
+      (lane) =>
+        !lane.completionReceipt && !TERMINAL_LANE_STATUSES.has(lane.status),
+    );
+    if (nonTerminal.length > 0)
+      throw new Error(
+        `Lane retirement requires every lane to be terminal; non-terminal lane(s): ${nonTerminal
+          .map((lane) => lane.id)
+          .join(", ")}.`,
+      );
+
+    if (workflow.ownership.workspaceId !== taskBinding.workspaceId)
+      throw new Error(
+        `Lane retirement refused: recorded lane ownership workspace does not match the root's task workspace ${taskBinding.workspaceId}.`,
+      );
+    const rawTabIds = workflow.ownership.tabIds;
+    if (!Array.isArray(rawTabIds))
+      throw new Error(
+        "Lane retirement refused: no recorded lane tabs belong to the root's task workspace.",
+      );
+    const tabIds: string[] = [];
+    for (const tabId of rawTabIds) {
+      if (typeof tabId !== "string" || !tabId.trim())
+        throw new Error("Lane retirement refused: a recorded lane tab ID is invalid.");
+      if (!tabIds.includes(tabId)) tabIds.push(tabId);
+    }
+
+    const storedRetirement = (workflow as WorkflowWithLaneRetirement)
+      .laneRetirement;
+    if (storedRetirement?.status === "retired")
+      return {
+        laneRetired: true,
+        retired: true,
+        alreadyRetired: true,
+        workflow,
+        tabIds: storedRetirement.tabIds,
+        closedTabIds: storedRetirement.closedTabIds,
+        failedTabIds: [],
+        remainingTabIds: [],
+        commands: [],
+        partialFailure: false,
+        workspaceRetained: true,
+      };
+    if (storedRetirement && storedRetirement.status !== "partial")
+      throw new Error("Lane retirement record has an unsupported state.");
+    if (
+      storedRetirement &&
+      (storedRetirement.workspaceId !== taskBinding.workspaceId ||
+        JSON.stringify(storedRetirement.tabIds) !== JSON.stringify(tabIds))
+    )
+      throw new Error(
+        "Lane retirement record no longer matches the root task workspace's recorded tabs.",
+      );
+
+    const closedBefore = new Set(storedRetirement?.closedTabIds ?? []);
+    const pendingTabIds = tabIds.filter((tabId) => !closedBefore.has(tabId));
+    if (pendingTabIds.length > 0) {
+      const listed = responseRecord(
+        await runHerdr(["tab", "list", "--workspace", taskBinding.workspaceId], signal),
+        "task workspace tab list",
+      );
+      if (!Array.isArray(listed.tabs))
+        throw new Error(
+          "Herdr task workspace tab list returned no registered tabs.",
+        );
+      for (const tabId of pendingTabIds) {
+        const tab = listed.tabs.find(
+          (item: unknown): item is Record<string, unknown> =>
+            isRecord(item) && item.tab_id === tabId,
+        );
+        if (!tab || tab.workspace_id !== taskBinding.workspaceId)
+          throw new Error(
+            `Lane tab ${tabId} is not in the root's task workspace ${taskBinding.workspaceId}; refusing cleanup.`,
+          );
+      }
+    }
+
+    const commands = pendingTabIds.map((tabId) => `herdr tab close ${tabId}`);
+    if (!execute)
+      return {
+        dryRun: true,
+        laneRetirement: true,
+        retired: false,
+        workflow,
+        tabIds: pendingTabIds,
+        commands,
+        workspaceRetained: true,
+      };
+
+    let currentWorkflow = await withManifestTransaction(cwd, (manifest) => {
+      const stored = workflowFor(manifest, id) as WorkflowWithLaneRetirement;
+      const currentRetirement = stored.laneRetirement;
+      if (currentRetirement?.status === "retired") return stored;
+      const currentNonTerminal = stored.lanes.filter(
+        (lane) =>
+          !lane.completionReceipt &&
+          !TERMINAL_LANE_STATUSES.has(lane.status),
+      );
+      if (currentNonTerminal.length > 0)
+        throw new Error(
+          `Lane retirement requires every lane to be terminal; non-terminal lane(s): ${currentNonTerminal
+            .map((lane) => lane.id)
+            .join(", ")}.`,
+        );
+      if (stored.ownership.workspaceId !== taskBinding.workspaceId)
+        throw new Error(
+          "Lane retirement refused: recorded lane ownership workspace changed before cleanup.",
+        );
+      if (
+        currentRetirement &&
+        (currentRetirement.workspaceId !== taskBinding.workspaceId ||
+          JSON.stringify(currentRetirement.tabIds) !== JSON.stringify(tabIds))
+      )
+        throw new Error(
+          "Lane retirement record no longer matches the root task workspace's recorded tabs.",
+        );
+      const timestamp = now();
+      const record: LaneRetirementRecord = currentRetirement ?? {
+        version: 1,
+        status: pendingTabIds.length === 0 ? "retired" : "partial",
+        workspaceId: taskBinding.workspaceId,
+        tabIds,
+        closedTabIds: [],
+        failedTabIds: [],
+        pendingTabIds,
+        requestedAt: timestamp,
+        evidence: [],
+      };
+      record.pendingTabIds = record.tabIds.filter(
+        (tabId) => !record.closedTabIds.includes(tabId),
+      );
+      record.status = record.pendingTabIds.length === 0 ? "retired" : "partial";
+      record.evidence.push(...normalizedEvidence);
+      stored.laneRetirement = record;
+      stored.evidence.push({
+        at: timestamp,
+        kind: currentRetirement
+          ? "lane-retirement-retry"
+          : "lane-retirement",
+        text: JSON.stringify({
+          workspaceId: taskBinding.workspaceId,
+          tabIds,
+          evidence: normalizedEvidence,
+        }),
+      });
+      if (pendingTabIds.length === 0) {
+        record.status = "retired";
+        record.pendingTabIds = [];
+        record.completedAt = timestamp;
+        stored.evidence.push({
+          at: timestamp,
+          kind: "lane-retirement-completed",
+          text: JSON.stringify({
+            workspaceId: taskBinding.workspaceId,
+            closedTabIds: record.closedTabIds,
+            failedTabIds: record.failedTabIds,
+            evidence: normalizedEvidence,
+          }),
+        });
+      }
+      stored.updatedAt = timestamp;
+      return stored;
+    });
+
+    const recordAfterStart = (currentWorkflow as WorkflowWithLaneRetirement)
+      .laneRetirement!;
+    const attemptedTabIds = recordAfterStart.pendingTabIds.slice();
+    const closeErrors: Array<{ tabId: string; error: string }> = [];
+    for (const tabId of attemptedTabIds) {
+      try {
+        await runHerdr(["tab", "close", tabId], signal);
+        currentWorkflow = await withManifestTransaction(cwd, (manifest) => {
+          const stored = workflowFor(manifest, id) as WorkflowWithLaneRetirement;
+          const record = stored.laneRetirement;
+          if (!record) throw new Error("Lane retirement record disappeared during cleanup.");
+          if (!record.closedTabIds.includes(tabId))
+            record.closedTabIds.push(tabId);
+          record.failedTabIds = record.failedTabIds.filter(
+            (failedTabId) => failedTabId !== tabId,
+          );
+          record.pendingTabIds = record.tabIds.filter(
+            (recordedTabId) => !record.closedTabIds.includes(recordedTabId),
+          );
+          const timestamp = now();
+          stored.evidence.push({
+            at: timestamp,
+            kind: "lane-retirement-tab-closed",
+            text: `Closed recorded lane tab ${tabId} in task workspace ${record.workspaceId}.`,
+          });
+          if (record.pendingTabIds.length === 0) {
+            record.status = "retired";
+            record.completedAt = timestamp;
+            stored.evidence.push({
+              at: timestamp,
+              kind: "lane-retirement-completed",
+              text: JSON.stringify({
+                workspaceId: record.workspaceId,
+                closedTabIds: record.closedTabIds,
+                failedTabIds: record.failedTabIds,
+              }),
+            });
+          }
+          stored.updatedAt = timestamp;
+          return stored;
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        closeErrors.push({ tabId, error: message });
+        currentWorkflow = await withManifestTransaction(cwd, (manifest) => {
+          const stored = workflowFor(manifest, id) as WorkflowWithLaneRetirement;
+          const record = stored.laneRetirement;
+          if (!record) throw new Error("Lane retirement record disappeared during cleanup.");
+          if (!record.failedTabIds.includes(tabId))
+            record.failedTabIds.push(tabId);
+          record.pendingTabIds = record.tabIds.filter(
+            (recordedTabId) => !record.closedTabIds.includes(recordedTabId),
+          );
+          const timestamp = now();
+          stored.evidence.push({
+            at: timestamp,
+            kind: "lane-retirement-tab-failed",
+            text: JSON.stringify({ tabId, workspaceId: record.workspaceId, error: message }),
+          });
+          stored.updatedAt = timestamp;
+          return stored;
+        });
+      }
+    }
+    const finalRetirement = (currentWorkflow as WorkflowWithLaneRetirement)
+      .laneRetirement!;
+    const remainingTabIds = finalRetirement.pendingTabIds.slice();
+    return {
+      laneRetired: finalRetirement.status === "retired",
+      retired: finalRetirement.status === "retired",
+      partialFailure: closeErrors.length > 0,
+      workflow: currentWorkflow,
+      tabIds: finalRetirement.tabIds,
+      closedTabIds: finalRetirement.closedTabIds,
+      failedTabIds: finalRetirement.failedTabIds,
+      remainingTabIds,
+      commands: remainingTabIds.map((tabId) => `herdr tab close ${tabId}`),
+      closeErrors,
+      workspaceRetained: true,
+    };
+  }
+
   async function close(
     cwd: string,
     id: string,
@@ -3494,12 +3789,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             candidate.outcome !== "closed",
         ),
     );
+    if (workflow.taskBinding)
+      return retireTaskLaneTabs(
+        cwd,
+        id,
+        workflow,
+        evidence,
+        execute,
+        signal,
+      );
     if (evidence.filter(Boolean).length === 0)
       throw new Error("Close requires at least one evidence item.");
-    if (workflow.taskBinding)
-      throw new Error(
-        "Task workspaces are user-owned. Workspace closure is forbidden; per-lane cleanup requires a separately reviewed operation.",
-      );
     if (workflow.outcome !== "completed")
       throw new Error(
         "Close requires a completed Herdr observation; blocked, idle, failed, and unknown workflows stay open.",
@@ -4478,11 +4778,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     name: "herdr_close",
     label: "Herdr Close",
     description:
-      "Preview or explicitly close only a recorded extension-owned Herdr workspace; evidence is mandatory.",
+      "Preview or explicitly close a recorded extension-owned workspace, or root-only retire recorded lane tabs in a task workspace; evidence is mandatory.",
     promptSnippet:
-      "Close a Herdr workflow only with evidence; dry-run by default.",
+      "Close a Herdr workflow or retire its lane tabs only with evidence; dry-run by default.",
     promptGuidelines: [
-      "Use herdr_close only after recording concrete evidence and explicit user intent. Child sessions receive a parent-approval-required result; only the verified controller-mapped root may show the confirmation.",
+      "Use herdr_close only after recording concrete evidence and explicit user intent. Task-workspace lane retirement requires execute=true, a verified root, and every lane terminal; it never closes the workspace.",
+      "Ordinary workspace close remains root-confirmed. Child sessions receive a parent-approval-required result only for ordinary close; lane retirement is root-only.",
     ],
     parameters: Type.Object({
       workflowId: Type.String(),
@@ -4498,17 +4799,24 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ctx,
         signal,
       );
+      const laneRetirementResult = result as any;
       return {
         content: [
           {
             type: "text",
-            text: result.dryRun
+            text: laneRetirementResult.dryRun
               ? `Dry-run close for ${params.workflowId}`
-              : result.parentApprovalRequired
-                ? `Parent approval required for ${params.workflowId}; observe the child through Herdr and approve from the designated root.`
-                : result.cancelled
-                  ? "Close cancelled"
-                  : `Closed ${params.workflowId}`,
+              : laneRetirementResult.laneRetirement
+                ? laneRetirementResult.partialFailure
+                  ? `Lane retirement partially completed for ${params.workflowId}; retry the remaining tabs.`
+                  : laneRetirementResult.alreadyRetired
+                    ? `Lane tabs for ${params.workflowId} are already retired.`
+                    : `Retired lane tabs for ${params.workflowId}`
+                : laneRetirementResult.parentApprovalRequired
+                  ? `Parent approval required for ${params.workflowId}; observe the child through Herdr and approve from the designated root.`
+                  : laneRetirementResult.cancelled
+                    ? "Close cancelled"
+                    : `Closed ${params.workflowId}`,
           },
         ],
         details: result,
@@ -4600,11 +4908,18 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       if (!id || !evidence)
         throw new Error("Usage: /herdr-close <id> <evidence> [--execute]");
       const result = await close(ctx.cwd, id, [evidence], execute, ctx);
+      const laneRetirementResult = result as any;
       let message = `Closed ${id}`;
-      if (result.dryRun) message = `Dry-run: ${id}`;
-      else if (result.parentApprovalRequired)
+      if (laneRetirementResult.dryRun) message = `Dry-run: ${id}`;
+      else if (laneRetirementResult.laneRetirement)
+        message = laneRetirementResult.partialFailure
+          ? `Lane retirement partially completed for ${id}; retry the remaining tabs.`
+          : laneRetirementResult.alreadyRetired
+            ? `Lane tabs for ${id} are already retired.`
+            : `Retired lane tabs for ${id}`;
+      else if (laneRetirementResult.parentApprovalRequired)
         message = `Parent approval required for ${id}; observe the child through Herdr and approve from the designated root.`;
-      else if (result.cancelled) message = "Close cancelled";
+      else if (laneRetirementResult.cancelled) message = "Close cancelled";
       ctx.ui.notify(message, "info");
     },
   });
