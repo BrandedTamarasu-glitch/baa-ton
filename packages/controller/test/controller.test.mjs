@@ -54,6 +54,8 @@ async function createFixture({
   workflowOutcome,
   laneStatus,
   completionReceipt,
+  approvalRequests,
+  questionRequests,
 } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "herdr-controller-"));
   const stateDir = join(directory, "state");
@@ -98,6 +100,8 @@ async function createFixture({
         id: "herdr-bb029",
         ...(workflowStatus ? { status: workflowStatus } : {}),
         ...(workflowOutcome ? { outcome: workflowOutcome } : {}),
+        ...(approvalRequests ? { approvalRequests } : {}),
+        ...(questionRequests ? { questionRequests } : {}),
         ownership: {
           createdBy: "herdr-orchestrator",
           workspaceId: child.workspace_id,
@@ -883,7 +887,7 @@ test("a genuine repeated status (blocked -> working -> blocked) wakes twice, whi
   }
 });
 
-test("a new actionable lane event advances the thin parent goal once", async () => {
+test("a new actionable lane event requests root review once", async () => {
   const fixture = await createFixture({
     parentGoal: {
       version: 1,
@@ -920,7 +924,7 @@ test("a new actionable lane event advances the thin parent goal once", async () 
       herdr: client(mock),
     });
     const goal = (await fixture.manifest()).parentGoal;
-    assert.equal(goal.status, "action-required");
+    assert.equal(goal.status, "review-requested");
     assert.equal(
       goal.signals.length,
       1,
@@ -933,19 +937,82 @@ test("a new actionable lane event advances the thin parent goal once", async () 
     assert.equal(metadata[0].source, "herdr-orchestrator");
     assert.equal(metadata[0].ttl_ms, 86_400_000);
     assert.deepEqual(metadata[0].tokens, {
-      herdr_goal_status: "Goal: action required",
+      herdr_goal_status: "Goal: review requested",
       herdr_goal_next_1: "Next: Review durable done",
       herdr_goal_next_2: "event",
       herdr_goal_next_3:
         goal.nextAction.match(/event\s+([^\s]+)\s+for/)?.[1] ?? null,
     });
     assert.deepEqual(metadata[0].state_labels, {
-      idle: "Goal: action required",
-      done: "Goal: action required",
+      idle: "Goal: review requested",
+      done: "Goal: review requested",
     });
   } finally {
     await mock.close();
     await fixture.cleanup();
+  }
+});
+
+test("persisted parent questions and approvals mark the goal as user-action-required", async () => {
+  const cases = [
+    {
+      field: "questionRequests",
+      request: {
+        id: "question-pending-1",
+        kind: "question",
+        status: "parent-question-required",
+        requestedAt: "2026-09-14T00:00:00.000Z",
+        question: "Which release channel should I use?",
+      },
+      expected: /parent question question-pending-1/,
+    },
+    {
+      field: "approvalRequests",
+      request: {
+        id: "approval-pending-1",
+        action: "dispatch",
+        status: "parent-approval-required",
+        requestedAt: "2026-09-14T00:00:01.000Z",
+        request: "Parent approval is required.",
+      },
+      expected: /parent approval approval-pending-1/,
+    },
+  ];
+  for (const item of cases) {
+    const fixture = await createFixture({
+      piGoalPauseDetection: false,
+      parentGoal: {
+        version: 1,
+        id: `parent-${item.field}`,
+        objective: "Wait for a user decision.",
+        status: "review-requested",
+        nextAction: "Review the lane breadcrumb.",
+        signals: [],
+        createdAt: "2026-09-14T00:00:00.000Z",
+        updatedAt: "2026-09-14T00:00:00.000Z",
+      },
+      [item.field]: [item.request],
+    });
+    const herdr = {
+      async request(method) {
+        assert.equal(method, "pane.report_metadata");
+        return { result: {} };
+      },
+    };
+    try {
+      await handleHook({
+        eventName: "pane.agent_status_changed",
+        eventJson: statusEvent("working"),
+        stateDir: fixture.stateDir,
+        herdr,
+      });
+      const goal = (await fixture.manifest()).parentGoal;
+      assert.equal(goal.status, "action-required");
+      assert.match(goal.nextAction, item.expected);
+      assert.match(goal.nextAction, /required before/);
+    } finally {
+      await fixture.cleanup();
+    }
   }
 });
 
@@ -1859,7 +1926,7 @@ test("an unavailable root leaves a durable pending event that an identical hook 
   }
 });
 
-test("a supervisor tick drains a pending lane wake once the root is ready, even while the goal is action-required", async () => {
+test("a supervisor tick drains a pending lane wake once the root is ready, even while the goal requests review", async () => {
   const fixture = await createFixture({ parentGoal: dueParentGoal() });
   let rootAvailable = false;
   const mock = await startHerdrMock((request) => {
@@ -1885,14 +1952,14 @@ test("a supervisor tick drains a pending lane wake once the root is ready, even 
     const afterHook = (await fixture.manifest()).parentGoal;
     assert.equal(
       afterHook.status,
-      "action-required",
-      "an undelivered actionable event marks the goal action-required",
+      "review-requested",
+      "an undelivered actionable event records a review request",
     );
 
     rootAvailable = true;
     // No new hook recurs for this pane; only the root becoming ready again
     // and a routine tick should be needed to recover the pending wake, even
-    // though the supervisor itself skips an action-required goal.
+    // though the supervisor itself skips a review-requested goal.
     const tick = await runSupervisorTick({
       stateDir: fixture.stateDir,
       herdr: client(mock),

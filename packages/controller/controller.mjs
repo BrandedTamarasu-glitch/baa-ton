@@ -35,6 +35,10 @@ const SOCKET_TIMEOUT_MS = 2_500;
 const MIN_NUDGE_INTERVAL_SECONDS = 5;
 const MAX_NUDGE_INTERVAL_SECONDS = 86_400;
 const ACTIONABLE_CLASSIFICATIONS = new Set(["done", "blocked", "goal-paused"]);
+const USER_ACTIONABLE_REQUEST_STATUSES = new Set([
+  "parent-question-required",
+  "parent-approval-required",
+]);
 const POST_COMPLETION_STATUSES = new Set([
   "completion-reported",
   "completed",
@@ -789,14 +793,91 @@ function signalParentGoal(manifest, record) {
   }
   // A completed or explicitly blocked parent goal must never be revived by a
   // late lane hook; the durable signal remains available for manual review.
+  // A pending user question/approval is stronger than a lane review breadcrumb
+  // and must not be downgraded while the user still needs to act.
   if (
     goal.status !== "completed" &&
     goal.status !== "blocked" &&
-    goal.status !== "paused"
+    goal.status !== "paused" &&
+    goal.status !== "action-required"
   )
-    goal.status = "action-required";
+    goal.status = "review-requested";
   goal.nextAction = `Review durable ${record.classification} event ${record.identity} for ${record.workflow_id}/${record.lane_id}; continue authorized safe local work or persist a truthful waiting/blocked state.`;
   goal.updatedAt = now();
+}
+
+function pendingParentAction(manifest, workflows = manifest.workflows) {
+  const actions = [];
+  const add = (request, kind, workflowId) => {
+    if (
+      !isRecord(request) ||
+      !USER_ACTIONABLE_REQUEST_STATUSES.has(request.status) ||
+      typeof request.id !== "string" ||
+      request.id.length === 0
+    )
+      return;
+    actions.push({
+      kind,
+      id: request.id,
+      workflowId:
+        typeof request.workflowId === "string" && request.workflowId.length > 0
+          ? request.workflowId
+          : workflowId,
+      requestedAt:
+        typeof request.requestedAt === "string" ? request.requestedAt : undefined,
+    });
+  };
+  if (Array.isArray(manifest.questionRequests))
+    for (const request of manifest.questionRequests)
+      add(request, "question", undefined);
+  if (Array.isArray(workflows))
+    for (const workflow of workflows) {
+      if (!isRecord(workflow)) continue;
+      if (Array.isArray(workflow.questionRequests))
+        for (const request of workflow.questionRequests)
+          add(request, "question", workflow.id);
+      if (Array.isArray(workflow.approvalRequests))
+        for (const request of workflow.approvalRequests)
+          add(request, "approval", workflow.id);
+    }
+  return actions
+    .map((action, index) => ({ action, index }))
+    .sort((left, right) => {
+      const leftAt = left.action.requestedAt
+        ? Date.parse(left.action.requestedAt)
+        : NaN;
+      const rightAt = right.action.requestedAt
+        ? Date.parse(right.action.requestedAt)
+        : NaN;
+      if (Number.isFinite(leftAt) && Number.isFinite(rightAt))
+        return leftAt - rightAt || left.index - right.index;
+      return left.index - right.index;
+    })
+    .map(({ action }) => action)[0];
+}
+
+function signalParentGoalForUserAction(manifest, workflows) {
+  if (!("parentGoal" in manifest)) return false;
+  const goal = validateParentGoal(manifest.parentGoal);
+  const pending = pendingParentAction(manifest, workflows);
+  if (!pending) return false;
+  const workflowLabel = pending.workflowId
+    ? ` for ${pending.workflowId}`
+    : " for the mapped child";
+  const nextAction =
+    pending.kind === "question"
+      ? `Answer pending parent question ${pending.id}${workflowLabel}; Zach's answer is required before the child can continue.`
+      : `Approve or reject pending parent approval ${pending.id}${workflowLabel}; Zach's approval is required before the operation can continue.`;
+  const terminal =
+    goal.status === "completed" ||
+    goal.status === "blocked" ||
+    goal.status === "paused";
+  const nextStatus = terminal ? goal.status : "action-required";
+  if (goal.status === nextStatus && goal.nextAction === nextAction) return false;
+  goal.status = nextStatus;
+  goal.nextAction = nextAction;
+  goal.updatedAt = now();
+  return true;
 }
 
 function ensureLedger(workflow) {
@@ -1406,10 +1487,23 @@ export async function runSupervisorTick({
           config.owner,
         ),
       );
+      // Parent questions and approvals are persisted by the extension, while
+      // this controller owns the parent goal. Reconcile them on the same
+      // event-driven tick so the sidebar reserves "action required" for a
+      // record that actually needs Zach's decision.
+      if (signalParentGoalForUserAction(manifest, matchedWorkflows)) {
+        await atomicWriteJson(manifestPath, manifest);
+        if ("parentGoal" in manifest)
+          await publishParentGoalSidebar(
+            validateParentGoal(manifest.parentGoal),
+            orchestrator.root,
+            api,
+          );
+      }
       // Event-driven pending-outbox reconciliation. A lane wake that could
       // not be delivered earlier (root busy or unavailable) previously
       // retried only if an identical hook happened to recur later, and was
-      // never attempted while the parent goal sat in "action-required",
+      // never attempted while the parent goal sat in a non-active status,
       // which an undelivered actionable event usually causes in the first
       // place. This tick is the event-driven recovery point (it fires on
       // every hook/interval), so drain independently of parent-goal status.
@@ -1825,6 +1919,10 @@ export async function handleHook({
       record = newRecord(event, mapping, classification, identity);
       ledger.events.push(record);
       signalParentGoal(manifest, record);
+      // Question/approval records are written by the extension rather than a
+      // pane hook. Reconcile after the lane breadcrumb so a user request wins
+      // over the review-only status and next action from this event.
+      signalParentGoalForUserAction(manifest);
       inboxMessage = await persistControllerMessage(configDir, {
         logicalKey: `lane-event:${record.workflow_id}/${record.lane_id}/${record.classification}`,
         occurrenceId: record.identity,
@@ -1849,6 +1947,17 @@ export async function handleHook({
           mapping.orchestrator.root,
           api,
         );
+    } else {
+      const userActionChanged = signalParentGoalForUserAction(manifest);
+      if (userActionChanged) {
+        await atomicWriteJson(mapping.workflow.manifest_path, manifest);
+        if ("parentGoal" in manifest)
+          await publishParentGoalSidebar(
+            validateParentGoal(manifest.parentGoal),
+            mapping.orchestrator.root,
+            api,
+          );
+      }
     }
     if (!ACTIONABLE_CLASSIFICATIONS.has(record.classification)) {
       return { accepted: true, deduplicated: !created, record };

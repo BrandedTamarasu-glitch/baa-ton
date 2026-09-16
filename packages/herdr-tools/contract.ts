@@ -378,6 +378,7 @@ export type ParentGoalStatus =
   | "active"
   | "waiting-for-event"
   | "action-required"
+  | "review-requested"
   | "blocked"
   | "completed"
   | "paused";

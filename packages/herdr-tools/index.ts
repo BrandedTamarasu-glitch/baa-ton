@@ -347,6 +347,7 @@ const PARENT_GOAL_STATUSES = new Set<ParentGoalStatus>([
   "active",
   "waiting-for-event",
   "action-required",
+  "review-requested",
   "blocked",
   "completed",
   "paused",
