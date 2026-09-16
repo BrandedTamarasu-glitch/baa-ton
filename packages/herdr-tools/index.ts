@@ -46,6 +46,7 @@ import {
   type Lane,
   type LaneInput,
   type Manifest,
+  type MessageRecord,
   type NativeSessionRef,
   type ParentGoal,
   type ParentGoalStatus,
@@ -76,6 +77,7 @@ import {
 } from "./harness-adapter.js";
 import { fileURLToPath } from "node:url";
 import { acknowledgeActivation } from "./activation-ack.mjs";
+import { routeChildMessage } from "../controller/controller.mjs";
 
 const MANIFEST_DIR = ".pi/herdr-orchestrator";
 const MANIFEST_NAME = "manifest.json";
@@ -84,6 +86,10 @@ const BB029_AUTHORIZATION_SCOPE = "BB-029";
 const HERDR_COMMAND_TIMEOUT_MS = 35_000;
 const RECENT_AGENT_OUTPUT_LINES = 120;
 const GOAL_PAUSE_OUTPUT_LIMIT = 6000;
+const MESSAGE_SUMMARY_MAX_LENGTH = 4000;
+const MESSAGE_DETAILS_MAX_LENGTH = 6000;
+const MESSAGE_DEDUPE_WINDOW_MS = 60_000;
+const RECENT_MESSAGE_WINDOW_MS = 86_400_000;
 const HERDR_PANE_ID_ENV = "HERDR_PANE_ID";
 const HERDR_PLUGIN_CONFIG_DIR_ENV = "HERDR_PLUGIN_CONFIG_DIR";
 const CONTROLLER_PLUGIN_ID = "herdr-orchestrator-controller";
@@ -109,7 +115,7 @@ async function rootBootstrapPrompt(cwd: string): Promise<string> {
       status: workflow.status,
       lanes: workflow.lanes.length,
     }));
-  return `\n\nHerdr parent-root bootstrap: you are the sole parent executor. Registered parent goal: ${rootGoal}. Herdr's durable manifest at ${manifestPath(cwd)} is authoritative; current workflows: ${jsonText(active)}. You may use herdr_plan, herdr_dispatch, herdr_observe, herdr_resume, and herdr_close only through their documented parent/root paths. Treat controller-delivered lane lifecycle, parent-question-required, parent-approval-required, and blocker records as durable work signals: read the record and continue through safe local actions under existing authorization. Persist a truthful state when waiting for an external event, blocked, paused, or complete; do not stop merely because one tool or parent action finished. Never ask the user to operate a child pane or Pi goal UI; children persist requests and Herdr wakes you. Do not poll or create detached agents. Do not push, merge, create PRs, deploy, mutate production, or close resources without explicit user approval.`;
+  return `\n\nHerdr parent-root bootstrap: you are the sole parent executor. Registered parent goal: ${rootGoal}. Herdr's durable manifest at ${manifestPath(cwd)} is authoritative; current workflows: ${jsonText(active)}. You may use herdr_plan, herdr_dispatch, herdr_observe, herdr_resume, and herdr_close only through their documented parent/root paths. Treat controller-delivered lane lifecycle, child-message, parent-question-required, parent-approval-required, and blocker records as durable work signals: read the record and continue through safe local actions under existing authorization. Persist a truthful state when waiting for an external event, blocked, paused, or complete; do not stop merely because one tool or parent action finished. Never ask the user to operate a child pane or Pi goal UI; children persist requests and Herdr wakes you. Do not poll or create detached agents. Do not push, merge, create PRs, deploy, mutate production, or close resources without explicit user approval.`;
 }
 
 function pausedGoalIds(output: string): string[] {
@@ -261,6 +267,7 @@ async function loadManifest(cwd: string): Promise<Manifest> {
       workflows?: unknown;
       parentGoal?: ParentGoal;
       questionRequests?: ParentQuestionRequest[];
+      messageRequests?: MessageRecord[];
     };
     if (
       (parsed.version === 1 || parsed.version === 2) &&
@@ -273,6 +280,7 @@ async function loadManifest(cwd: string): Promise<Manifest> {
         ),
         parentGoal: parsed.parentGoal,
         questionRequests: parsed.questionRequests,
+        messageRequests: parsed.messageRequests,
       };
     return { version: 2, workflows: [] };
   } catch (error: unknown) {
@@ -1360,6 +1368,7 @@ function contract(workflow: Workflow, lane: Lane): string {
     "Do not create subagents, background jobs, detached tasks, or another agent session.",
     "Run tests synchronously in this pane, or ask the caller to create an explicit Herdr test pane.",
     "A recorded local authorization policy applies only to the designated root's dispatch, retry, and Pi paused-goal recovery; it grants this child no approval authority.",
+    "Use herdr_message for durable informational facts the parent should review, including after herdr_complete; use the question flow for Zach's decisions and herdr_complete for the one lane receipt.",
     "Never push, merge, deploy, create a PR, mutate production or external services, or close Herdr resources.",
     `Before ending, you MUST call herdr_complete({ workflowId: "${workflow.id}", summary: "<outcome, evidence, blockers>" }) exactly once after verifying the work. A chat-only outcome is insufficient and does not complete this lane.`,
     "Then state the same outcome/evidence clearly. Generic Herdr done events are fallback-only; the durable herdr_complete receipt is required for normal completion.",
@@ -1487,10 +1496,13 @@ function readControllerConfigForCurrentPane(): ControllerConfig | undefined {
 
 function isRootOrchestrator(): boolean {
   const paneId = process.env[HERDR_PANE_ID_ENV];
-  if (!paneId) return false;
+  const workspaceId = process.env.HERDR_WORKSPACE_ID;
+  if (!paneId || !workspaceId) return false;
   return (
     readControllerConfigForCurrentPane()?.orchestrators.some(
-      (record) => record.root.pane_id === paneId,
+      (record) =>
+        record.root.pane_id === paneId &&
+        record.root.workspace_id === workspaceId,
     ) ?? false
   );
 }
@@ -1634,6 +1646,90 @@ async function persistParentQuestion(
   }
 }
 
+async function persistParentMessage(
+  cwd: string,
+  workflowId: string,
+  summary: string,
+  details?: string,
+): Promise<{ request: MessageRecord; created: boolean }> {
+  requireHerdr();
+  if (isRootOrchestrator())
+    throw new Error(
+      "The verified root has no parent to message; use the root's normal workflow tools instead.",
+    );
+  const assignment = currentChildAssignment();
+  // cwd is a code location, never routing authority.
+  cwd = assignment.cwd;
+  if (assignment.workflow.workflow_id !== workflowId)
+    throw new Error("Message is outside this participant's assignment.");
+  const normalizedSummary = summary.trim();
+  if (!normalizedSummary)
+    throw new Error("Message summary must be a non-empty string.");
+  if (normalizedSummary.length > MESSAGE_SUMMARY_MAX_LENGTH)
+    throw new Error(
+      `Message summary must be no longer than ${MESSAGE_SUMMARY_MAX_LENGTH} characters.`,
+    );
+  const normalizedDetails = details?.trim();
+  if (normalizedDetails && normalizedDetails.length > MESSAGE_DETAILS_MAX_LENGTH)
+    throw new Error(
+      `Message details must be no longer than ${MESSAGE_DETAILS_MAX_LENGTH} characters.`,
+    );
+  const requestedAt = now();
+  const release = await acquireManifestLock(cwd, 10_000);
+  try {
+    const manifest = await loadManifest(cwd);
+    const workflow = workflowFor(manifest, workflowId);
+    if (
+      !workflow.lanes.some(
+        (lane) =>
+          lane.id === assignment.lane.lane_id &&
+          lane.paneId === assignment.lane.pane_id,
+      )
+    )
+      throw new Error(
+        "Child assignment differs from the authoritative manifest.",
+      );
+    const requests = (workflow.messageRequests ??= []);
+    const existing = requests.find((request) => {
+      if (
+        request.workflowId !== workflow.id ||
+        request.laneId !== assignment.lane.lane_id ||
+        request.summary !== normalizedSummary
+      )
+        return false;
+      const at = Date.parse(request.requestedAt);
+      return Number.isFinite(at) &&
+        Math.abs(Date.parse(requestedAt) - at) <= MESSAGE_DEDUPE_WINDOW_MS;
+    });
+    if (existing) return { request: existing, created: false };
+    const request: MessageRecord = {
+      version: 1,
+      id: `message-${randomUUID().slice(0, 8)}`,
+      workflowId: workflow.id,
+      laneId: assignment.lane.lane_id,
+      summary: normalizedSummary,
+      ...(normalizedDetails ? { details: normalizedDetails } : {}),
+      kind: "informational",
+      requestedAt,
+      delivery: {
+        status: "pending",
+        attempts: 0,
+        updatedAt: requestedAt,
+      },
+    };
+    requests.push(request);
+    workflow.evidence.push({
+      at: now(),
+      kind: "child-message",
+      text: `Informational message ${request.id} is durable for ${request.workflowId}/${request.laneId}.`,
+    });
+    await saveManifest(cwd, manifest);
+    return { request, created: true };
+  } finally {
+    await release();
+  }
+}
+
 async function confirmExecution(
   ctx: ExtensionContext,
   label: string,
@@ -1675,6 +1771,52 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     timeoutMs?: number,
   ): Promise<any> {
     return parseJson(await runHerdrRaw(args, signal, timeoutMs));
+  }
+
+  async function sendMessage(
+    cwd: string,
+    workflowId: string,
+    summary: string,
+    details: string | undefined,
+    signal?: AbortSignal,
+  ) {
+    const persisted = await persistParentMessage(
+      cwd,
+      workflowId,
+      summary,
+      details,
+    );
+    const request = persisted.request;
+    if (!persisted.created && request.delivery.status !== "pending")
+      return { ...persisted, delivery: request.delivery.status };
+    const herdr = {
+      request: async (method: string, params: Record<string, unknown>) => {
+        if (method === "agent.get")
+          return runHerdr(
+            ["agent", "get", String(params.target)],
+            signal,
+          );
+        if (method === "agent.prompt")
+          return runHerdr(
+            [
+              "agent",
+              "prompt",
+              String(params.target),
+              String(params.text),
+            ],
+            signal,
+          );
+        throw new Error(`Unsupported controller Herdr request: ${method}`);
+      },
+    };
+    const routed = await routeChildMessage({
+      configDir: resolve(dirname(rootConfigPath())),
+      workflowId,
+      laneId: request.laneId,
+      messageId: request.id,
+      herdr,
+    });
+    return { ...persisted, ...routed, delivery: routed.delivery };
   }
 
   async function assertCleanLocalWorktree(
@@ -2072,7 +2214,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const manifestHasLegacyState =
       existingManifest.workflows.length > 0 ||
       existingManifest.parentGoal !== undefined ||
-      (existingManifest.questionRequests?.length ?? 0) > 0;
+      (existingManifest.questionRequests?.length ?? 0) > 0 ||
+      (existingManifest.messageRequests?.length ?? 0) > 0;
     if (
       config?.orchestrators.some((record) =>
         record.workflows.some((workflow) =>
@@ -3025,7 +3168,15 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     )
       await registerEventController(cwd, id, signal);
     const workflow = workflowFor(await loadManifest(cwd), id);
-    return { workflow, state: workflow.status, observations };
+    const nowMs = Date.now();
+    const messages = (workflow.messageRequests ?? []).filter((message) => {
+      const at = Date.parse(message.requestedAt);
+      return (
+        message.delivery.status !== "delivered" ||
+        (Number.isFinite(at) && nowMs - at <= RECENT_MESSAGE_WINDOW_MS)
+      );
+    });
+    return { workflow, state: workflow.status, observations, messages };
   }
 
   async function resume(
@@ -4510,6 +4661,49 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     },
   });
   pi.registerTool({
+    name: "herdr_message",
+    label: "Herdr Message",
+    description:
+      "Send durable informational work context to the mapped parent root; it remains available even after this lane reports completion.",
+    promptSnippet:
+      "Send a durable informational message to the mapped Herdr parent.",
+    promptGuidelines: [
+      "Use herdr_message for information the root should review, herdr_question_answer flow for a decision needed from Zach, and herdr_complete for the lane's one completion receipt. A message is informational and never requests approval.",
+      "A registered child may use this after herdr_complete when a late fact still needs to reach the parent; the root itself has no parent to message.",
+    ],
+    parameters: Type.Object(
+      {
+        workflowId: Type.String({ minLength: 1 }),
+        summary: Type.String({
+          minLength: 1,
+          maxLength: MESSAGE_SUMMARY_MAX_LENGTH,
+        }),
+        details: Type.Optional(
+          Type.String({ maxLength: MESSAGE_DETAILS_MAX_LENGTH }),
+        ),
+      },
+      { additionalProperties: false },
+    ),
+    async execute(_id, params, signal, _update, ctx) {
+      const result = await sendMessage(
+        ctx.cwd,
+        params.workflowId,
+        params.summary,
+        params.details,
+        signal,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Stored child message ${result.request.id}; parent notification: ${result.delivery}.`,
+          },
+        ],
+        details: result,
+      };
+    },
+  });
+  pi.registerTool({
     name: "herdr_complete",
     label: "Herdr Complete",
     description:
@@ -4766,7 +4960,16 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const result = await observe(ctx.cwd, params.workflowId, signal);
       return {
         content: [
-          { type: "text", text: `${params.workflowId}: ${result.state}` },
+          {
+            type: "text",
+            text: `${params.workflowId}: ${result.state}${
+              result.messages.length
+                ? `; messages to review: ${result.messages
+                    .map((message) => `${message.laneId}/${message.summary}`)
+                    .join("; ")}`
+                : ""
+            }`,
+          },
         ],
         details: result,
       };

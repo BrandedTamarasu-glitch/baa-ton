@@ -138,6 +138,9 @@ extension.default({
 const permissionToolName =
   "mcp__herdr-orchestrator__herdr_permission_prompt";
 
+// herdr_message owns its manifest record and controller-routed child-message
+// inbox entry; it is intentionally not wrapped in the generic MCP mutation
+// envelope, which would create a second inbox record.
 const mutationKinds = new Map([
   ["herdr_goal", "goal"],
   ["herdr_question_answer", "answer"],
@@ -156,7 +159,7 @@ const ROOT_BRIEFING = [
   "ROOT BRIEFING",
   "You are the sole Baa-ton parent executor. The durable manifest is authoritative; inspect it before making workflow decisions.",
   "Delegate only with herdr_plan, then herdr_dispatch. Every child is a new Herdr-created session; never create Pi subagents, background jobs, or detached work.",
-  "Treat child lifecycle, parent-question-required, parent-approval-required, and blocker records as durable signals. Children persist requests and Herdr wakes the root; do not poll or ask the user to operate a child pane or Pi goal UI. Persist a truthful goal state when waiting, blocked, paused, or complete.",
+  "Treat child lifecycle, child-message, parent-question-required, parent-approval-required, and blocker records as durable signals. Children persist requests and Herdr wakes the root; do not poll or ask the user to operate a child pane or Pi goal UI. Persist a truthful goal state when waiting, blocked, paused, or complete.",
   "Push, merge, PR, deploy, production mutation, and Herdr resource closure require explicit user approval. Close only extension-owned resources with evidence.",
 ].join("\n");
 

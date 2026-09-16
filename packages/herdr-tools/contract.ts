@@ -138,6 +138,25 @@ export type ParentQuestionRequest = {
 };
 export type QuestionRecord = ParentQuestionRequest;
 
+/** Durable informational message from a mapped child lane to its parent. */
+export type MessageRecord = {
+  version: 1;
+  id: string;
+  workflowId: string;
+  laneId: string;
+  summary: string;
+  details?: string;
+  kind: "informational";
+  requestedAt: string;
+  delivery: {
+    status: "pending" | "sending" | "delivered" | "uncertain";
+    attempts: number;
+    updatedAt: string;
+    reason?: string;
+  };
+};
+export type ParentMessageRecord = MessageRecord;
+
 export type GoalPauseRecord = {
   status: "goal-paused";
   goalIds: string[];
@@ -486,6 +505,7 @@ export type Workflow = {
   authorizationPolicy?: AuthorizationPolicy;
   approvalRequests?: ApprovalRequest[];
   questionRequests?: ParentQuestionRequest[];
+  messageRequests?: MessageRecord[];
   eventControllerRegistration?: EventControllerRegistration;
   createdAt: string;
   updatedAt: string;
@@ -503,6 +523,7 @@ export type Manifest = {
   workflows: Workflow[];
   parentGoal?: ParentGoal;
   questionRequests?: ParentQuestionRequest[];
+  messageRequests?: MessageRecord[];
 };
 export type ExecResult = {
   stdout: string;

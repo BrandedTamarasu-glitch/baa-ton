@@ -34,6 +34,14 @@ const LOCK_RETRY_MS = 10;
 const SOCKET_TIMEOUT_MS = 2_500;
 const MIN_NUDGE_INTERVAL_SECONDS = 5;
 const MAX_NUDGE_INTERVAL_SECONDS = 86_400;
+const MESSAGE_SUMMARY_MAX_LENGTH = 4_000;
+const MESSAGE_DETAILS_MAX_LENGTH = 6_000;
+const MESSAGE_DELIVERY_STATUSES = new Set([
+  "pending",
+  "sending",
+  "delivered",
+  "uncertain",
+]);
 const ACTIONABLE_CLASSIFICATIONS = new Set(["done", "blocked", "goal-paused"]);
 const USER_ACTIONABLE_REQUEST_STATUSES = new Set([
   "parent-question-required",
@@ -561,6 +569,54 @@ function locateMapping(config, event) {
   return matches[0];
 }
 
+function validateMessageRecord(value, label) {
+  const message = assertObjectShape(
+    value,
+    label,
+    [
+      "version",
+      "id",
+      "workflowId",
+      "laneId",
+      "summary",
+      "kind",
+      "requestedAt",
+      "delivery",
+    ],
+    ["details"],
+  );
+  assert(message.version === 1, `${label}.version must be 1.`);
+  for (const key of ["id", "workflowId", "laneId", "summary", "requestedAt"])
+    assertString(message[key], `${label}.${key}`);
+  assert(
+    message.summary.length <= MESSAGE_SUMMARY_MAX_LENGTH,
+    `${label}.summary is too long.`,
+  );
+  assert(message.kind === "informational", `${label}.kind must be informational.`);
+  if ("details" in message) {
+    assert(
+      typeof message.details === "string" &&
+        message.details.length <= MESSAGE_DETAILS_MAX_LENGTH,
+      `${label}.details is invalid.`,
+    );
+  }
+  const delivery = assertObjectShape(
+    message.delivery,
+    `${label}.delivery`,
+    ["status", "attempts", "updatedAt"],
+    ["reason"],
+  );
+  assert(
+    MESSAGE_DELIVERY_STATUSES.has(delivery.status),
+    `${label}.delivery.status is invalid.`,
+  );
+  assertSafeUInt(delivery.attempts, `${label}.delivery.attempts`);
+  assertString(delivery.updatedAt, `${label}.delivery.updatedAt`);
+  if ("reason" in delivery)
+    assertString(delivery.reason, `${label}.delivery.reason`);
+  return message;
+}
+
 function validateMappedWorkflow(manifest, mapping, owner) {
   assert(isRecord(manifest), "Workflow manifest must be an object.");
   assert(
@@ -601,6 +657,16 @@ function validateMappedWorkflow(manifest, mapping, owner) {
     "Manifest lane pane ID differs from the explicit mapping.",
     "invalid_mapping",
   );
+  if ("messageRequests" in workflow) {
+    assert(
+      Array.isArray(workflow.messageRequests),
+      "Mapped workflow messageRequests must be an array.",
+      "invalid_mapping",
+    );
+    workflow.messageRequests.forEach((message, index) =>
+      validateMessageRecord(message, `workflow.messageRequests[${index}]`),
+    );
+  }
   // Manifest ownership and pane identity are authoritative. Agent names/kinds
   // are live Herdr metadata, not event-mapping identity.
   return workflow;
@@ -1317,6 +1383,231 @@ async function deliverWake(record, root, herdr) {
   }
 }
 
+function childMessageWakeText(message) {
+  return [
+    `[Herdr child message] workflow ${message.workflowId}, lane ${message.laneId}: ${message.summary}`,
+    ...(message.details ? [`Details: ${message.details}`] : []),
+    `Review durable informational message ${message.id} in the workflow manifest before taking action.`,
+  ].join(" ");
+}
+
+async function deliverChildMessageWake(message, root, herdr) {
+  try {
+    const rootInfo = await herdr.request("agent.get", { target: root.target });
+    if (!rootMatches(rootInfo, root))
+      return {
+        status: "pending",
+        reason: "recorded_root_unavailable_or_mismatched",
+      };
+  } catch (error) {
+    if (unavailable(error))
+      return { status: "pending", reason: `root_unavailable:${error.code}` };
+    return {
+      status: "uncertain",
+      reason: `root_check_failed:${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  try {
+    // Child messages are controller wakes, not foreground work or questions.
+    await herdr.request("agent.prompt", {
+      target: root.target,
+      text: childMessageWakeText(message),
+    });
+    return { status: "delivered", reason: "agent_prompt_accepted" };
+  } catch (error) {
+    if (error?.sent)
+      return {
+        status: "uncertain",
+        reason: `root_prompt_ambiguous:${error instanceof Error ? error.message : String(error)}`,
+      };
+    if (unavailable(error))
+      return { status: "pending", reason: `root_unavailable:${error.code}` };
+    return {
+      status: "uncertain",
+      reason: `root_prompt_failed:${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+function signalParentGoalForMessage(manifest, message, timestamp = now()) {
+  if (!("parentGoal" in manifest)) return false;
+  const goal = validateParentGoal(manifest.parentGoal);
+  goal.status = "review-requested";
+  goal.nextAction =
+    `Review child message ${message.id} from ${message.workflowId}/${message.laneId}: ${message.summary}`;
+  goal.updatedAt = timestamp;
+  return true;
+}
+
+async function processChildMessageRequest({
+  manifestPath,
+  manifest,
+  workflow,
+  mapping,
+  request,
+  configDir,
+  herdr,
+  timestamp = now(),
+}) {
+  const currentStatus = request.delivery?.status ?? "pending";
+  const attempts = Number.isSafeInteger(request.delivery?.attempts) &&
+    request.delivery.attempts >= 0
+    ? request.delivery.attempts
+    : 0;
+  if (currentStatus === "delivered" || currentStatus === "uncertain")
+    return { accepted: true, delivery: currentStatus, request };
+  if (currentStatus === "sending") {
+    request.delivery = {
+      status: "uncertain",
+      attempts,
+      updatedAt: timestamp,
+      reason: "interrupted_root_delivery_requires_parent_review",
+    };
+    await atomicWriteJson(manifestPath, manifest);
+    return { accepted: true, delivery: "uncertain", request };
+  }
+
+  const nextAttempts = attempts + 1;
+  request.delivery = {
+    status: "sending",
+    attempts: nextAttempts,
+    updatedAt: timestamp,
+  };
+  // This is intentionally unconditional, including terminal lanes and goals:
+  // a child message is a new review signal, not post-completion lifecycle noise.
+  signalParentGoalForMessage(manifest, request, timestamp);
+  await atomicWriteJson(manifestPath, manifest);
+
+  let inboxMessage;
+  try {
+    inboxMessage = await persistControllerMessage(configDir, {
+      logicalKey: `child-message:${request.workflowId}/${request.laneId}:${sha256(request.summary)}`,
+      occurrenceId: request.id,
+      kind: "child-message",
+      from: inboxIdentity(
+        mapping.lane.workspace_id,
+        mapping.lane.pane_id,
+        mapping.lane.target,
+      ),
+      to: inboxIdentity(
+        mapping.orchestrator.root.workspace_id,
+        mapping.orchestrator.root.pane_id,
+        mapping.orchestrator.root.agent_kind,
+      ),
+      payload: request,
+      wake: true,
+    });
+    if (inboxMessage)
+      await markDelivery(
+        inboxMessage.path,
+        inboxMessage.message.occurrence_id,
+        "sending",
+        { attempts: nextAttempts },
+      );
+  } catch (error) {
+    request.delivery = {
+      status: "uncertain",
+      attempts: nextAttempts,
+      updatedAt: now(),
+      reason: `message_persist_failed:${error instanceof Error ? error.message : String(error)}`,
+    };
+    await atomicWriteJson(manifestPath, manifest);
+    return { accepted: true, delivery: "uncertain", request };
+  }
+
+  const outcome = await deliverChildMessageWake(
+    request,
+    mapping.orchestrator.root,
+    herdr,
+  );
+  request.delivery = {
+    status: outcome.status,
+    attempts: nextAttempts,
+    updatedAt: now(),
+    reason: outcome.reason,
+  };
+  await finishControllerMessage(inboxMessage, outcome.status, {
+    attempts: nextAttempts,
+    reason: outcome.reason,
+  });
+  await atomicWriteJson(manifestPath, manifest);
+  return { accepted: true, delivery: outcome.status, request };
+}
+
+/**
+ * Route one durable child message from the extension/bridge through the same
+ * controller inbox and root wake path used by lifecycle events. The caller
+ * has already fenced its live pane; this function revalidates the registered
+ * workflow and authoritative manifest before sending anything.
+ */
+export async function routeChildMessage(options = {}) {
+  const {
+    configDir: configuredConfigDir,
+    stateDir,
+    workflowId,
+    laneId,
+    messageId,
+    herdr,
+  } = options;
+  const configDir = configuredConfigDir ?? stateDir;
+  assertString(configDir, "HERDR_PLUGIN_CONFIG_DIR");
+  assertString(workflowId, "workflowId");
+  assertString(laneId, "laneId");
+  assertString(messageId, "messageId");
+  const config = await loadConfig(configDir);
+  const matches = [];
+  for (const orchestrator of config.orchestrators)
+    for (const workflow of orchestrator.workflows)
+      if (workflow.workflow_id === workflowId) {
+        const lane = workflow.lanes.find((candidate) => candidate.lane_id === laneId);
+        if (lane) matches.push({ orchestrator, workflow, lane });
+      }
+  assert(
+    matches.length === 1,
+    matches.length === 0
+      ? "Child message route is not registered for this workflow/lane."
+      : "Child message route is ambiguously registered.",
+    matches.length === 0 ? "invalid_mapping" : "ambiguous_mapping",
+  );
+  const mapping = matches[0];
+  const manifestPath = resolve(mapping.workflow.manifest_path);
+  const release = await acquireManifestLock(manifestPath);
+  try {
+    const manifest = parseJson(
+      await readRegularFile(manifestPath, "Workflow manifest"),
+      "Workflow manifest",
+    );
+    const workflow = validateMappedWorkflow(
+      manifest,
+      { workflow: mapping.workflow, lane: mapping.lane },
+      config.owner,
+    );
+    const request = workflow.messageRequests?.find(
+      (candidate) =>
+        isRecord(candidate) &&
+        candidate.id === messageId &&
+        candidate.workflowId === workflowId &&
+        candidate.laneId === laneId,
+    );
+    assert(
+      request,
+      `Durable child message ${messageId} is missing from the authoritative manifest.`,
+      "invalid_mapping",
+    );
+    return await processChildMessageRequest({
+      manifestPath,
+      manifest,
+      workflow,
+      mapping: { orchestrator: mapping.orchestrator, workflow: mapping.workflow, lane: mapping.lane },
+      request,
+      configDir,
+      herdr: herdr ?? new JsonLineHerdrClient(),
+    });
+  } finally {
+    await release();
+  }
+}
+
 function supervisorWakeText(goal) {
   return [
     `[Herdr Orchestrator supervisor] Parent goal ${goal.id} remains active.`,
@@ -1567,6 +1858,48 @@ export async function runSupervisorTick({
         }
       }
       if (pendingChanged) await atomicWriteJson(manifestPath, manifest);
+
+      // Child messages are independent of lifecycle classification and of lane
+      // terminal state. A message left pending by a child/bridge invocation is
+      // retried from the durable manifest on the next controller tick; an
+      // interrupted sending state is converted to uncertain and never replayed.
+      for (const [workflowIndex, candidate] of workflows.entries()) {
+        const stored = matchedWorkflows[workflowIndex];
+        const messageRequests = Array.isArray(stored.messageRequests)
+          ? stored.messageRequests
+          : [];
+        const messageLaneById = new Map(
+          candidate.lanes.map((lane) => [lane.lane_id, lane]),
+        );
+        for (const request of messageRequests) {
+          if ((request.delivery?.status ?? "pending") !== "pending") continue;
+          const lane = messageLaneById.get(request.laneId);
+          if (!lane) continue;
+          const outcome = await processChildMessageRequest({
+            manifestPath,
+            manifest,
+            workflow: stored,
+            mapping: { orchestrator, workflow: candidate, lane },
+            request,
+            configDir,
+            herdr: api,
+            timestamp,
+          });
+          pendingWakes.push({
+            manifestPath,
+            workflowId: stored.id,
+            laneId: request.laneId,
+            kind: "child-message",
+            status: outcome.delivery,
+          });
+          if ("parentGoal" in manifest)
+            await publishParentGoalSidebar(
+              validateParentGoal(manifest.parentGoal),
+              orchestrator.root,
+              api,
+            );
+        }
+      }
       if (!("parentGoal" in manifest)) {
         results.push({ manifestPath, status: "no-parent-goal" });
         continue;

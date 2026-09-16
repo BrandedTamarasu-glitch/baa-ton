@@ -10,11 +10,16 @@ Harness-neutral local workflow operations for Herdr. The local MCP bridge expose
 | `herdr_reparent` | Preview or root-confirm a controller-root handoff. |
 | `herdr_plan` | Create a durable workflow and its lanes. |
 | `herdr_dispatch` | Preview or create owned Herdr workspace/tab/lane resources. |
-| `herdr_observe` | Record lane state and bounded recent output. |
+| `herdr_observe` | Record lane state and bounded recent output, including child messages. |
+| `herdr_message` | Send durable informational context from a child to its parent. |
 | `herdr_resume` | Recover lanes that have a recorded paused goal. |
 | `herdr_close` | Close only a completed, evidenced, extension-owned workspace. |
 
 All operations fail closed outside a Herdr session. Dispatch, resume, and close are previews by default. Non-root callers persist a parent-approval request rather than presenting approval UI.
+
+## Messaging the parent
+
+A registered child uses `herdr_message` for durable informational context the root should review, including late facts after `herdr_complete`; use the question flow when Zach must decide something, and use `herdr_complete` for the lane's one completion receipt. Messages are not approval requests and are controller-routed to wake the mapped root.
 
 ## Guarantees
 

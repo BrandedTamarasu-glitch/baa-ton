@@ -191,6 +191,7 @@ test("mapped root bridge exposes root-role parity and returns non-Pi root ground
         "herdr_operator_close",
         "herdr_reparent",
         "herdr_question_answer",
+        "herdr_message",
         "herdr_doctor",
       ])
         assert.equal(names.has(name), true, `${name} is exposed through MCP`);

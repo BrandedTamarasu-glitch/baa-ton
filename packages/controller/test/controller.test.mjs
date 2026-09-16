@@ -12,6 +12,7 @@ import {
   hookResponse,
   runSupervisorLoop,
   runSupervisorTick,
+  routeChildMessage,
   validateConfig,
 } from "../controller.mjs";
 import { configureSidebar } from "../sidebar-configure.mjs";
@@ -56,6 +57,7 @@ async function createFixture({
   completionReceipt,
   approvalRequests,
   questionRequests,
+  messageRequests,
   siblingLane,
 } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "herdr-controller-"));
@@ -103,6 +105,7 @@ async function createFixture({
         ...(workflowOutcome ? { outcome: workflowOutcome } : {}),
         ...(approvalRequests ? { approvalRequests } : {}),
         ...(questionRequests ? { questionRequests } : {}),
+        ...(messageRequests ? { messageRequests } : {}),
         ownership: {
           createdBy: "herdr-orchestrator",
           workspaceId: child.workspace_id,
@@ -765,6 +768,104 @@ test("post-completion done and idle transitions are observational and never wake
     assert.equal(inbox.messages[0].states.notified, null);
     assert.deepEqual(inbox.wake_hints, [], "observational events never enqueue a wake");
   } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("durable child messages wake the root after lane completion and remain distinct", async () => {
+  const child = {
+    ...CHILD,
+    pane_id: "w-root:p5",
+    workspace_id: ROOT.workspace_id,
+  };
+  const messageRequests = [
+    {
+      version: 1,
+      id: "message-late-worktree",
+      workflowId: "herdr-bb029",
+      laneId: child.lane_id,
+      summary: "The user asked for more work; the worktree was removed.",
+      kind: "informational",
+      requestedAt: "2026-09-16T00:00:00.000Z",
+      delivery: { status: "pending", attempts: 0, updatedAt: "2026-09-16T00:00:00.000Z" },
+    },
+    {
+      version: 1,
+      id: "message-late-distinct",
+      workflowId: "herdr-bb029",
+      laneId: child.lane_id,
+      summary: "A distinct late fact also needs review.",
+      kind: "informational",
+      requestedAt: "2026-09-16T00:00:01.000Z",
+      delivery: { status: "pending", attempts: 0, updatedAt: "2026-09-16T00:00:01.000Z" },
+    },
+  ];
+  const fixture = await createFixture({
+    child,
+    workflowStatus: "completed",
+    workflowOutcome: "completed",
+    completionReceipt: {
+      id: "incarnation-1",
+      summary: "lane completed",
+      delivery: "delivered",
+    },
+    messageRequests,
+    parentGoal: {
+      version: 1,
+      id: "parent-message",
+      objective: "Review late child information.",
+      status: "completed",
+      nextAction: "No more work.",
+      signals: [],
+      createdAt: "2026-09-16T00:00:00.000Z",
+      updatedAt: "2026-09-16T00:00:00.000Z",
+    },
+  });
+  const mock = await startHerdrMock(async (request) => {
+    if (request.method === "agent.get") return rootAgentInfo();
+    if (request.method === "agent.prompt") return { result: {} };
+    throw new Error(`Unexpected ${request.method}`);
+  });
+  try {
+    const first = await routeChildMessage({
+      configDir: fixture.stateDir,
+      workflowId: "herdr-bb029",
+      laneId: child.lane_id,
+      messageId: messageRequests[0].id,
+      herdr: client(mock),
+    });
+    const second = await routeChildMessage({
+      configDir: fixture.stateDir,
+      workflowId: "herdr-bb029",
+      laneId: child.lane_id,
+      messageId: messageRequests[1].id,
+      herdr: client(mock),
+    });
+    assert.equal(first.delivery, "delivered");
+    assert.equal(second.delivery, "delivered");
+    const prompts = requestsFor(mock, "agent.prompt");
+    assert.equal(prompts.length, 2);
+    assert.match(prompts[0].params.text, /lane lane-child/);
+    assert.match(prompts[0].params.text, /The user asked for more work/);
+    const manifest = await fixture.manifest();
+    assert.equal(manifest.parentGoal.status, "review-requested");
+    assert.doesNotMatch(manifest.parentGoal.nextAction, /action-required/);
+    assert.deepEqual(
+      manifest.workflows[0].messageRequests.map((request) => request.delivery.status),
+      ["delivered", "delivered"],
+    );
+    const inbox = await readStore(storePath({ stateDir: fixture.stateDir }));
+    assert.deepEqual(
+      inbox.messages.map((message) => message.envelope.message.type),
+      ["child-message", "child-message"],
+    );
+    assert.equal(inbox.wake_hints.length, 1);
+    assert.deepEqual(
+      inbox.wake_hints[0].occurrence_ids,
+      [messageRequests[0].id, messageRequests[1].id],
+    );
+  } finally {
+    await mock.close();
     await fixture.cleanup();
   }
 });
