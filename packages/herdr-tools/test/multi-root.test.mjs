@@ -269,6 +269,147 @@ test("add appends a concurrent root and preserves existing config and manifests"
   }
 });
 
+test("same-directory roots keep independent goals, queues, and sessions", async () => {
+  const f = await fixture();
+  try {
+    const goalTool = f.tools.get("herdr_goal");
+    const queueTool = f.tools.get("herdr_queue");
+    f.setIdentity(f.rootA.pane_id, f.rootA.workspace_id);
+    await bootstrap(f, f.cwdA);
+    await goalTool.execute(
+      "goal-a-init",
+      { action: "initialize", objective: "Root A objective" },
+      undefined,
+      undefined,
+      f.context(f.cwdA),
+    );
+
+    const beforeAdd = JSON.parse(await readFile(f.manifestA, "utf8"));
+    f.setIdentity("w-b:root", "w-b");
+    const added = await bootstrap(f, f.cwdA, { add: true });
+    assert.equal(added.details.add, true);
+    assert.equal(added.details.manifestReset, false);
+    const afterAdd = JSON.parse(await readFile(f.manifestA, "utf8"));
+    assert.equal(afterAdd.parentGoal.objective, beforeAdd.parentGoal.objective);
+    assert.equal(afterAdd.workflows.length, beforeAdd.workflows.length);
+    assert.equal(afterAdd.rootSessionLogs.length, 2);
+
+    await goalTool.execute(
+      "goal-b-init",
+      { action: "initialize", objective: "Root B objective" },
+      undefined,
+      undefined,
+      f.context(f.cwdA),
+    );
+    await goalTool.execute(
+      "goal-b-complete",
+      { action: "set-state", status: "completed", nextAction: "Done" },
+      undefined,
+      undefined,
+      f.context(f.cwdA),
+    );
+    const bStatus = await goalTool.execute(
+      "goal-b-status",
+      { action: "status" },
+      undefined,
+      undefined,
+      f.context(f.cwdA),
+    );
+    assert.equal(bStatus.details.goal.objective, "Root B objective");
+    assert.equal(bStatus.details.goal.status, "completed");
+    const bReset = await goalTool.execute(
+      "goal-b-reset",
+      { action: "reset" },
+      undefined,
+      undefined,
+      f.context(f.cwdA),
+    );
+    assert.equal(bReset.details.reset, true);
+    await goalTool.execute(
+      "goal-b-reinit",
+      { action: "initialize", objective: "Root B second objective" },
+      undefined,
+      undefined,
+      f.context(f.cwdA),
+    );
+
+    f.setIdentity(f.rootA.pane_id, f.rootA.workspace_id);
+    const aStatus = await goalTool.execute(
+      "goal-a-status",
+      { action: "status" },
+      undefined,
+      undefined,
+      f.context(f.cwdA),
+    );
+    assert.equal(aStatus.details.goal.objective, "Root A objective");
+    assert.equal(aStatus.details.goal.status, "active");
+    await goalTool.execute(
+      "goal-a-wait",
+      { action: "set-state", status: "waiting-for-event", nextAction: "Wait" },
+      undefined,
+      undefined,
+      f.context(f.cwdA),
+    );
+
+    const aQueue = await queueTool.execute(
+      "queue-a",
+      { action: "enqueue", objective: "Root A queue item", files: ["a.ts"] },
+      undefined,
+      undefined,
+      f.context(f.cwdA),
+    );
+    f.setIdentity("w-b:root", "w-b");
+    const bQueue = await queueTool.execute(
+      "queue-b",
+      { action: "enqueue", objective: "Root B queue item", files: ["b.ts"] },
+      undefined,
+      undefined,
+      f.context(f.cwdA),
+    );
+    assert.notEqual(aQueue.details.queueItem.id, bQueue.details.queueItem.id);
+
+    const bList = await queueTool.execute(
+      "queue-b-list",
+      { action: "list" },
+      undefined,
+      undefined,
+      f.context(f.cwdA),
+    );
+    assert.deepEqual(bList.details.items.map((item) => item.objective), [
+      "Root B queue item",
+    ]);
+    f.setIdentity(f.rootA.pane_id, f.rootA.workspace_id);
+    const aList = await queueTool.execute(
+      "queue-a-list",
+      { action: "list" },
+      undefined,
+      undefined,
+      f.context(f.cwdA),
+    );
+    assert.deepEqual(aList.details.items.map((item) => item.objective), [
+      "Root A queue item",
+    ]);
+
+    const manifest = JSON.parse(await readFile(f.manifestA, "utf8"));
+    assert.deepEqual(
+      Object.keys(manifest.parentGoals).sort(),
+      ["root-a", "orchestrator:w-b:w-b:root:" + f.cwdA].sort(),
+    );
+    assert.equal(
+      manifest.parentGoals["orchestrator:w-b:w-b:root:" + f.cwdA].rootId,
+      "orchestrator:w-b:w-b:root:" + f.cwdA,
+    );
+    assert.equal(manifest.rootQueues.version, 1);
+    assert.equal(manifest.rootQueues.roots.length, 2);
+    assert.deepEqual(
+      manifest.rootQueues.roots.map((root) => root.itemIds.length),
+      [1, 1],
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("add on the same pane and checkout is idempotent", async () => {
   const f = await fixture();
   try {

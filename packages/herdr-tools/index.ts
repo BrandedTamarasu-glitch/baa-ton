@@ -131,6 +131,8 @@ const CONTROLLER_PLUGIN_ID = "herdr-orchestrator-controller";
 const CONTROLLER_CONFIG_NAME = "config.json";
 const SCOPED_GOALS_SCHEMA_VERSION = 1 as const;
 const GOAL_HISTORY_SCHEMA_VERSION = 1 as const;
+const ROOT_GOALS_SCHEMA_VERSION = 1 as const;
+const ROOT_QUEUES_SCHEMA_VERSION = 1 as const;
 const QUEUE_SCHEMA_VERSION = 1 as const;
 const QUEUE_DEDUPE_WINDOW_MS = 60_000;
 const QUEUE_ITEM_STATES = [
@@ -158,9 +160,39 @@ type QueueStore = {
   version: typeof QUEUE_SCHEMA_VERSION;
   items: QueueItem[];
 };
-type ManifestWithQueue = ManifestWithGoalHistory & {
-  queue?: QueueStore;
+type RootParentGoal = ParentGoal & {
+  rootId: string;
+  root: ControllerRootMapping;
 };
+type RootGoalStore = Record<string, RootParentGoal>;
+type RootGoalRecord = {
+  rootId: string;
+  root: ControllerRootMapping;
+  goal?: RootParentGoal;
+  goalHistory: GoalHistoryRecord[];
+};
+type RootSessionLogEntry = SessionLogEntry & {
+  rootId: string;
+  root: ControllerRootMapping;
+};
+type RootQueueRecord = {
+  version: typeof ROOT_QUEUES_SCHEMA_VERSION;
+  rootId: string;
+  root: ControllerRootMapping;
+  itemIds: string[];
+};
+type RootQueueStore = {
+  version: typeof ROOT_QUEUES_SCHEMA_VERSION;
+  roots: RootQueueRecord[];
+};
+type ManifestWithRootState = ManifestWithGoalHistory & {
+  queue?: QueueStore;
+  parentGoals?: RootGoalStore;
+  goalHistoryByRoot?: Record<string, GoalHistoryRecord[]>;
+  rootSessionLogs?: RootSessionLogEntry[];
+  rootQueues?: RootQueueStore;
+};
+type ManifestWithQueue = ManifestWithRootState;
 type QueueBlockers = {
   dependencies: Array<{ id: string; state?: QueueItemState }>;
   files: Array<{ itemId: string; files: string[] }>;
@@ -224,7 +256,9 @@ async function runDirectGit(
 async function rootBootstrapPrompt(cwd: string): Promise<string> {
   if (!isRootOrchestrator()) return "";
   const manifest = await loadManifest(cwd);
-  const goal = manifest.parentGoal;
+  const scope = currentRootScope(cwd);
+  const scoped = scope ? rootGoalFor(manifest, cwd, scope).goal : undefined;
+  const goal = scope ? scoped : manifest.parentGoal;
   const rootGoal = goal
     ? `${goal.status}: ${clip(goal.objective, 4000)} Next: ${clip(goal.nextAction, 1000)}`
     : "No registered parent goal.";
@@ -506,12 +540,17 @@ function queueReadiness(
   manifest: ManifestWithQueue,
   candidate: QueueItem | undefined,
   cwd: string,
+  visibleIds?: Set<string>,
 ): QueueReadiness {
   const blockers: QueueBlockers = { dependencies: [], files: [] };
   if (!candidate) return { item: undefined, blockers };
   const queue = queueForManifest(manifest) ?? { version: QUEUE_SCHEMA_VERSION, items: [] };
   for (const dependencyId of candidate.after) {
-    const dependency = queue.items.find((item) => item.id === dependencyId);
+    const dependency = queue.items.find(
+      (item) =>
+        item.id === dependencyId &&
+        (!visibleIds || visibleIds.has(item.id)),
+    );
     if (!dependency || !["landed", "dropped"].includes(dependency.state))
       blockers.dependencies.push({
         id: dependencyId,
@@ -523,7 +562,11 @@ function queueReadiness(
   );
   if (candidateFiles.size > 0) {
     for (const other of queue.items) {
-      if (other.id === candidate.id || ["landed", "dropped"].includes(other.state))
+      if (
+        (visibleIds && !visibleIds.has(other.id)) ||
+        other.id === candidate.id ||
+        ["landed", "dropped"].includes(other.state)
+      )
         continue;
       const workflow = manifest.workflows.find(
         (item) =>
@@ -553,10 +596,15 @@ function queueReadiness(
 function queueHead(
   manifest: ManifestWithQueue,
   cwd: string,
+  visibleIds?: Set<string>,
 ): QueueReadiness {
   const queue = queueForManifest(manifest);
-  const candidate = queue?.items.find((item) => item.state === "pending");
-  return queueReadiness(manifest, candidate, cwd);
+  const candidate = queue?.items.find(
+    (item) =>
+      item.state === "pending" &&
+      (!visibleIds || visibleIds.has(item.id)),
+  );
+  return queueReadiness(manifest, candidate, cwd, visibleIds);
 }
 
 function queueBlockerText(blockers: QueueBlockers): string {
@@ -576,17 +624,123 @@ function queueBlockerText(blockers: QueueBlockers): string {
   return parts.join("; ");
 }
 
+function rootGoalStore(value: unknown, label = "manifest.parentGoals"): RootGoalStore {
+  if (!isRecord(value)) throw new Error(`${label} must be an object.`);
+  // Accept the first internal draft of the scoped schema while normalizing all
+  // new writes to the root-id keyed shape consumed by the controller.
+  if (value.version === ROOT_GOALS_SCHEMA_VERSION && Array.isArray(value.roots)) {
+    const normalized: RootGoalStore = {};
+    for (const [index, raw] of value.roots.entries()) {
+      if (!isRecord(raw)) throw new Error(`${label}.roots[${index}] must be an object.`);
+      if (typeof raw.rootId !== "string" || !raw.rootId)
+        throw new Error(`${label}.roots[${index}].rootId must be a non-empty string.`);
+      if (raw.goal !== undefined && !isRecord(raw.goal))
+        throw new Error(`${label}.roots[${index}].goal must be an object when present.`);
+      const goal = raw.goal as RootParentGoal | undefined;
+      if (goal) normalized[raw.rootId] = goal;
+    }
+    return normalized;
+  }
+  const normalized: RootGoalStore = {};
+  for (const [rootId, raw] of Object.entries(value)) {
+    if (!isRecord(raw)) throw new Error(`${label}.${rootId} must be an object.`);
+    // Root ownership is carried on the goal when the extension writes it. A
+    // controller-created map may omit it because the map key is authoritative.
+    if (isRecord(raw.goal)) {
+      const goal = raw.goal as RootParentGoal;
+      normalized[rootId] = {
+        ...goal,
+        rootId:
+          typeof raw.rootId === "string" && raw.rootId ? raw.rootId : rootId,
+        ...(isRecord(raw.root) ? { root: validateControllerRoot(raw.root) } : {}),
+      } as RootParentGoal;
+    } else {
+      normalized[rootId] = {
+        ...raw,
+        rootId:
+          typeof raw.rootId === "string" && raw.rootId ? raw.rootId : rootId,
+      } as unknown as RootParentGoal;
+      if (isRecord(raw.root))
+        normalized[rootId].root = validateControllerRoot(raw.root);
+    }
+  }
+  return normalized;
+}
+
+function rootGoalHistoryStore(
+  value: unknown,
+  label = "manifest.goalHistoryByRoot",
+): Record<string, GoalHistoryRecord[]> {
+  if (!isRecord(value)) throw new Error(`${label} must be an object.`);
+  const result: Record<string, GoalHistoryRecord[]> = {};
+  for (const [rootId, history] of Object.entries(value)) {
+    if (!Array.isArray(history)) throw new Error(`${label}.${rootId} must be an array.`);
+    result[rootId] = history as GoalHistoryRecord[];
+  }
+  return result;
+}
+
+function rootSessionLogStore(
+  value: unknown,
+  label = "manifest.rootSessionLogs",
+): RootSessionLogEntry[] {
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array.`);
+  const ids = new Set<string>();
+  return value.map((raw, index) => {
+    const itemLabel = `${label}[${index}]`;
+    if (!isRecord(raw)) throw new Error(`${itemLabel} must be an object.`);
+    if (typeof raw.rootId !== "string" || !raw.rootId)
+      throw new Error(`${itemLabel}.rootId must be a non-empty string.`);
+    if (ids.has(raw.rootId)) throw new Error(`Duplicate root session log ID: ${raw.rootId}.`);
+    ids.add(raw.rootId);
+    validateControllerRoot(raw.root);
+    return raw as unknown as RootSessionLogEntry;
+  });
+}
+
+function rootQueueStore(value: unknown, label = "manifest.rootQueues"): RootQueueStore {
+  if (!isRecord(value)) throw new Error(`${label} must be an object.`);
+  if (value.version !== ROOT_QUEUES_SCHEMA_VERSION)
+    throw new Error(`${label}.version must be ${ROOT_QUEUES_SCHEMA_VERSION}.`);
+  if (!Array.isArray(value.roots)) throw new Error(`${label}.roots must be an array.`);
+  const ids = new Set<string>();
+  const itemIds = new Set<string>();
+  const roots = value.roots.map((raw, index) => {
+    const itemLabel = `${label}.roots[${index}]`;
+    if (!isRecord(raw)) throw new Error(`${itemLabel} must be an object.`);
+    if (raw.version !== ROOT_QUEUES_SCHEMA_VERSION)
+      throw new Error(`${itemLabel}.version must be ${ROOT_QUEUES_SCHEMA_VERSION}.`);
+    if (typeof raw.rootId !== "string" || !raw.rootId)
+      throw new Error(`${itemLabel}.rootId must be a non-empty string.`);
+    if (ids.has(raw.rootId)) throw new Error(`Duplicate root queue ID: ${raw.rootId}.`);
+    ids.add(raw.rootId);
+    validateControllerRoot(raw.root);
+    if (!Array.isArray(raw.itemIds) || raw.itemIds.some((id) => typeof id !== "string" || !id))
+      throw new Error(`${itemLabel}.itemIds must contain non-empty strings.`);
+    for (const id of raw.itemIds) {
+      if (itemIds.has(id)) throw new Error(`Queue item ${id} has multiple root owners.`);
+      itemIds.add(id);
+    }
+    return raw as unknown as RootQueueRecord;
+  });
+  return { version: ROOT_QUEUES_SCHEMA_VERSION, roots };
+}
+
 async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
   try {
     const parsed = JSON.parse(await readFile(manifestPath(cwd), "utf8")) as {
       version?: unknown;
       workflows?: unknown;
       parentGoal?: ParentGoal;
+      parentGoals?: unknown;
       questionRequests?: ParentQuestionRequest[];
       messageRequests?: MessageRecord[];
       sessionLog?: SessionLogEntry;
+      rootSessionLogs?: unknown;
       goalHistory?: unknown;
       queue?: unknown;
+      rootQueues?: unknown;
+      goalHistoryByRoot?: unknown;
     };
     if (
       (parsed.version === 1 || parsed.version === 2) &&
@@ -603,6 +757,18 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
         ...(parsed.sessionLog ? { sessionLog: parsed.sessionLog } : {}),
         ...(Array.isArray(parsed.goalHistory)
           ? { goalHistory: parsed.goalHistory as GoalHistoryRecord[] }
+          : {}),
+        ...(parsed.parentGoals !== undefined
+          ? { parentGoals: rootGoalStore(parsed.parentGoals) }
+          : {}),
+        ...(parsed.goalHistoryByRoot !== undefined
+          ? { goalHistoryByRoot: rootGoalHistoryStore(parsed.goalHistoryByRoot) }
+          : {}),
+        ...(parsed.rootSessionLogs !== undefined
+          ? { rootSessionLogs: rootSessionLogStore(parsed.rootSessionLogs) }
+          : {}),
+        ...(parsed.rootQueues !== undefined
+          ? { rootQueues: rootQueueStore(parsed.rootQueues) }
           : {}),
         ...(parsed.queue !== undefined
           ? { queue: queueStore(parsed.queue) }
@@ -668,7 +834,7 @@ async function acquireManifestLock(
 // external results first, then pass only the resulting mutation in.
 async function withManifestTransaction<T>(
   cwd: string,
-  mutate: (manifest: Manifest) => T,
+  mutate: (manifest: ManifestWithRootState) => T,
   waitMs = 10_000,
 ): Promise<T> {
   const release = await acquireManifestLock(cwd, waitMs);
@@ -753,8 +919,36 @@ const TERMINAL_WORKFLOW_OUTCOMES = new Set([
   "operator-closed",
 ]);
 
-function nonTerminalWorkflowIds(manifest: ManifestWithGoalHistory): string[] {
+function workflowOwnedByRoot(
+  workflow: Workflow,
+  scope: { rootId: string; root: ControllerRootMapping },
+  cwd?: string,
+): boolean {
+  if (
+    workflow.taskBinding &&
+    workflow.taskBinding.rootPaneId === scope.root.pane_id &&
+    workflow.taskBinding.workspaceId === scope.root.workspace_id
+  )
+    return true;
+  const registration = workflow.eventControllerRegistration;
+  if (
+    registration?.root &&
+    registration.root.pane_id === scope.root.pane_id &&
+    registration.root.workspace_id === scope.root.workspace_id
+  )
+    return true;
+  if (workflow.ownership?.workspaceId)
+    return workflow.ownership.workspaceId === scope.root.workspace_id;
+  return cwd ? legacyRootIdForManifest(cwd) === scope.rootId : true;
+}
+
+function nonTerminalWorkflowIds(
+  manifest: ManifestWithGoalHistory,
+  scope?: { rootId: string; root: ControllerRootMapping },
+  cwd?: string,
+): string[] {
   return manifest.workflows
+    .filter((workflow) => !scope || workflowOwnedByRoot(workflow, scope, cwd))
     .filter((workflow) => {
       const hasStatus = typeof workflow.status === "string";
       const hasOutcome = typeof workflow.outcome === "string";
@@ -831,25 +1025,42 @@ async function parentGoal(
   rootTurn?: RootTurn,
 ): Promise<ParentGoalActionResult> {
   requireRootGoalExecutor();
+  const scope = requireRootManifestExecutor(cwd);
   const release = await acquireManifestLock(cwd);
   try {
     const manifest = await loadManifest(cwd);
-    const history = Array.isArray(manifest.goalHistory)
-      ? manifest.goalHistory
-      : [];
+    const scoped = rootGoalFor(manifest, cwd, scope);
+    const record = scoped.record;
+    const goal = scoped.goal ?? record?.goal;
+    const history = record
+      ? ((manifest.goalHistoryByRoot ??= {})[scope.rootId] ??= record.goalHistory)
+      : Array.isArray(manifest.goalHistory)
+        ? manifest.goalHistory
+        : [];
+    const legacyOwner = legacyRootIdForManifest(cwd) === scope.rootId;
+    const syncLegacyProjection = (value: ParentGoal | undefined): void => {
+      if (legacyOwner && (!record || record.rootId === scope.rootId)) {
+        if (value) manifest.parentGoal = value;
+        else delete manifest.parentGoal;
+      }
+      if (record) {
+        record.root = scope.root;
+        if (value && manifest.parentGoals) {
+          const scopedGoal = value as RootParentGoal;
+          scopedGoal.rootId = scope.rootId;
+          scopedGoal.root = scope.root;
+          manifest.parentGoals[scope.rootId] = scopedGoal;
+        }
+      }
+    };
     if (action === "status") {
-      if (!manifest.parentGoal)
-        throw new Error("No parent goal is registered.");
-      return {
-        goal: manifest.parentGoal,
-        goalHistoryCount: history.length,
-      };
+      if (!goal) throw new Error("No parent goal is registered.");
+      return { goal, goalHistoryCount: history.length };
     }
     if (action === "reset") {
-      const goal = manifest.parentGoal;
       if (!goal)
         throw new Error("No parent goal is registered; initialize one first.");
-      const activeWorkflowIds = nonTerminalWorkflowIds(manifest);
+      const activeWorkflowIds = nonTerminalWorkflowIds(manifest, scope, cwd);
       const normalizedReason = reason?.trim();
       if (activeWorkflowIds.length > 0 && !force)
         throw new Error(
@@ -866,8 +1077,13 @@ async function parentGoal(
         archived.reason = normalizedReason!;
       }
       history.push(archived);
-      manifest.goalHistory = history;
-      delete manifest.parentGoal;
+      if (record) {
+        record.goal = undefined;
+        delete manifest.parentGoals?.[scope.rootId];
+      }
+      if (!record || record.rootId === legacyRootIdForManifest(cwd))
+        manifest.goalHistory = history;
+      syncLegacyProjection(undefined);
       await saveManifest(cwd, manifest);
       return {
         reset: true,
@@ -876,12 +1092,12 @@ async function parentGoal(
       };
     }
     if (action === "initialize") {
-      if (manifest.parentGoal)
+      if (goal)
         throw new Error("A parent goal is already registered; use set-state.");
       if (!objective?.trim())
         throw new Error("objective is required to initialize a parent goal.");
       const timestamp = now();
-      manifest.parentGoal = {
+      const initialized: ParentGoal = {
         version: 1,
         id: `parent-goal-${randomUUID().slice(0, 12)}`,
         objective: objective.trim(),
@@ -903,111 +1119,123 @@ async function parentGoal(
         createdAt: timestamp,
         updatedAt: timestamp,
       };
-    } else {
-      const goal = manifest.parentGoal;
-      if (!goal)
-        throw new Error("No parent goal is registered; initialize one first.");
-      const timestamp = now();
-      const supervisor = () =>
-        (goal.supervisor ??= {
-          version: 1,
-          state: "stopped",
-          intervalSeconds: parentGoalNudgeInterval(undefined),
-          nudgeCount: 0,
-          nextNudgeAt: null,
-          rootActivity: { status: "unknown", observedAt: timestamp },
-          createdAt: timestamp,
-          updatedAt: timestamp,
-        });
-      const previousWork = JSON.stringify([
-        goal.status,
-        goal.objective,
-        goal.nextAction,
-      ]);
-      const previousSupervisorState = goal.supervisor?.state;
-      if (action === "set-state") {
-        if (!status || !PARENT_GOAL_STATUSES.has(status as ParentGoalStatus))
-          throw new Error(
-            `status must be one of: ${[...PARENT_GOAL_STATUSES].join(", ")}.`,
-          );
-        if (status === "paused")
-          throw new Error("Use action=pause with a non-empty pauseReason.");
-        goal.status = status as ParentGoalStatus;
-        if (objective?.trim()) goal.objective = objective.trim();
-        if (nextAction?.trim()) goal.nextAction = nextAction.trim();
-        if (status === "completed" || status === "blocked") {
-          const control = supervisor();
-          control.state = "stopped";
-          control.nextNudgeAt = null;
-          control.updatedAt = timestamp;
-        }
-      } else if (action === "start") {
-        if (goal.status === "completed" || goal.status === "blocked")
-          throw new Error(
-            "A completed or blocked parent goal cannot be started.",
-          );
-        const control = supervisor();
-        control.state = "running";
-        control.intervalSeconds = parentGoalNudgeInterval(
-          nudgeIntervalSeconds ?? control.intervalSeconds,
+      // Retain the original field for a legacy manifest/root. A second root
+      // gets a private record without replacing that compatibility projection.
+      const useLegacyField = !manifest.parentGoals && legacyOwner;
+      if (useLegacyField) manifest.parentGoal = initialized;
+      else {
+        const target = record ?? ensureRootGoalRecord(manifest, cwd, scope);
+        const scopedGoal: RootParentGoal = {
+          ...initialized,
+          rootId: scope.rootId,
+          root: scope.root,
+        };
+        target.root = scope.root;
+        target.goal = scopedGoal;
+        manifest.parentGoals![scope.rootId] = scopedGoal;
+      }
+      syncLegacyProjection(initialized);
+      if (rootTurn && initialized.supervisor)
+        initialized.supervisor.rootTurn = rootTurn;
+      await saveManifest(cwd, manifest);
+      return {
+        goal: initialized,
+        goalHistoryCount: history.length,
+      };
+    }
+    if (!goal)
+      throw new Error("No parent goal is registered; initialize one first.");
+    const timestamp = now();
+    const supervisor = () =>
+      (goal.supervisor ??= {
+        version: 1,
+        state: "stopped",
+        intervalSeconds: parentGoalNudgeInterval(undefined),
+        nudgeCount: 0,
+        nextNudgeAt: null,
+        rootActivity: { status: "unknown", observedAt: timestamp },
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+    const previousWork = JSON.stringify([
+      goal.status,
+      goal.objective,
+      goal.nextAction,
+    ]);
+    const previousSupervisorState = goal.supervisor?.state;
+    if (action === "set-state") {
+      if (!status || !PARENT_GOAL_STATUSES.has(status as ParentGoalStatus))
+        throw new Error(
+          `status must be one of: ${[...PARENT_GOAL_STATUSES].join(", ")}.`,
         );
-        // Repeating start on a running supervisor is not a new wake authorization.
-        if (previousSupervisorState !== "running") {
-          control.nextNudgeAt = new Date(
-            Date.parse(timestamp) + control.intervalSeconds * 1000,
-          ).toISOString();
-          delete control.lastDelivery;
-        }
-        delete control.pauseReason;
-        control.updatedAt = timestamp;
-        if (goal.status === "paused") goal.status = "active";
-        if (nextAction?.trim()) goal.nextAction = nextAction.trim();
-      } else if (action === "stop") {
+      if (status === "paused")
+        throw new Error("Use action=pause with a non-empty pauseReason.");
+      goal.status = status as ParentGoalStatus;
+      if (objective?.trim()) goal.objective = objective.trim();
+      if (nextAction?.trim()) goal.nextAction = nextAction.trim();
+      if (status === "completed" || status === "blocked") {
         const control = supervisor();
         control.state = "stopped";
         control.nextNudgeAt = null;
         control.updatedAt = timestamp;
-      } else if (action === "pause") {
-        if (!pauseReason?.trim())
-          throw new Error("pauseReason is required when action=pause.");
-        const control = supervisor();
-        control.state = "paused";
-        control.pauseReason = pauseReason.trim();
-        control.nextNudgeAt = null;
-        control.updatedAt = timestamp;
-        goal.status = "paused";
       }
-      const control = goal.supervisor;
-      if (
-        control &&
-        previousWork !==
-          JSON.stringify([goal.status, goal.objective, goal.nextAction])
-      ) {
-        // An explicit material work transition can re-arm a delivered wake, but
-        // never silently retry an ambiguous send. Stop/start is the review path.
-        if (
-          control.lastDelivery?.status !== "sending" &&
-          control.lastDelivery?.status !== "uncertain"
-        ) {
-          delete control.lastDelivery;
-          control.nextNudgeAt =
-            goal.status === "active" && control.state === "running"
-              ? new Date(
-                  Date.parse(timestamp) + control.intervalSeconds * 1000,
-                ).toISOString()
-              : null;
-        }
-        control.updatedAt = timestamp;
+    } else if (action === "start") {
+      if (goal.status === "completed" || goal.status === "blocked")
+        throw new Error("A completed or blocked parent goal cannot be started.");
+      const control = supervisor();
+      control.state = "running";
+      control.intervalSeconds = parentGoalNudgeInterval(
+        nudgeIntervalSeconds ?? control.intervalSeconds,
+      );
+      if (previousSupervisorState !== "running") {
+        control.nextNudgeAt = new Date(
+          Date.parse(timestamp) + control.intervalSeconds * 1000,
+        ).toISOString();
+        delete control.lastDelivery;
       }
-      goal.updatedAt = timestamp;
+      delete control.pauseReason;
+      control.updatedAt = timestamp;
+      if (goal.status === "paused") goal.status = "active";
+      if (nextAction?.trim()) goal.nextAction = nextAction.trim();
+    } else if (action === "stop") {
+      const control = supervisor();
+      control.state = "stopped";
+      control.nextNudgeAt = null;
+      control.updatedAt = timestamp;
+    } else if (action === "pause") {
+      if (!pauseReason?.trim())
+        throw new Error("pauseReason is required when action=pause.");
+      const control = supervisor();
+      control.state = "paused";
+      control.pauseReason = pauseReason.trim();
+      control.nextNudgeAt = null;
+      control.updatedAt = timestamp;
+      goal.status = "paused";
     }
-    if (rootTurn && manifest.parentGoal?.supervisor)
-      manifest.parentGoal.supervisor.rootTurn = rootTurn;
+    const control = goal.supervisor;
+    if (
+      control &&
+      previousWork !== JSON.stringify([goal.status, goal.objective, goal.nextAction])
+    ) {
+      if (
+        control.lastDelivery?.status !== "sending" &&
+        control.lastDelivery?.status !== "uncertain"
+      ) {
+        delete control.lastDelivery;
+        control.nextNudgeAt =
+          goal.status === "active" && control.state === "running"
+            ? new Date(
+                Date.parse(timestamp) + control.intervalSeconds * 1000,
+              ).toISOString()
+            : null;
+      }
+      control.updatedAt = timestamp;
+    }
+    goal.updatedAt = timestamp;
+    if (rootTurn && goal.supervisor) goal.supervisor.rootTurn = rootTurn;
+    syncLegacyProjection(goal);
     await saveManifest(cwd, manifest);
-    return {
-      goal: manifest.parentGoal!,
-      goalHistoryCount: history.length,
-    };
+    return { goal, goalHistoryCount: history.length };
   } finally {
     await release();
   }
@@ -1038,7 +1266,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function samePath(left: string, right: string): boolean {
-  return resolve(left) === resolve(right);
+  const leftResolved = resolve(left);
+  const rightResolved = resolve(right);
+  if (leftResolved === rightResolved) return true;
+  try {
+    return realpathSync(leftResolved) === realpathSync(rightResolved);
+  } catch {
+    return false;
+  }
 }
 
 function validateAgentKind(value: unknown, label = "agentKind"): AgentKind {
@@ -1961,9 +2196,26 @@ function rootSessionEntry(
   };
 }
 
-function sessionLogEntries(manifest: Manifest): SessionLogEntry[] {
+function sessionLogEntries(
+  manifest: ManifestWithRootState,
+  rootId?: string,
+): SessionLogEntry[] {
   const entries: SessionLogEntry[] = [];
-  if (manifest.sessionLog) entries.push({ ...manifest.sessionLog });
+  const scopedRoots = rootId
+    ? manifest.rootSessionLogs?.filter((entry) => entry.rootId === rootId) ?? []
+    : manifest.rootSessionLogs ?? [];
+  entries.push(...scopedRoots.map((entry) => ({ ...entry })));
+  if (
+    manifest.sessionLog &&
+    (!rootId || !manifest.rootSessionLogs)
+  ) {
+    const alreadyIncluded = scopedRoots.some(
+      (entry) =>
+        entry.paneId === manifest.sessionLog!.paneId &&
+        entry.workspaceId === manifest.sessionLog!.workspaceId,
+    );
+    if (!alreadyIncluded) entries.push({ ...manifest.sessionLog });
+  }
   for (const workflow of manifest.workflows)
     for (const lane of workflow.lanes)
       if (lane.sessionLog) {
@@ -2143,31 +2395,291 @@ function isRootOrchestrator(): boolean {
   );
 }
 
-function isRootForManifest(cwd: string): boolean {
-  const paneId = process.env[HERDR_PANE_ID_ENV];
-  const workspaceId = process.env.HERDR_WORKSPACE_ID;
-  if (!paneId || !workspaceId) return false;
+type CurrentRootScope = {
+  rootId: string;
+  root: ControllerRootMapping;
+  orchestrator: ControllerOrchestrator;
+};
+
+function rootOwnsManifest(record: ControllerOrchestrator, cwd: string): boolean {
   const target = resolve(cwd);
   return (
-    readControllerConfigForCurrentPane()?.orchestrators.some(
-      (record) =>
-        record.root.pane_id === paneId &&
-        record.root.workspace_id === workspaceId &&
-        (record.program.id === "legacy-global" ||
-          resolve(record.program.id) === target ||
-          (record.program.parent_manifest_path &&
-            resolve(record.program.parent_manifest_path) ===
-              resolve(manifestPath(cwd)))),
-    ) ?? false
+    record.program.id === "legacy-global" ||
+    samePath(record.program.id, target) ||
+    (record.program.parent_manifest_path !== undefined &&
+      samePath(record.program.parent_manifest_path, manifestPath(cwd)))
   );
 }
 
-function requireRootManifestExecutor(cwd: string): void {
+function currentRootScope(cwd: string): CurrentRootScope | undefined {
+  const paneId = process.env[HERDR_PANE_ID_ENV];
+  const workspaceId = process.env.HERDR_WORKSPACE_ID;
+  if (!paneId || !workspaceId) return undefined;
+  const record = readControllerConfigForCurrentPane()?.orchestrators.find(
+    (candidate) =>
+      candidate.root.pane_id === paneId &&
+      candidate.root.workspace_id === workspaceId &&
+      rootOwnsManifest(candidate, cwd),
+  );
+  return record
+    ? { rootId: record.id, root: record.root, orchestrator: record }
+    : undefined;
+}
+
+function isRootForManifest(cwd: string): boolean {
+  return currentRootScope(cwd) !== undefined;
+}
+
+function manifestRootCandidates(cwd: string): ControllerOrchestrator[] {
+  return (
+    readControllerConfigForCurrentPane()?.orchestrators.filter((record) =>
+      rootOwnsManifest(record, cwd),
+    ) ?? []
+  );
+}
+
+function legacyRootIdForManifest(cwd: string): string | undefined {
+  const candidates = manifestRootCandidates(cwd);
+  const session = readManifestRootSession(cwd);
+  if (session) {
+    const match = candidates.find(
+      (record) =>
+        record.root.pane_id === session.paneId &&
+        record.root.workspace_id === session.workspaceId,
+    );
+    if (match) return match.id;
+  }
+  return candidates[0]?.id;
+}
+
+function readManifestRootSession(cwd: string): SessionLogEntry | undefined {
+  try {
+    const parsed = JSON.parse(
+      readFileSync(manifestPath(cwd), "utf8"),
+    ) as { sessionLog?: unknown };
+    return isRecord(parsed.sessionLog) && parsed.sessionLog.kind === "root"
+      ? (parsed.sessionLog as unknown as SessionLogEntry)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function rootSessionLogFor(
+  manifest: ManifestWithRootState,
+  rootId: string,
+): RootSessionLogEntry | undefined {
+  return manifest.rootSessionLogs?.find((entry) => entry.rootId === rootId);
+}
+
+function ensureRootGoalStore(
+  manifest: ManifestWithRootState,
+  cwd: string,
+): RootGoalStore {
+  if (!manifest.parentGoals) manifest.parentGoals = {};
+  const ownerId = legacyRootIdForManifest(cwd);
+  const owner = ownerId
+    ? manifestRootCandidates(cwd).find((record) => record.id === ownerId)
+    : undefined;
+  if (ownerId && manifest.parentGoal && !manifest.parentGoals[ownerId]) {
+    manifest.parentGoals[ownerId] = {
+      ...JSON.parse(JSON.stringify(manifest.parentGoal)),
+      rootId: ownerId,
+      root: owner?.root,
+    } as RootParentGoal;
+    if (Array.isArray(manifest.goalHistory))
+      (manifest.goalHistoryByRoot ??= {})[ownerId] = JSON.parse(
+        JSON.stringify(manifest.goalHistory),
+      ) as GoalHistoryRecord[];
+  }
+  return manifest.parentGoals;
+}
+
+function rootGoalRecordFor(
+  manifest: ManifestWithRootState,
+  cwd: string,
+  scope: CurrentRootScope,
+  create = false,
+): RootGoalRecord | undefined {
+  const store = create
+    ? ensureRootGoalStore(manifest, cwd)
+    : manifest.parentGoals;
+  const goal = store?.[scope.rootId];
+  if (!goal) return undefined;
+  return {
+    rootId: scope.rootId,
+    root: goal.root ?? scope.root,
+    goal,
+    goalHistory: manifest.goalHistoryByRoot?.[scope.rootId] ?? [],
+  };
+}
+
+function ensureRootGoalRecord(
+  manifest: ManifestWithRootState,
+  cwd: string,
+  scope: CurrentRootScope,
+): RootGoalRecord {
+  const existing = rootGoalRecordFor(manifest, cwd, scope, true);
+  if (existing) return existing;
+  if (!manifest.goalHistoryByRoot) manifest.goalHistoryByRoot = {};
+  const goalHistory = (manifest.goalHistoryByRoot[scope.rootId] ??= []);
+  return {
+    rootId: scope.rootId,
+    root: scope.root,
+    goalHistory,
+  };
+}
+
+function rootGoalFor(
+  manifest: ManifestWithRootState,
+  cwd: string,
+  scope: CurrentRootScope,
+): { goal?: ParentGoal; record?: RootGoalRecord; legacy: boolean } {
+  const record = rootGoalRecordFor(manifest, cwd, scope);
+  if (record) return { goal: record.goal, record, legacy: false };
+  const legacyOwnerId = legacyRootIdForManifest(cwd);
+  if (manifest.parentGoal && legacyOwnerId === scope.rootId)
+    return { goal: manifest.parentGoal, legacy: true };
+  return { legacy: false };
+}
+
+function rootSessionEntryFor(
+  manifest: ManifestWithRootState,
+  cwd: string,
+  scope: CurrentRootScope,
+  agent: unknown,
+  startedAt: string,
+  lastResponseAt?: string,
+  forceScoped = false,
+): RootSessionLogEntry {
+  const priorScoped = rootSessionLogFor(manifest, scope.rootId);
+  const legacyOwner = legacyRootIdForManifest(cwd) === scope.rootId;
+  const prior = priorScoped ?? (legacyOwner ? manifest.sessionLog : undefined);
+  const entry: RootSessionLogEntry = {
+    ...rootSessionEntry(scope.root, agent, prior, startedAt, lastResponseAt),
+    rootId: scope.rootId,
+    root: scope.root,
+  };
+  const useScoped = forceScoped || Boolean(manifest.rootSessionLogs) || Boolean(manifest.parentGoals);
+  if (useScoped) {
+    const entries = (manifest.rootSessionLogs ??= []);
+    const legacyOwnerId = legacyRootIdForManifest(cwd);
+    const legacyOwner = legacyOwnerId
+      ? manifestRootCandidates(cwd).find((candidate) => candidate.id === legacyOwnerId)
+      : undefined;
+    if (
+      legacyOwnerId &&
+      manifest.sessionLog &&
+      !entries.some((candidate) => candidate.rootId === legacyOwnerId)
+    )
+      entries.push({
+        ...manifest.sessionLog,
+        rootId: legacyOwnerId,
+        root: legacyOwner?.root ?? scope.root,
+      });
+    const index = entries.findIndex((candidate) => candidate.rootId === scope.rootId);
+    if (index === -1) entries.push(entry);
+    else entries[index] = entry;
+  }
+  // Keep the original single-root field as a compatibility projection. The
+  // controller still consumes it, and it always belongs to the first root
+  // that owned a legacy manifest.
+  if (
+    legacyOwner &&
+    (!useScoped || scope.rootId === legacyRootIdForManifest(cwd))
+  ) {
+    const { rootId: _rootId, root: _root, ...legacyEntry } = entry;
+    manifest.sessionLog = legacyEntry;
+  }
+  return entry;
+}
+
+function rootQueueRecordFor(
+  manifest: ManifestWithRootState,
+  rootId: string,
+): RootQueueRecord | undefined {
+  return manifest.rootQueues?.roots.find((record) => record.rootId === rootId);
+}
+
+function ensureRootQueueRecord(
+  manifest: ManifestWithRootState,
+  cwd: string,
+  scope: CurrentRootScope,
+): RootQueueRecord {
+  const store = ensureRootQueueStore(manifest, cwd);
+  const existing = store.roots.find((record) => record.rootId === scope.rootId);
+  if (existing) {
+    existing.root = scope.root;
+    return existing;
+  }
+  const record: RootQueueRecord = {
+    version: ROOT_QUEUES_SCHEMA_VERSION,
+    rootId: scope.rootId,
+    root: scope.root,
+    itemIds: [],
+  };
+  store.roots.push(record);
+  return record;
+}
+
+function ensureRootQueueStore(
+  manifest: ManifestWithRootState,
+  cwd: string,
+): RootQueueStore {
+  if (!manifest.rootQueues)
+    manifest.rootQueues = { version: ROOT_QUEUES_SCHEMA_VERSION, roots: [] };
+  const ownerId = legacyRootIdForManifest(cwd);
+  const owner = ownerId
+    ? manifestRootCandidates(cwd).find((record) => record.id === ownerId)
+    : undefined;
+  if (ownerId && !rootQueueRecordFor(manifest, ownerId))
+    manifest.rootQueues.roots.push({
+      version: ROOT_QUEUES_SCHEMA_VERSION,
+      rootId: ownerId,
+      root: owner?.root ?? {
+        target: ownerId,
+        target_kind: "pane_id",
+        pane_id: ownerId,
+        workspace_id: "legacy",
+      },
+      itemIds: manifest.queue?.items.map((item) => item.id) ?? [],
+    });
+  return manifest.rootQueues;
+}
+
+function queueItemIdsForRoot(
+  manifest: ManifestWithRootState,
+  cwd: string,
+  scope: CurrentRootScope,
+): Set<string> {
+  const record = rootQueueRecordFor(manifest, scope.rootId);
+  if (record) return new Set(record.itemIds);
+  // A legacy queue has no ownership metadata and is entirely owned by the
+  // originally registered root until a second root writes to it.
+  return legacyRootIdForManifest(cwd) === scope.rootId
+    ? new Set(manifest.queue?.items.map((item) => item.id) ?? [])
+    : new Set();
+}
+
+function queueViewForRoot(
+  manifest: ManifestWithQueue,
+  cwd: string,
+  scope: CurrentRootScope | undefined,
+): QueueStore | undefined {
+  const queue = queueForManifest(manifest);
+  if (!queue || !scope) return queue;
+  const ids = queueItemIdsForRoot(manifest, cwd, scope);
+  return { ...queue, items: queue.items.filter((item) => ids.has(item.id)) };
+}
+
+function requireRootManifestExecutor(cwd: string): CurrentRootScope {
   requireRootGoalExecutor();
-  if (!isRootForManifest(cwd))
+  const scope = currentRootScope(cwd);
+  if (!scope)
     throw new Error(
       "The verified controller-mapped root does not own this queue manifest.",
     );
+  return scope;
 }
 
 function isRegisteredChildLane(): boolean {
@@ -2898,9 +3410,15 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const manifestHasState = (manifest: ManifestWithQueue): boolean =>
       manifest.workflows.length > 0 ||
       manifest.parentGoal !== undefined ||
+      (manifest.parentGoals ? Object.keys(manifest.parentGoals).length : 0) > 0 ||
+      (manifest.goalHistoryByRoot
+        ? Object.keys(manifest.goalHistoryByRoot).length
+        : 0) > 0 ||
       (manifest.questionRequests?.length ?? 0) > 0 ||
       (manifest.messageRequests?.length ?? 0) > 0 ||
-      (manifest.queue?.items.length ?? 0) > 0;
+      (manifest.queue?.items.length ?? 0) > 0 ||
+      (manifest.rootQueues?.roots.length ?? 0) > 0 ||
+      (manifest.rootSessionLogs?.length ?? 0) > 0;
     const existingManifest = await loadManifest(cwd);
     const manifestHasLegacyState = manifestHasState(existingManifest);
     if (
@@ -2952,11 +3470,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     // access stays on the transactional async path.
     const readManifestForLabel = (
       labelCwd: string,
-    ): { parentGoal?: { objective?: string } } | undefined => {
+    ): {
+      parentGoal?: { objective?: string };
+      parentGoals?: Record<string, { objective?: string; goal?: { objective?: string } }>;
+    } | undefined => {
       try {
         return JSON.parse(
           readFileSync(manifestPath(labelCwd), "utf8"),
-        ) as { parentGoal?: { objective?: string } };
+        ) as {
+          parentGoal?: { objective?: string };
+          parentGoals?: Record<string, { objective?: string; goal?: { objective?: string } }>;
+        };
       } catch {
         return undefined;
       }
@@ -2969,9 +3493,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const handle = `${kind}\u00b7${root.workspace_id}`;
       try {
         const manifest = readManifestForLabel(cwd);
-        const slug = manifest?.parentGoal?.objective
-          ? laneSlug(manifest.parentGoal.objective)
-          : "";
+        const rootGoal =
+          manifest?.parentGoals?.[current?.id ?? controllerRecordId(root, cwd)];
+        const objective = rootGoal?.goal?.objective ??
+          rootGoal?.objective ??
+          (current && manifest?.parentGoal?.objective
+            ? manifest.parentGoal.objective
+            : undefined);
+        const slug = objective ? laneSlug(objective) : "";
         return slug ? `\ud83d\udc15 ${handle} \u00b7 ${slug}` : `\ud83d\udc15 ${handle}`;
       } catch {
         return `\ud83d\udc15 ${handle}`;
@@ -3005,6 +3534,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const persistRootTabId = async (): Promise<void> => {
       if (!rootTabId) return;
       await withManifestTransaction(cwd, (manifest) => {
+        const rootId = current?.id ?? controllerRecordId(root, cwd);
+        const entry = manifest.rootSessionLogs?.find(
+          (candidate) => candidate.rootId === rootId,
+        );
+        if (entry) entry.tabId = rootTabId;
         if (
           manifest.sessionLog?.kind === "root" &&
           manifest.sessionLog.paneId === root.pane_id &&
@@ -3017,14 +3551,22 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     if (current && !reset) {
       await withManifestTransaction(cwd, (manifest) => {
         const stamp = now();
+        const scope: CurrentRootScope = {
+          rootId: current.id,
+          root: current.root,
+          orchestrator: current,
+        };
+        const goal = rootGoalFor(manifest, cwd, scope).goal;
         const priorActivity =
-          manifest.parentGoal?.supervisor?.rootTurn?.updatedAt ??
-          manifest.parentGoal?.supervisor?.rootActivity?.observedAt;
-        manifest.sessionLog = rootSessionEntry(
-          root,
+          goal?.supervisor?.rootTurn?.updatedAt ??
+          goal?.supervisor?.rootActivity?.observedAt;
+        rootSessionEntryFor(
+          manifest,
+          cwd,
+          scope,
           rootAgent,
-          manifest.sessionLog,
-          manifest.sessionLog?.startedAt ?? stamp,
+          manifest.rootSessionLogs?.find((entry) => entry.rootId === current.id)
+            ?.startedAt ?? manifest.sessionLog?.startedAt ?? stamp,
           laterTimestamp(priorActivity, stamp),
         );
         return manifest;
@@ -3051,10 +3593,6 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         `Cannot add root in workspace ${root.workspace_id}: orchestrator ${conflictingWorkspaceRoot.id} already uses this workspace with root pane ${conflictingWorkspaceRoot.root.pane_id}. Add mode requires both a distinct pane and a distinct workspace; use reset=true only to replace existing mappings.`,
       );
     }
-    if (add && manifestHasLegacyState)
-      throw new Error(
-        `Cannot add root for ${resolvedCwd}: its parent manifest has existing state. Add mode never resets or replaces this cwd's manifest; use reset=true only for the legacy no-add replacement flow.`,
-      );
     if (
       !add &&
       ((config && config.orchestrators.length > 0) || manifestHasLegacyState)
@@ -3112,10 +3650,6 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             throw new Error(
               `Cannot add root in workspace ${root.workspace_id}: orchestrator ${latestWorkspaceConflict.id} already uses this workspace with root pane ${latestWorkspaceConflict.root.pane_id}. Add mode requires both a distinct pane and a distinct workspace; use reset=true only to replace existing mappings.`,
             );
-          if (add && manifestHasState(latestManifest))
-            throw new Error(
-              `Cannot add root for ${resolvedCwd}: its parent manifest has existing state. Add mode never resets or replaces this cwd's manifest; use reset=true only for the legacy no-add replacement flow.`,
-            );
           if (
             !add &&
             ((latestConfig && latestConfig.orchestrators.length > 0) ||
@@ -3126,16 +3660,46 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               "Controller config or parent manifest has existing state. Review it, then call herdr_bootstrap_root with reset=true to retire it before claiming this manually started root.",
             );
           const bootstrapStamp = now();
-          const priorActivity =
-            latestManifest.parentGoal?.supervisor?.rootTurn?.updatedAt ??
-            latestManifest.parentGoal?.supervisor?.rootActivity?.observedAt;
-          const refreshedRootSession = rootSessionEntry(
+          const rootScope: CurrentRootScope = {
+            rootId: next.id,
             root,
-            rootAgent,
-            latestManifest.sessionLog,
-            latestManifest.sessionLog?.startedAt ?? bootstrapStamp,
-            laterTimestamp(priorActivity, bootstrapStamp),
-          );
+            orchestrator: next,
+          };
+          const goal = rootGoalFor(latestManifest, cwd, rootScope).goal;
+          const priorActivity =
+            goal?.supervisor?.rootTurn?.updatedAt ??
+            goal?.supervisor?.rootActivity?.observedAt;
+          const sameCwdRootCount =
+            latestConfig?.orchestrators.filter((candidate) =>
+              rootOwnsManifest(candidate, cwd),
+            ).length ?? 0;
+          const useScopedSession =
+            add &&
+            (manifestHasState(latestManifest) || sameCwdRootCount > 0);
+          let refreshedRootSession: SessionLogEntry;
+          if (reset)
+            refreshedRootSession = rootSessionEntry(
+              root,
+              rootAgent,
+              latestManifest.sessionLog,
+              latestManifest.sessionLog?.startedAt ?? bootstrapStamp,
+              laterTimestamp(priorActivity, bootstrapStamp),
+            );
+          else {
+            const scoped = rootSessionEntryFor(
+              latestManifest,
+              cwd,
+              rootScope,
+              rootAgent,
+              latestManifest.rootSessionLogs?.find(
+                (entry) => entry.rootId === next.id,
+              )?.startedAt ?? latestManifest.sessionLog?.startedAt ?? bootstrapStamp,
+              laterTimestamp(priorActivity, bootstrapStamp),
+              useScopedSession,
+            );
+            const { rootId: _rootId, root: _root, ...legacySession } = scoped;
+            refreshedRootSession = legacySession;
+          }
           // Preserve compatibility with a destructive reset of a legacy
           // manifest that never had a root session trace. A reset with an
           // existing trace, or a genuinely fresh reset, records the root;
@@ -3148,6 +3712,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               workflows: [],
               ...(persistResetSession ? { sessionLog: refreshedRootSession } : {}),
             });
+          else if (add && useScopedSession)
+            // A co-root gets a durable root-owned trace while every existing
+            // workflow, goal, queue, and legacy projection remains intact.
+            await saveManifest(cwd, latestManifest);
           else if (add && !manifestHasState(latestManifest))
             // A new root owns a private manifest even before its first goal or
             // workflow is created; never rewrite a manifest containing state.
@@ -3161,10 +3729,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               sessionLog: refreshedRootSession,
             });
           else if (current && !reset)
-            await saveManifest(cwd, {
-              ...latestManifest,
-              sessionLog: refreshedRootSession,
-            });
+            await saveManifest(cwd, latestManifest);
           await saveControllerConfig(
             configPath,
             reset || !latestConfig
@@ -3184,14 +3749,31 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     if (alreadyRegisteredAfterLock) {
       await withManifestTransaction(cwd, (manifest) => {
         const stamp = now();
-        const priorActivity =
-          manifest.parentGoal?.supervisor?.rootTurn?.updatedAt ??
-          manifest.parentGoal?.supervisor?.rootActivity?.observedAt;
-        manifest.sessionLog = rootSessionEntry(
+        const scope: CurrentRootScope = {
+          rootId: controllerRecordId(root, cwd),
           root,
+          orchestrator: {
+            id: controllerRecordId(root, cwd),
+            root,
+            program: {
+              id: resolvedCwd,
+              workspace_id: root.workspace_id,
+              parent_manifest_path: resolve(manifestPath(cwd)),
+            },
+            workflows: [],
+          },
+        };
+        const goal = rootGoalFor(manifest, cwd, scope).goal;
+        const priorActivity =
+          goal?.supervisor?.rootTurn?.updatedAt ??
+          goal?.supervisor?.rootActivity?.observedAt;
+        rootSessionEntryFor(
+          manifest,
+          cwd,
+          scope,
           rootAgent,
-          manifest.sessionLog,
-          manifest.sessionLog?.startedAt ?? stamp,
+          manifest.rootSessionLogs?.find((entry) => entry.rootId === scope.rootId)
+            ?.startedAt ?? manifest.sessionLog?.startedAt ?? stamp,
           laterTimestamp(priorActivity, stamp),
         );
         return manifest;
@@ -3649,7 +4231,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       reason?: string;
     },
   ): Promise<unknown> {
-    requireRootManifestExecutor(cwd);
+    const rootScope = requireRootManifestExecutor(cwd);
     if (action === "enqueue") {
       const objective = input.objective?.trim();
       if (!objective) throw new Error("objective is required to enqueue a queue item.");
@@ -3666,18 +4248,29 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       try {
         const manifest = await loadManifest(cwd);
         const queue = queueForManifest(manifest, true)!;
+        const useRootQueues =
+          Boolean(manifest.rootQueues) || manifestRootCandidates(cwd).length > 1;
+        const owned = useRootQueues
+          ? ensureRootQueueRecord(manifest, cwd, rootScope)
+          : undefined;
+        const visibleIds = owned
+          ? new Set(owned.itemIds)
+          : new Set(queue.items.map((item) => item.id));
         const timestamp = now();
         const objectiveHash = createHash("sha256").update(objective).digest("hex");
         const duplicate = queue.items.find(
           (item) =>
+            visibleIds.has(item.id) &&
             createHash("sha256").update(item.objective).digest("hex") === objectiveHash &&
             Date.parse(timestamp) - Date.parse(item.createdAt) <= QUEUE_DEDUPE_WINDOW_MS &&
             Date.parse(timestamp) >= Date.parse(item.createdAt),
         );
-        if (duplicate)
+        if (duplicate) {
+          if (owned) await saveManifest(cwd, manifest);
           return { queueItem: duplicate, deduplicated: true, queue };
+        }
         for (const dependency of after)
-          if (!queue.items.some((item) => item.id === dependency))
+          if (!visibleIds.has(dependency))
             throw new Error(`Queue item after dependency is unknown: ${dependency}.`);
         const item: QueueItem = {
           version: QUEUE_SCHEMA_VERSION,
@@ -3691,6 +4284,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           updatedAt: timestamp,
         };
         queue.items.push(item);
+        if (owned) owned.itemIds.push(item.id);
         await saveManifest(cwd, manifest);
         return { queueItem: item, deduplicated: false, queue };
       } finally {
@@ -3711,7 +4305,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const manifest = await loadManifest(cwd);
         const queue = queueForManifest(manifest);
         if (!queue) throw new Error("No queue is registered.");
-        const item = queue.items.find((candidate) => candidate.id === id);
+        const useRootQueues =
+          Boolean(manifest.rootQueues) || manifestRootCandidates(cwd).length > 1;
+        const owned = useRootQueues
+          ? ensureRootQueueRecord(manifest, cwd, rootScope)
+          : undefined;
+        const visibleIds = owned
+          ? new Set(owned.itemIds)
+          : new Set(queue.items.map((item) => item.id));
+        const item = queue.items.find(
+          (candidate) => candidate.id === id && visibleIds.has(candidate.id),
+        );
         if (!item) throw new Error(`Unknown queue item: ${id}.`);
         const allowed: Record<QueueItemState, QueueItemState[]> = {
           pending: ["verified", "dropped"],
@@ -3739,11 +4343,16 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       version: QUEUE_SCHEMA_VERSION,
       items: [],
     };
-    const readiness = queueHead(manifest, cwd);
+    const visibleIds = queueItemIdsForRoot(manifest, cwd, rootScope);
+    const visibleItems = queue.items.filter((item) => visibleIds.has(item.id));
+    const readiness = queueHead(manifest, cwd, visibleIds);
     const blockersByItem = Object.fromEntries(
-      queue.items
+      visibleItems
         .filter((item) => item.state === "pending")
-        .map((item) => [item.id, queueReadiness(manifest, item, cwd).blockers]),
+        .map((item) => [
+          item.id,
+          queueReadiness(manifest, item, cwd, visibleIds).blockers,
+        ]),
     );
     if (action === "dequeue")
       return {
@@ -3756,7 +4365,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         queue,
       };
     return {
-      items: queue.items,
+      items: visibleItems,
       queue,
       head: readiness.item,
       blockers: readiness.blockers,
@@ -3776,16 +4385,25 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   ): Promise<Workflow> {
     let objective = objectiveInput?.trim() ?? "";
     let linkedQueueItem: QueueItem | undefined;
+    let rootScope: CurrentRootScope | undefined;
     if (queueItemId) {
-      requireRootManifestExecutor(cwd);
+      rootScope = requireRootManifestExecutor(cwd);
       const manifest = await loadManifest(cwd);
       const queue = queueForManifest(manifest);
       if (!queue) throw new Error("No queue is registered.");
-      linkedQueueItem = queue.items.find((item) => item.id === queueItemId);
+      const visibleIds = queueItemIdsForRoot(manifest, cwd, rootScope);
+      linkedQueueItem = queue.items.find(
+        (item) => item.id === queueItemId && visibleIds.has(item.id),
+      );
       if (!linkedQueueItem) throw new Error(`Unknown queue item: ${queueItemId}.`);
       if (linkedQueueItem.state !== "pending")
         throw new Error(`Queue item ${queueItemId} is ${linkedQueueItem.state}, not pending.`);
-      const readiness = queueReadiness(manifest, linkedQueueItem, cwd);
+      const readiness = queueReadiness(
+        manifest,
+        linkedQueueItem,
+        cwd,
+        visibleIds,
+      );
       if (readiness.blockers.dependencies.length || readiness.blockers.files.length)
         throw new Error(
           `Queue item ${queueItemId} is blocked: ${queueBlockerText(readiness.blockers)}.`,
@@ -3828,6 +4446,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       : undefined;
     requireRootGoalExecutor();
     const root = await currentPaneRoot();
+    rootScope ??= currentRootScope(cwd);
+    if (!rootScope)
+      throw new Error("The verified controller-mapped root does not own this workflow manifest.");
     const rootAgent = responseRecord(
       await runHerdr(["agent", "get", root.pane_id]),
       "task root",
@@ -3908,11 +4529,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const manifest = await loadManifest(cwd);
       if (linkedQueueItem) {
         const queue = queueForManifest(manifest);
-        const item = queue?.items.find((candidate) => candidate.id === linkedQueueItem!.id);
+        const visibleIds = queue
+          ? queueItemIdsForRoot(manifest, cwd, rootScope!)
+          : new Set<string>();
+        const item = queue?.items.find(
+          (candidate) =>
+            candidate.id === linkedQueueItem!.id && visibleIds.has(candidate.id),
+        );
         if (!item) throw new Error(`Queue item ${linkedQueueItem.id} disappeared before planning.`);
         if (item.state !== "pending")
           throw new Error(`Queue item ${item.id} is ${item.state}, not pending.`);
-        const readiness = queueReadiness(manifest, item, cwd);
+        const readiness = queueReadiness(manifest, item, cwd, visibleIds);
         if (readiness.blockers.dependencies.length || readiness.blockers.files.length)
           throw new Error(
             `Queue item ${item.id} became blocked: ${queueBlockerText(readiness.blockers)}.`,
@@ -4310,7 +4937,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       messages,
       // This is scoped to the manifest owned by the current root. It includes
       // the root trace plus every workflow lane, including retired lanes.
-      sessionLog: sessionLogEntries(currentManifest),
+      sessionLog: sessionLogEntries(
+        currentManifest,
+        currentRootScope(cwd)?.rootId,
+      ),
     };
   }
 
@@ -6069,9 +6699,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           status: "warn",
           detail: `Unrecognized manifest version ${manifest.version} at ${manifestPath(cwd)}; expected 2.`,
         };
+      const scope = currentRootScope(cwd);
+      const goal = scope ? rootGoalFor(manifest, cwd, scope).goal : manifest.parentGoal;
       return {
         status: "ok",
-        detail: `Version 2 manifest at ${manifestPath(cwd)}: ${manifest.workflows.length} workflow(s), parent goal ${manifest.parentGoal ? "present" : "absent"}.`,
+        detail: `Version 2 manifest at ${manifestPath(cwd)}: ${manifest.workflows.length} workflow(s), parent goal ${goal ? "present" : "absent"}.`,
       };
     });
 
@@ -6242,7 +6874,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       if (turn.runId !== rootRunId || (state === "idle" && !ctx.isIdle()))
         return;
       const manifest = await loadManifest(ctx.cwd);
-      const control = manifest.parentGoal?.supervisor;
+      const scope: CurrentRootScope = {
+        rootId: mappedRoot.id,
+        root: mappedRoot.root,
+        orchestrator: mappedRoot,
+      };
+      const goal = rootGoalFor(manifest, ctx.cwd, scope).goal;
+      const control = goal?.supervisor;
       if (
         state === "idle" &&
         control &&
@@ -6258,11 +6896,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           ? { agent_session: { kind: "path" as const, value: sessionPath } }
           : {}),
       };
-      manifest.sessionLog = rootSessionEntry(
-        mappedRoot.root,
+      rootSessionEntryFor(
+        manifest,
+        ctx.cwd,
+        scope,
         sessionAgent,
-        manifest.sessionLog,
-        manifest.sessionLog?.startedAt ?? turn.updatedAt,
+        manifest.rootSessionLogs?.find((entry) => entry.rootId === scope.rootId)
+          ?.startedAt ?? manifest.sessionLog?.startedAt ?? turn.updatedAt,
         turn.updatedAt,
       );
       if (!control) {
@@ -6369,8 +7009,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     await attemptActivationAck(ctx);
     if (!ctx.hasUI) return;
     const manifest = await loadManifest(ctx.cwd);
-    if (manifest.parentGoal)
-      await publishParentGoalSidebar(manifest.parentGoal, ctx.signal, manifest.queue);
+    const scope = currentRootScope(ctx.cwd);
+    const goal = scope ? rootGoalFor(manifest, ctx.cwd, scope).goal : manifest.parentGoal;
+    if (goal)
+      await publishParentGoalSidebar(
+        goal,
+        ctx.signal,
+        queueViewForRoot(manifest, ctx.cwd, scope),
+      );
     else await clearParentGoalSidebar(ctx.signal);
   });
 
@@ -6557,7 +7203,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       }
       if (ctx.hasUI) {
         const manifest = await loadManifest(ctx.cwd);
-        await publishParentGoalSidebar(result.goal, signal, manifest.queue);
+        await publishParentGoalSidebar(
+          result.goal,
+          signal,
+          queueViewForRoot(manifest, ctx.cwd, currentRootScope(ctx.cwd)),
+        );
       }
 
       return {
@@ -6786,11 +7436,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const result = await queueOperation(ctx.cwd, params.action, params);
       if (ctx.hasUI) {
         const manifest = await loadManifest(ctx.cwd);
-        if (manifest.parentGoal)
+        const goal = currentRootScope(ctx.cwd)
+          ? rootGoalFor(manifest, ctx.cwd, currentRootScope(ctx.cwd)!).goal
+          : manifest.parentGoal;
+        if (goal)
           await publishParentGoalSidebar(
-            manifest.parentGoal,
+            goal,
             _signal,
-            manifest.queue,
+            queueViewForRoot(manifest, ctx.cwd, currentRootScope(ctx.cwd)),
           );
       }
       const details = result as {

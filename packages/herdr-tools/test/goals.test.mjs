@@ -146,6 +146,28 @@ test("parent goal reset archives and clears the active record so a new round ini
   }
 });
 
+test("legacy single parent-goal manifests remain unchanged and root-scoped", async () => {
+  const fixture = await parentGoalFixture();
+  try {
+    const before = JSON.parse(await readFile(fixture.manifestPath, "utf8"));
+    const status = await fixture.tools.get("herdr_goal").execute(
+      "legacy-status",
+      { action: "status" },
+      undefined,
+      undefined,
+      fixture.ctx,
+    );
+    assert.equal(status.details.goal.id, before.parentGoal.id);
+    assert.equal(status.details.goal.objective, before.parentGoal.objective);
+    assert.deepEqual(
+      JSON.parse(await readFile(fixture.manifestPath, "utf8")),
+      before,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("parent goal reset refuses active workflows unless force records a reason", async () => {
   const fixture = await parentGoalFixture({ workflowStatus: "running", workflowOutcome: "running" });
   try {
