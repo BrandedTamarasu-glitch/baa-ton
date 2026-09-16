@@ -1441,12 +1441,13 @@ function newStallRecord({
   };
 }
 
-function detectStalledLanes({
+async function detectStalledLanes({
   manifest,
   workflows,
   orchestrator,
   manifestPath,
   timestamp,
+  herdr,
 }) {
   const timestampMs = Date.parse(timestamp);
   if (!Number.isFinite(timestampMs)) return false;
@@ -1483,15 +1484,47 @@ function detectStalledLanes({
         transition,
       );
       if (events.some((record) => record.identity === identity)) continue;
-      events.push(
-        newStallRecord({
-          mapping,
-          transition,
-          identity,
-          elapsedMs: timestampMs - transitionMs,
-          timestamp,
-        }),
-      );
+      const stallRecord = newStallRecord({
+        mapping,
+        transition,
+        identity,
+        elapsedMs: timestampMs - transitionMs,
+        timestamp,
+      });
+      events.push(stallRecord);
+      // Goal nudge: the same continuation mechanism the root gets from its
+      // parent goal, directed at the stalled lane's own pane. One nudge per
+      // stale period (this record's identity already dedupes); delivery
+      // outcome is recorded on the stall record, never thrown — the stall
+      // signal itself remains the durable wake for the root.
+      const laneObjective =
+        Array.isArray(workflow.lanes) &&
+        workflow.lanes.some(
+          (stored) => isRecord(stored) && stored.id === lane.lane_id,
+        )
+          ? workflow.lanes.find(
+              (stored) => isRecord(stored) && stored.id === lane.lane_id,
+            ).objective
+          : workflow.objective;
+      try {
+        await herdr.request("agent.prompt", {
+          target: mapping.lane.target,
+          text: `Your lane has shown no status transition for ${Math.round(
+            (timestampMs - transitionMs) / 60_000,
+          )} minutes; you may be stalled. Continue your assigned work now (objective: ${laneObjective}). If you are blocked, say so and route it via herdr_message or a parent question; when the work is verified, file your herdr_complete receipt. Do not start anything new.`,
+        });
+        stallRecord.nudge = {
+          status: "delivered",
+          at: timestamp,
+        };
+      } catch (error) {
+        stallRecord.nudge = {
+          status: "uncertain",
+          at: timestamp,
+          reason:
+            error instanceof Error ? error.message : String(error),
+        };
+      }
       signalParentGoal(manifest, events.at(-1), timestamp);
       changed = true;
     }
@@ -2350,12 +2383,13 @@ export async function runSupervisorTick({
       // Wall-clock stall detection is sampled here, alongside the existing
       // event-driven pending-wake reconciliation. It compares only durable
       // lane transition timestamps; it never polls a child agent.
-      const stallsChanged = detectStalledLanes({
+      const stallsChanged = await detectStalledLanes({
         manifest,
         workflows,
         orchestrator,
         manifestPath,
         timestamp,
+        herdr: api,
       });
       if (stallsChanged) {
         await atomicWriteJson(manifestPath, manifest);

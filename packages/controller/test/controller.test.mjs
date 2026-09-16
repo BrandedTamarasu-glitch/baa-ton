@@ -301,12 +301,19 @@ async function seedWorkingTransition(fixture, receivedAt, child = CHILD) {
   return transition;
 }
 
-function rootWakeApi(prompts, roots = new Map([[ROOT.target, ROOT]])) {
+function rootWakeApi(
+  prompts,
+  roots = new Map([[ROOT.target, ROOT]]),
+  lanePrompts,
+) {
   return {
     async request(method, params = {}) {
       if (method === "pane.report_metadata") return { result: {} };
       if (method === "agent.prompt") {
-        prompts.push(params.text);
+        // Root-directed wakes are recorded as text for existing assertions;
+        // lane-directed goal nudges go to the optional capture array.
+        if (params.target === ROOT.target) prompts.push(params.text);
+        else if (lanePrompts) lanePrompts.push(params);
         return { result: { type: "agent_prompted" } };
       }
       const root = roots.get(params.target);
@@ -2210,7 +2217,8 @@ test("a stale working lane emits one durable advisory stall signal and wakes its
   const transitionAt = "2026-09-14T00:00:00.000Z";
   await seedWorkingTransition(fixture, transitionAt);
   const prompts = [];
-  const api = rootWakeApi(prompts);
+  const lanePrompts = [];
+  const api = rootWakeApi(prompts, undefined, lanePrompts);
   try {
     const first = await runSupervisorTick({
       stateDir: fixture.stateDir,
@@ -2233,6 +2241,17 @@ test("a stale working lane emits one durable advisory stall signal and wakes its
     assert.equal(stalls[0].wake.status, "delivered");
     assert.equal(stalls[0].received_at, transitionAt);
     assert.equal(stalls[0].detected_at, "2026-09-14T00:06:00.000Z");
+    assert.equal(stalls[0].nudge.status, "delivered");
+    assert.equal(lanePrompts.length, 1);
+    assert.equal(lanePrompts[0].target, CHILD.target);
+    assert.match(
+      lanePrompts[0].text,
+      /you may be stalled\. Continue your assigned work now \(objective: /,
+    );
+    assert.match(
+      lanePrompts[0].text,
+      /file your herdr_complete receipt\./,
+    );
     assert.equal(manifest.parentGoal.status, "review-requested");
     assert.equal(manifest.parentGoal.signals[0].classification, "stall-suspected");
     assert.match(
@@ -2256,6 +2275,59 @@ test("a stale working lane emits one durable advisory stall signal and wakes its
     );
     assert.equal(stalls.length, 1);
     assert.equal(prompts.length, 1);
+    assert.equal(lanePrompts.length, 1, "nudge dedupes with the stall period");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a stall signal records an uncertain nudge when the lane prompt fails", async () => {
+  const fixture = await createFixture({ piGoalPauseDetection: false });
+  await seedWorkingTransition(fixture, "2026-09-14T00:00:00.000Z");
+  const prompts = [];
+  const api = {
+    ...rootWakeApi(prompts),
+    async request(method, params = {}) {
+      if (method === "pane.report_metadata") return { result: {} };
+      if (method === "agent.prompt") {
+        if (params.target === ROOT.target) {
+          prompts.push(params.text);
+          return { result: { type: "agent_prompted" } };
+        }
+        throw new Error("socket_timeout after submission");
+      }
+      return {
+        type: "agent_info",
+        agent: {
+          agent: ROOT.agent_kind,
+          name: ROOT.target,
+          pane_id: ROOT.pane_id,
+          workspace_id: ROOT.workspace_id,
+        },
+      };
+    },
+  };
+  try {
+    const result = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: api,
+      timestamp: "2026-09-14T00:06:00.000Z",
+    });
+    assert.deepEqual(result.pendingWakes, [
+      {
+        manifestPath: fixture.manifestPath,
+        workflowId: "herdr-bb029",
+        laneId: CHILD.lane_id,
+        status: "delivered",
+      },
+    ]);
+    const manifest = await fixture.manifest();
+    const stalls = manifest.workflows[0].eventController.events.filter(
+      (event) => event.classification === "stall-suspected",
+    );
+    assert.equal(stalls.length, 1);
+    assert.equal(stalls[0].nudge.status, "uncertain");
+    assert.match(stalls[0].nudge.reason, /socket_timeout/);
   } finally {
     await fixture.cleanup();
   }
@@ -2483,7 +2555,7 @@ test("stalls are isolated to each routed root in a multi-root supervisor tick", 
     });
     assert.deepEqual(
       prompts.map((prompt) => prompt.target).sort(),
-      [ROOT.target, rootB.target].sort(),
+      [ROOT.target, CHILD.target, rootB.target, childB.target].sort(),
     );
     assert.equal(
       prompts.some((prompt) => prompt.text.includes("workflow herdr-bb029")),
