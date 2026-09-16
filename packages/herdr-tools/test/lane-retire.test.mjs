@@ -134,6 +134,8 @@ function registeredTools(data) {
     registerCommand() {},
     async exec(_command, args) {
       data.calls.push(args);
+      if (args[0] === "plugin" && args[1] === "config-dir")
+        return { code: 0, stderr: "", stdout: data.configDir };
       if (args[0] === "agent" && args[1] === "get")
         return {
           code: 0,
@@ -227,6 +229,13 @@ test("lane retirement dry-run and execute close only recorded task tabs", async 
     assert.equal(data.calls.some((args) => args[0] === "workspace" && args[1] === "close"), false);
     assert.ok(result.details.workflow.laneRetirement);
     assert.equal(result.details.workflow.laneRetirement.status, "retired");
+    assert.equal(result.details.routesRetired, true);
+    assert.ok(result.details.workflow.evidence.some((entry) => entry.kind === "lane-retirement-routes-retired"));
+    const controllerConfig = JSON.parse(await readFile(join(data.configDir, "config.json"), "utf8"));
+    const routed = controllerConfig.orchestrators.flatMap((record) =>
+      record.workflows.map((workflow) => workflow.workflow_id),
+    );
+    assert.equal(routed.includes(data.workflowId), false, "retired workflow routes are removed");
     assert.ok(result.details.workflow.evidence.some((entry) => entry.kind === "lane-retirement-completed"));
     const stored = JSON.parse(await readFile(data.manifestPath, "utf8"));
     assert.ok(stored.workflows[0].laneRetirement);

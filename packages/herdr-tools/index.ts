@@ -3754,9 +3754,46 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const finalRetirement = (currentWorkflow as WorkflowWithLaneRetirement)
       .laneRetirement!;
     const remainingTabIds = finalRetirement.pendingTabIds.slice();
+    let routesRetired = false;
+    if (finalRetirement.status === "retired") {
+      // A fully retired lane workflow has no live panes to route events for;
+      // drop its controller mapping so stale routes stop probing dead panes
+      // (the manifest record stays as durable history).
+      const configPath = await controllerConfigPath(signal);
+      const lockPath = `${configPath}.lock`;
+      await mkdir(lockPath, { mode: 0o700 });
+      try {
+        const config = await loadControllerConfig(configPath);
+        if (config) {
+          let removed = false;
+          for (const orchestrator of config.orchestrators) {
+            const before = orchestrator.workflows.length;
+            orchestrator.workflows = orchestrator.workflows.filter(
+              (workflow) => workflow.workflow_id !== id,
+            );
+            if (orchestrator.workflows.length !== before) removed = true;
+          }
+          if (removed) await saveControllerConfig(configPath, config);
+          routesRetired = true;
+        }
+      } finally {
+        await rm(lockPath, { recursive: true, force: true });
+      }
+      currentWorkflow = await withManifestTransaction(cwd, (manifest) => {
+        const stored = workflowFor(manifest, id) as WorkflowWithLaneRetirement;
+        stored.evidence.push({
+          at: now(),
+          kind: "lane-retirement-routes-retired",
+          text: `Removed controller routes for retired workflow ${id}; manifest record retained as history.`,
+        });
+        stored.updatedAt = now();
+        return stored;
+      });
+    }
     return {
       laneRetired: finalRetirement.status === "retired",
       retired: finalRetirement.status === "retired",
+      routesRetired,
       partialFailure: closeErrors.length > 0,
       workflow: currentWorkflow,
       tabIds: finalRetirement.tabIds,
