@@ -8,12 +8,70 @@ Baa-ton is an orchestration core for [Herdr](https://github.com/herdrdev/herdr) 
 terminal multiplexer for coding agents. Herdr owns the terminals and agent processes;
 Baa-ton plans their work, verifies each agent before assigning it, and records what happened.
 
+## Why Baa-ton
+
+**What problem does it solve?** Running several coding agents is easy; trusting their
+output is not. Baa-ton makes delegation *durable and verifiable* instead of
+hope-and-scrollback.
+
+- *"The agent said tests passed."* — Claims aren't receipts. A lane completes only by
+  storing a durable `herdr_complete` receipt, and the parent independently re-runs the
+  checks before accepting anything.
+- *"My session died mid-round."* — Plans, lane assignments, events, and receipts live in
+  transactional manifests. Reload or restart, and the round picks up from the ledger.
+- *"Which of my six panes needs me?"* — The event controller wakes the parent only for
+  actionable events (done, blocked, a question only you can answer). Post-completion
+  noise is suppressed; `action-required` means *you* must act.
+- *"Don't let it push to prod."* — Lanes are fenced per harness (interception, deny-rules,
+  sandboxes). Push, merge, deploy, and resource closure always require the human.
+- *"I want Codex to implement and Claude to review."* — One versioned contract, any
+  qualified harness, heterogeneous lanes — with capability discovery instead of hoping
+  a model/thinking level exists.
+
+**Who is it for?** Anyone driving coding agents from a terminal through Herdr and wanting
+parallel work they can actually trust.
+
+**What it is not.** Not a daemon, not a hosted service, not CI. It never spawns processes
+(Herdr does), and every harness that isn't explicitly qualified fails closed.
+
 ## What it does
 
 - **Plans work into lanes** — one writer per worktree workflow, read-only lanes for review.
-- **Verifies before assigning** — exact provider/model/thinking/auth, startup attestation, capability discovery. Unverified or unregistered harnesses fail closed *before* any terminal is created.
-- **Bridges every harness** — all ten `herdr_*` tools (plan, dispatch, complete, observe, …) over one MCP bridge.
-- **Wakes the parent durably** — an event controller turns lane lifecycle events into durable wakes and completion receipts; nothing relies on polling.
+- **Verifies before assigning** — exact provider/model/thinking/auth, startup attestation, live capability discovery. Unverified harnesses fail closed *before* any terminal is created.
+- **Bridges every harness** — all ten `herdr_*` tools over one MCP bridge.
+- **Wakes the parent durably** — lifecycle events become durable wakes and receipts; nothing polls.
+
+## Example prompts
+
+You talk to a root session in a Herdr pane; Baa-ton does the rest. Real shapes that work today:
+
+**Delegate one bounded task**
+
+```text
+Close the failing tests in packages/controller — delegate to a luna lane
+in a worktree and verify it yourself before we merge.
+```
+→ The root plans a single-lane workflow (BB-029 local scope), dispatches it after startup
+proof, the lane works/tests/commits and files its receipt, the root re-runs the suite and
+reports evidence.
+
+**Run a parallel round**
+
+```text
+Close these three gaps. Parallelize the disjoint ones, sequence the ones
+that share files, and have Claude review the whole diff before we push.
+```
+→ One workflow per writer over separate worktrees, parent verification between lanes,
+then a read-only cross-vendor review lane. No push without your explicit gate.
+
+**Answer a lane's question**
+
+```text
+(the lane hit a decision) → you get woken with the question
+Pick option 2 — reuse the existing adapter.
+```
+→ Questions persist durably and route to the mapped root; your answer is recorded and
+delivered to the waiting lane. Lanes never prompt their own UI.
 
 ## Supported harnesses
 
