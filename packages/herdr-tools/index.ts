@@ -60,7 +60,7 @@ export type {
   GoalOwnership,
   OperatorClosure,
 } from "./contract.js";
-import { dispatchTask } from "./dispatch-task.js";
+import { dispatchTask, laneSlug } from "./dispatch-task.js";
 import {
   LAUNCH_PROFILE_SCHEMA_VERSION,
   type LaunchProfile,
@@ -2367,6 +2367,35 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         record.program.id === resolve(cwd),
     );
     const labelEvidence: string[] = [];
+    // Best-effort sync read for display labels only; authoritative manifest
+    // access stays on the transactional async path.
+    const readManifestForLabel = (
+      labelCwd: string,
+    ): { parentGoal?: { objective?: string } } | undefined => {
+      try {
+        return JSON.parse(
+          readFileSync(manifestPath(labelCwd), "utf8"),
+        ) as { parentGoal?: { objective?: string } };
+      } catch {
+        return undefined;
+      }
+    };
+    // Multi-root label: the root's tab carries its distinguishing handle
+    // (harness kind + workspace) so concurrent roots stay distinguishable,
+    // plus the current goal slug when one is registered.
+    const rootTabLabel = (): string => {
+      const kind = root.agent_kind ?? "root";
+      const handle = `${kind}\u00b7${root.workspace_id}`;
+      try {
+        const manifest = readManifestForLabel(cwd);
+        const slug = manifest?.parentGoal?.objective
+          ? laneSlug(manifest.parentGoal.objective)
+          : "";
+        return slug ? `\ud83d\udc15 ${handle} \u00b7 ${slug}` : `\ud83d\udc15 ${handle}`;
+      } catch {
+        return `\ud83d\udc15 ${handle}`;
+      }
+    };
     const renameRootTab = async (): Promise<void> => {
       try {
         const paneResult = responseRecord(
@@ -2380,12 +2409,15 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           "tab_id",
           "root pane get for tab label",
         );
-        await runHerdr(["tab", "rename", tabId, "🐕 root"], signal);
-        labelEvidence.push(`Root tab ${tabId} labeled 🐕 root.`);
+        const label = rootTabLabel();
+        await runHerdr(["tab", "rename", tabId, label], signal);
+        labelEvidence.push(`Root tab ${tabId} labeled ${label}.`);
       } catch (error) {
         // Labels are display-only. A native renderer/API mismatch must never
         // make a verified root bootstrap fail after its durable claim landed.
-        labelEvidence.push(`Root tab label 🐕 root could not be applied: ${String(error)}`);
+        labelEvidence.push(
+          `Root tab label could not be applied: ${String(error)}`,
+        );
       }
     };
     if (current && !reset) {
