@@ -1154,12 +1154,18 @@ function validateControllerConfig(input: unknown): ControllerConfig {
     new Set(orchestrators.map((item) => item.id)).size !== orchestrators.length
   )
     throw new Error("controller config cannot repeat orchestrator IDs.");
-  const workflowIds = orchestrators.flatMap((item) =>
-    item.workflows.map((workflow) => workflow.workflow_id),
-  );
-  if (new Set(workflowIds).size !== workflowIds.length)
+  // Workflow IDs are scoped to an orchestrator; isolated roots may use the
+  // same ID because their manifest paths and pane routes remain distinct.
+  if (
+    orchestrators.some((orchestrator) => {
+      const workflowIds = orchestrator.workflows.map(
+        (workflow) => workflow.workflow_id,
+      );
+      return new Set(workflowIds).size !== workflowIds.length;
+    })
+  )
     throw new Error(
-      "controller config cannot repeat workflow IDs across orchestrators.",
+      "controller config cannot repeat workflow IDs within an orchestrator.",
     );
   return { version: 2, owner: OWNER, orchestrators };
 }
@@ -2330,6 +2336,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   async function bootstrapRoot(
     cwd: string,
     reset: boolean,
+    add: boolean,
     confirm: boolean,
     ctx: ExtensionContext,
     signal?: AbortSignal,
@@ -2337,20 +2344,27 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     root: ControllerRootMapping;
     configPath: string;
     reset: boolean;
+    add: boolean;
     manifestReset: boolean;
     alreadyRegistered: boolean;
     evidence: string[];
   }> {
     requireHerdr();
+    if (add && reset)
+      throw new Error(
+        "herdr_bootstrap_root add=true cannot be combined with reset=true; add mode never resets existing mappings or manifest state.",
+      );
     const root = await currentPaneRoot(signal);
+    const resolvedCwd = resolve(cwd);
     const configPath = await controllerConfigPath(signal);
     const config = await loadControllerConfig(configPath);
+    const manifestHasState = (manifest: ManifestWithGoalHistory): boolean =>
+      manifest.workflows.length > 0 ||
+      manifest.parentGoal !== undefined ||
+      (manifest.questionRequests?.length ?? 0) > 0 ||
+      (manifest.messageRequests?.length ?? 0) > 0;
     const existingManifest = await loadManifest(cwd);
-    const manifestHasLegacyState =
-      existingManifest.workflows.length > 0 ||
-      existingManifest.parentGoal !== undefined ||
-      (existingManifest.questionRequests?.length ?? 0) > 0 ||
-      (existingManifest.messageRequests?.length ?? 0) > 0;
+    const manifestHasLegacyState = manifestHasState(existingManifest);
     if (
       config?.orchestrators.some((record) =>
         record.workflows.some((workflow) =>
@@ -2361,11 +2375,39 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       throw new Error(
         "The current pane is already a registered child lane and cannot claim root authority.",
       );
-    const current = config?.orchestrators.find(
-      (record) =>
-        sameControllerRoot(record.root, root) &&
-        record.program.id === resolve(cwd),
-    );
+    const rootForPaneAndCwd = (
+      candidate: ControllerConfig | undefined,
+    ): ControllerOrchestrator | undefined =>
+      candidate?.orchestrators.find(
+        (record) =>
+          record.root.pane_id === root.pane_id &&
+          record.root.workspace_id === root.workspace_id &&
+          record.program.id === resolvedCwd,
+      );
+    const rootForPane = (
+      candidate: ControllerConfig | undefined,
+    ): ControllerOrchestrator | undefined =>
+      candidate?.orchestrators.find(
+        (record) =>
+          record.root.pane_id === root.pane_id &&
+          !(
+            record.root.workspace_id === root.workspace_id &&
+            record.program.id === resolvedCwd
+          ),
+      );
+    const rootForWorkspace = (
+      candidate: ControllerConfig | undefined,
+    ): ControllerOrchestrator | undefined =>
+      candidate?.orchestrators.find(
+        (record) =>
+          record.root.workspace_id === root.workspace_id &&
+          !(
+            record.root.pane_id === root.pane_id &&
+            record.program.id === resolvedCwd
+          ),
+      );
+    const current = rootForPaneAndCwd(config);
+    const conflictingPaneRoot = rootForPane(config);
     const labelEvidence: string[] = [];
     // Best-effort sync read for display labels only; authoritative manifest
     // access stays on the transactional async path.
@@ -2426,64 +2468,135 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         root,
         configPath,
         reset: false,
+        add,
         manifestReset: false,
         alreadyRegistered: true,
         evidence: labelEvidence,
       };
     }
-    if ((config && config.orchestrators.length > 0) || manifestHasLegacyState) {
+    if (conflictingPaneRoot && !reset)
+      throw new Error(
+        `Current pane ${root.pane_id} is already registered by orchestrator ${conflictingPaneRoot.id} for cwd ${conflictingPaneRoot.program.id}; claiming ${resolvedCwd} requires reset=true (add mode never replaces a different cwd).`,
+      );
+    if (add && rootForWorkspace(config)) {
+      const conflictingWorkspaceRoot = rootForWorkspace(config)!;
+      throw new Error(
+        `Cannot add root in workspace ${root.workspace_id}: orchestrator ${conflictingWorkspaceRoot.id} already uses this workspace with root pane ${conflictingWorkspaceRoot.root.pane_id}. Add mode requires both a distinct pane and a distinct workspace; use reset=true only to replace existing mappings.`,
+      );
+    }
+    if (add && manifestHasLegacyState)
+      throw new Error(
+        `Cannot add root for ${resolvedCwd}: its parent manifest has existing state. Add mode never resets or replaces this cwd's manifest; use reset=true only for the legacy no-add replacement flow.`,
+      );
+    if (
+      !add &&
+      ((config && config.orchestrators.length > 0) || manifestHasLegacyState)
+    ) {
       if (!reset)
         throw new Error(
           "Controller config or parent manifest has existing state. Review it, then call herdr_bootstrap_root with reset=true to retire it before claiming this manually started root.",
         );
     }
-    const label = reset
-      ? "Reset Baa-ton controller mappings and claim this root"
-      : "Claim this manually started Baa-ton root";
+    const label = add
+      ? "Add this manually started Baa-ton root"
+      : reset
+        ? "Reset Baa-ton controller mappings and claim this root"
+        : "Claim this manually started Baa-ton root";
     if (
       confirm &&
       !(await ctx.ui.confirm(
         "Herdr orchestrator",
-        `${label}? ${reset ? "This retires the existing controller mapping and parent manifest state." : "This records the verified current pane/workspace and a clean parent manifest."} It does not create lanes or enable the controller.`,
+        `${label}? ${reset ? "This retires the existing controller mapping and parent manifest state." : add ? "This appends a controller mapping for the distinct current pane/workspace and leaves all existing roots and manifests intact." : "This records the verified current pane/workspace and a clean parent manifest."} It does not create lanes or enable the controller.`,
       ))
     )
       throw new Error("Root bootstrap was cancelled.");
-    const next: ControllerConfig = {
-      version: 2,
-      owner: OWNER,
-      orchestrators: [
-        {
-          id: controllerRecordId(root, cwd),
-          root,
-          program: {
-            id: resolve(cwd),
-            workspace_id: root.workspace_id,
-            parent_manifest_path: resolve(manifestPath(cwd)),
-          },
-          workflows: [],
-        },
-      ],
+    const next: ControllerOrchestrator = {
+      id: controllerRecordId(root, cwd),
+      root,
+      program: {
+        id: resolvedCwd,
+        workspace_id: root.workspace_id,
+        parent_manifest_path: resolve(manifestPath(cwd)),
+      },
+      workflows: [],
     };
+    let alreadyRegisteredAfterLock = false;
     const release = await acquireManifestLock(cwd);
     try {
-      if (reset) await saveManifest(cwd, { version: 2, workflows: [] });
-      await saveControllerConfig(
-        configPath,
-        reset || !config
-          ? next
-          : {
-              ...config,
-              orchestrators: [...config.orchestrators, ...next.orchestrators],
-            },
-      );
+      const configLockPath = `${configPath}.lock`;
+      await mkdir(configLockPath, { mode: 0o700 });
+      try {
+        // Reconcile against the config and manifest observed after the user
+        // confirmation. The config lock prevents a concurrent root bootstrap
+        // from being lost by this append.
+        const latestConfig = await loadControllerConfig(configPath);
+        const latestManifest = await loadManifest(cwd);
+        const latestCurrent = rootForPaneAndCwd(latestConfig);
+        if (latestCurrent && !reset) {
+          alreadyRegisteredAfterLock = true;
+        } else {
+          const latestPaneConflict = rootForPane(latestConfig);
+          if (latestPaneConflict && !reset)
+            throw new Error(
+              `Current pane ${root.pane_id} is already registered by orchestrator ${latestPaneConflict.id} for cwd ${latestPaneConflict.program.id}; claiming ${resolvedCwd} requires reset=true (add mode never replaces a different cwd).`,
+            );
+          const latestWorkspaceConflict = rootForWorkspace(latestConfig);
+          if (add && latestWorkspaceConflict)
+            throw new Error(
+              `Cannot add root in workspace ${root.workspace_id}: orchestrator ${latestWorkspaceConflict.id} already uses this workspace with root pane ${latestWorkspaceConflict.root.pane_id}. Add mode requires both a distinct pane and a distinct workspace; use reset=true only to replace existing mappings.`,
+            );
+          if (add && manifestHasState(latestManifest))
+            throw new Error(
+              `Cannot add root for ${resolvedCwd}: its parent manifest has existing state. Add mode never resets or replaces this cwd's manifest; use reset=true only for the legacy no-add replacement flow.`,
+            );
+          if (
+            !add &&
+            ((latestConfig && latestConfig.orchestrators.length > 0) ||
+              manifestHasState(latestManifest)) &&
+            !reset
+          )
+            throw new Error(
+              "Controller config or parent manifest has existing state. Review it, then call herdr_bootstrap_root with reset=true to retire it before claiming this manually started root.",
+            );
+          if (reset) await saveManifest(cwd, { version: 2, workflows: [] });
+          else if (add && !manifestHasState(latestManifest))
+            // A new root owns a private manifest even before its first goal or
+            // workflow is created; never rewrite a manifest containing state.
+            await saveManifest(cwd, latestManifest);
+          await saveControllerConfig(
+            configPath,
+            reset || !latestConfig
+              ? { version: 2, owner: OWNER, orchestrators: [next] }
+              : {
+                  ...latestConfig,
+                  orchestrators: [...latestConfig.orchestrators, next],
+                },
+          );
+        }
+      } finally {
+        await rm(configLockPath, { recursive: true, force: true });
+      }
     } finally {
       await release();
+    }
+    if (alreadyRegisteredAfterLock) {
+      await renameRootTab();
+      return {
+        root,
+        configPath,
+        reset: false,
+        add,
+        manifestReset: false,
+        alreadyRegistered: true,
+        evidence: labelEvidence,
+      };
     }
     await renameRootTab();
     return {
       root,
       configPath,
       reset,
+      add,
       manifestReset: reset,
       alreadyRegistered: false,
       evidence: labelEvidence,
@@ -4111,10 +4224,19 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const config = await loadControllerConfig(configPath);
         if (config) {
           let removed = false;
+          const retiredManifestPath = resolve(manifestPath(cwd));
           for (const orchestrator of config.orchestrators) {
             const before = orchestrator.workflows.length;
+            // Workflow IDs are root-local. Retire only the route belonging to
+            // this verified root and manifest; another root may legitimately
+            // use the same ID in its own isolated store.
             orchestrator.workflows = orchestrator.workflows.filter(
-              (workflow) => workflow.workflow_id !== id,
+              (workflow) =>
+                workflow.workflow_id !== id ||
+                resolve(workflow.manifest_path) !== retiredManifestPath ||
+                orchestrator.program.id !== resolve(cwd) ||
+                orchestrator.root.pane_id !== root.pane_id ||
+                orchestrator.root.workspace_id !== root.workspace_id,
             );
             if (orchestrator.workflows.length !== before) removed = true;
           }
@@ -4732,15 +4854,16 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     name: "herdr_bootstrap_root",
     label: "Bootstrap Herdr Root",
     description:
-      "Explicitly claim the verified current pane as the Baa-ton root before creating a parent goal.",
+      "Explicitly claim the verified current pane as the Baa-ton root before creating a parent goal; pass add=true to append a distinct concurrent root.",
     promptSnippet:
-      "Bootstrap the manually started Baa-ton root; confirmation is opt-in.",
+      "Bootstrap or add the manually started Baa-ton root; confirmation is opt-in.",
     promptGuidelines: [
-      "Use herdr_bootstrap_root only when Zach explicitly asks to initialize a manually started Baa-ton parent. It never creates lanes or enables the controller; pass confirm=true only when Zach asks for a confirmation gate.",
+      "Use herdr_bootstrap_root only when Zach explicitly asks to initialize a manually started Baa-ton parent. add=true appends the current pane/workspace without resetting existing roots; it requires a distinct pane and workspace and never replaces a different cwd. It never creates lanes or enables the controller; pass confirm=true only when Zach asks for a confirmation gate.",
     ],
     parameters: Type.Object(
       {
         reset: Type.Optional(Type.Boolean()),
+        add: Type.Optional(Type.Boolean()),
         confirm: Type.Optional(Type.Boolean()),
       },
       { additionalProperties: false },
@@ -4749,6 +4872,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const result = await bootstrapRoot(
         ctx.cwd,
         params.reset ?? false,
+        params.add ?? false,
         params.confirm ?? false,
         ctx,
         signal,
@@ -4761,7 +4885,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             type: "text",
             text: `${result.alreadyRegistered
               ? `Verified Baa-ton root ${result.root.pane_id} is already registered.`
-              : `Registered Baa-ton root ${result.root.pane_id}${result.reset ? " after retiring prior mappings" : ""}.`}${result.evidence.length ? ` ${result.evidence.join(" ")}` : ""}`,
+              : `${result.add ? "Added" : "Registered"} Baa-ton root ${result.root.pane_id}${result.reset ? " after retiring prior mappings" : ""}.`}${result.evidence.length ? ` ${result.evidence.join(" ")}` : ""}`,
           },
         ],
         details: result,

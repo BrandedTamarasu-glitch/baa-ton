@@ -421,13 +421,17 @@ export function validateConfig(input) {
     new Set(orchestrators.map((item) => item.id)).size === orchestrators.length,
     "config cannot repeat orchestrator IDs.",
   );
-  const workflowIds = orchestrators.flatMap((item) =>
-    item.workflows.map((workflow) => workflow.workflow_id),
-  );
-  assert(
-    new Set(workflowIds).size === workflowIds.length,
-    "config cannot repeat workflow_id values across orchestrators.",
-  );
+  // Workflow IDs are scoped to an orchestrator; isolated roots may use the
+  // same ID because their manifest paths and pane routes remain distinct.
+  for (const orchestrator of orchestrators) {
+    const workflowIds = orchestrator.workflows.map(
+      (workflow) => workflow.workflow_id,
+    );
+    assert(
+      new Set(workflowIds).size === workflowIds.length,
+      "config cannot repeat workflow_id values within an orchestrator.",
+    );
+  }
   return { version: 2, owner: OWNER, orchestrators };
 }
 
@@ -1447,6 +1451,10 @@ async function publishParentGoalSidebar(goal, root, herdr) {
   }
 }
 
+function routeScope(orchestrator, manifestPath) {
+  return `${orchestrator.id}:${sha256(resolve(manifestPath))}`;
+}
+
 function wakeText(record) {
   return [
     `[Herdr Orchestrator event] ${record.classification}: workflow ${record.workflow_id}, lane ${record.lane_id}.`,
@@ -1595,7 +1603,7 @@ async function processChildMessageRequest({
   let inboxMessage;
   try {
     inboxMessage = await persistControllerMessage(configDir, {
-      logicalKey: `child-message:${request.workflowId}/${request.laneId}:${sha256(request.summary)}`,
+      logicalKey: `child-message:${routeScope(mapping.orchestrator, manifestPath)}:${request.workflowId}/${request.laneId}:${sha256(request.summary)}`,
       occurrenceId: request.id,
       kind: "child-message",
       from: inboxIdentity(
@@ -1669,13 +1677,28 @@ export async function routeChildMessage(options = {}) {
   assertString(laneId, "laneId");
   assertString(messageId, "messageId");
   const config = await loadConfig(configDir);
-  const matches = [];
+  let matches = [];
   for (const orchestrator of config.orchestrators)
     for (const workflow of orchestrator.workflows)
       if (workflow.workflow_id === workflowId) {
         const lane = workflow.lanes.find((candidate) => candidate.lane_id === laneId);
         if (lane) matches.push({ orchestrator, workflow, lane });
       }
+  // Workflow IDs are unique within an orchestrator, not necessarily across
+  // isolated roots. A child bridge carries its pane/workspace identity, so use
+  // that identity to select the root-owned manifest before treating a repeated
+  // ID as ambiguous. Never fall back to cwd or choose the first match.
+  if (matches.length > 1) {
+    const paneId = process.env.HERDR_PANE_ID;
+    const workspaceId = process.env.HERDR_WORKSPACE_ID;
+    if (paneId && workspaceId) {
+      const scoped = matches.filter(
+        ({ lane }) =>
+          lane.pane_id === paneId && lane.workspace_id === workspaceId,
+      );
+      if (scoped.length > 0) matches = scoped;
+    }
+  }
   assert(
     matches.length === 1,
     matches.length === 0
@@ -1948,7 +1971,7 @@ export async function runSupervisorTick({
             updated_at: timestamp,
           };
           const inboxMessage = await persistControllerMessage(configDir, {
-            logicalKey: `lane-event:${record.workflow_id}/${record.lane_id}/${record.classification}`,
+            logicalKey: `lane-event:${routeScope(orchestrator, manifestPath)}:${record.workflow_id}/${record.lane_id}/${record.classification}`,
             occurrenceId: record.identity,
             kind: "lifecycle-event",
             from: inboxIdentity(
@@ -2130,7 +2153,7 @@ export async function runSupervisorTick({
       goal.updatedAt = timestamp;
       await atomicWriteJson(manifestPath, manifest);
       const inboxMessage = await persistControllerMessage(configDir, {
-        logicalKey: `supervisor-wake:${goal.id}`,
+        logicalKey: `supervisor-wake:${routeScope(orchestrator, manifestPath)}:${goal.id}`,
         occurrenceId: sha256(
           canonicalJson({
             goal: goal.id,
@@ -2406,7 +2429,7 @@ export async function handleHook({
       // durable instruction presented to the root.
       signalParentGoalMismatch(manifest, mapping.orchestrator.workflows);
       inboxMessage = await persistControllerMessage(configDir, {
-        logicalKey: `lane-event:${record.workflow_id}/${record.lane_id}/${record.classification}`,
+        logicalKey: `lane-event:${routeScope(mapping.orchestrator, mapping.workflow.manifest_path)}:${record.workflow_id}/${record.lane_id}/${record.classification}`,
         occurrenceId: record.identity,
         kind: "lifecycle-event",
         from: inboxIdentity(
@@ -2462,7 +2485,7 @@ export async function handleHook({
       return { accepted: true, deduplicated: true, record };
     }
     inboxMessage ??= await persistControllerMessage(configDir, {
-      logicalKey: `lane-event:${record.workflow_id}/${record.lane_id}/${record.classification}`,
+      logicalKey: `lane-event:${routeScope(mapping.orchestrator, mapping.workflow.manifest_path)}:${record.workflow_id}/${record.lane_id}/${record.classification}`,
       occurrenceId: record.identity,
       kind: "lifecycle-event",
       from: inboxIdentity(

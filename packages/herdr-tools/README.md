@@ -88,6 +88,21 @@ puts `HERDR_ENV`, `HERDR_WORKSPACE_ID`, `HERDR_PANE_ID`, and
 extension directly. Live qualification of a non-Pi root remains the final
 step.
 
+To register another root without retiring an existing one, call
+`herdr_bootstrap_root` from that root's current pane with `add: true`. Add mode
+appends only the current pane/workspace mapping and leaves existing controller
+records and manifests intact. The new root must use both a distinct pane and a
+distinct workspace; using an already-registered root pane, a child-lane pane,
+or a workspace already owned by another root is rejected. A same-pane/different
+checkout replacement remains a `reset: true` operation, while an already
+registered pane and checkout is idempotent.
+
+Concurrent roots are isolated: each root owns its own checkout manifest,
+parent goal, workflow/lanes, and wake/approval state. The controller keeps all
+orchestrator records in one config but routes lifecycle events and wakes by the
+registered pane/workspace mapping, so Pi, Claude Code, and other harness roots
+can run side by side without sharing parent state.
+
 ## Validate
 
 ```sh
