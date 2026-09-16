@@ -113,6 +113,17 @@ test("root bootstrap labels the current tab and repeats the idempotent rename", 
       ["tab", "rename", "w-labels:root-tab", "🐕 pi·w-labels"],
     );
     assert.match(first.details.evidence[0], /labeled 🐕 pi·w-labels/);
+    const manifest = JSON.parse(
+      await readFile(join(f.cwd, ".pi", "herdr-orchestrator", "manifest.json"), "utf8"),
+    );
+    assert.equal(manifest.sessionLog.kind, "root");
+    assert.equal(manifest.sessionLog.paneId, "w-labels:root");
+    assert.equal(manifest.sessionLog.workspaceId, "w-labels");
+    assert.equal(manifest.sessionLog.sessionRef.sessionId, "w-labels:w-labels:root");
+    assert.equal(manifest.sessionLog.tabId, "w-labels:root-tab");
+    assert.ok(manifest.sessionLog.startedAt);
+    assert.ok(manifest.sessionLog.lastResponseAt);
+    const firstStartedAt = manifest.sessionLog.startedAt;
 
     const second = await bootstrap.execute(
       "bootstrap-again",
@@ -126,6 +137,11 @@ test("root bootstrap labels the current tab and repeats the idempotent rename", 
       f.calls.filter((args) => args[0] === "tab" && args[1] === "rename").length,
       2,
     );
+    const refreshed = JSON.parse(
+      await readFile(join(f.cwd, ".pi", "herdr-orchestrator", "manifest.json"), "utf8"),
+    );
+    assert.equal(refreshed.sessionLog.startedAt, firstStartedAt);
+    assert.equal(refreshed.sessionLog.tabId, "w-labels:root-tab");
   } finally {
     await f.cleanup();
   }

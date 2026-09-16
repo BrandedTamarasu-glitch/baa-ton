@@ -227,6 +227,36 @@ export type PersistenceHandle = {
   metadata?: Record<string, unknown>;
 };
 
+/** Durable lifecycle states for a root or lane session trace. */
+export type SessionLogStatus =
+  | "planned"
+  | "dispatched"
+  | "working"
+  | "idle"
+  | "done"
+  | "completed"
+  | "retired"
+  | "gone";
+
+/**
+ * A resource-independent session trace.  The native pane/tab/worktree fields
+ * are breadcrumbs only; `sessionRef` is the durable provider identity that
+ * remains useful after those live resources disappear.
+ */
+export type SessionLogEntry = {
+  kind: "root" | "lane";
+  sessionRef: PersistenceHandle;
+  startedAt: string;
+  lastResponseAt?: string;
+  status: SessionLogStatus;
+  workflowId?: string;
+  laneId?: string;
+  paneId?: string;
+  tabId?: string;
+  workspaceId?: string;
+  worktree?: string;
+};
+
 /**
  * Compatibility view of the original Herdr native session identity. Existing
  * manifests use this shape; new records may additionally carry a
@@ -352,6 +382,8 @@ export type Lane = {
   nativeSession?: NativeSessionRef;
   /** Generalized provider/session persistence identity. */
   persistenceHandle?: PersistenceHandle;
+  /** Durable trace retained after the lane tab or worktree disappears. */
+  sessionLog?: SessionLogEntry;
   completionReceipt?: {
     id: string;
     summary: string;
@@ -507,6 +539,17 @@ export type Workflow = {
   questionRequests?: ParentQuestionRequest[];
   messageRequests?: MessageRecord[];
   eventControllerRegistration?: EventControllerRegistration;
+  /** Controller lifecycle ledger; timestamps are the source for lane activity. */
+  eventController?: {
+    version: 1;
+    events: Array<{
+      pane_id?: string;
+      lane_id?: string;
+      received_at?: string;
+      at?: string;
+      [key: string]: unknown;
+    }>;
+  };
   createdAt: string;
   updatedAt: string;
   dispatchedAt?: string;
@@ -521,6 +564,8 @@ export type Workflow = {
 export type Manifest = {
   version: 2;
   workflows: Workflow[];
+  /** Root-scoped session trace; unlike parentGoal it survives goal resets. */
+  sessionLog?: SessionLogEntry;
   parentGoal?: ParentGoal;
   questionRequests?: ParentQuestionRequest[];
   messageRequests?: MessageRecord[];

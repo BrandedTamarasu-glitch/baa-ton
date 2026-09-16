@@ -50,6 +50,19 @@ workflow ID when it supervises multiple workflows.
 - Observation is bounded; completion requires every lane to be done.
 - No operation pushes, merges, deploys, invokes external services, or runs detached work.
 
+## Session log
+
+Each root manifest keeps a durable `sessionLog` root entry, and each lane keeps
+its own `sessionLog` entry. An entry records `kind`, the provider-neutral
+`sessionRef` (`PersistenceHandle`), `startedAt`, `lastResponseAt`, lifecycle
+`status`, and the workflow/lane, pane/tab, workspace, and worktree breadcrumbs
+when known. Lane `lastResponseAt` is derived from the controller's durable
+`eventController.events` ledger, so it does not drift through a second activity
+writer. The trace remains readable after a lane tab is retired or a worktree is
+removed. `herdr_observe` returns the current root's root-plus-lane entries in
+`details.sessionLog`; the manifest is the durable source of truth. Resume and
+cleanup/retirement are follow-up rounds built on this trace.
+
 ## Run as MCP
 
 After `npm install` in the repository root, configure a local stdio MCP client with:

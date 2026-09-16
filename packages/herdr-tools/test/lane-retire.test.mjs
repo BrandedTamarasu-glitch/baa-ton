@@ -33,6 +33,25 @@ async function fixture(options = {}) {
     status: "completion-reported",
     paneId: `lane-pane-${index + 1}`,
     tabId: tabIds[index],
+    persistenceHandle: {
+      provider: "pi",
+      sessionId: `session-${index + 1}`,
+    },
+    sessionLog: {
+      kind: "lane",
+      sessionRef: {
+        provider: "pi",
+        sessionId: `session-${index + 1}`,
+      },
+      startedAt: "2026-09-15T00:00:00.000Z",
+      lastResponseAt: "2026-09-15T00:01:00.000Z",
+      status: "completed",
+      workflowId,
+      laneId: `lane-${index + 1}`,
+      paneId: `lane-pane-${index + 1}`,
+      tabId: tabIds[index],
+      workspaceId: "task-space",
+    },
   }));
   const workflow = {
     id: workflowId,
@@ -240,6 +259,10 @@ test("lane retirement dry-run and execute close only recorded task tabs", async 
     const stored = JSON.parse(await readFile(data.manifestPath, "utf8"));
     assert.ok(stored.workflows[0].laneRetirement);
     assert.deepEqual(stored.workflows[0].ownership.tabIds, data.tabIds);
+    assert.ok(
+      stored.workflows[0].lanes.every((lane) => lane.sessionLog.status === "retired"),
+      "session traces survive lane-tab retirement",
+    );
   } finally {
     await cleanup(data, restore);
   }

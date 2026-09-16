@@ -319,6 +319,17 @@ test("opaque IDs and different checkout still produce only tabs in one designate
       f.state.lanes.map((lane) => lane.agentName),
       ["child-wf-1", "child-wf-2"],
     );
+    assert.ok(f.state.lanes.every((lane) => lane.sessionLog));
+    assert.deepEqual(
+      f.state.lanes.map((lane) => lane.sessionLog.sessionRef),
+      f.state.lanes.map((lane) => lane.persistenceHandle),
+    );
+    assert.ok(
+      f.state.lanes.every(
+        (lane) => lane.sessionLog.startedAt === lane.agentStartedAt,
+      ),
+    );
+    assert.ok(f.state.lanes.every((lane) => lane.sessionLog.status === "working"));
     assert.equal(f.calls.filter((c) => c[1] === "prompt").length, 2);
     assert.equal(
       f.calls.some((c) => c[0] === "workspace" && c[1] !== "get"),

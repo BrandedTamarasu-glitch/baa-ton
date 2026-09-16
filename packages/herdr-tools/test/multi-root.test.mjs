@@ -247,10 +247,14 @@ test("add appends a concurrent root and preserves existing config and manifests"
         },
       ],
     });
-    assert.deepEqual(JSON.parse(await readFile(f.manifestB, "utf8")), {
-      version: 2,
-      workflows: [],
-    });
+    const manifestAfterAdd = JSON.parse(await readFile(f.manifestB, "utf8"));
+    assert.deepEqual(manifestAfterAdd.workflows, []);
+    assert.equal(manifestAfterAdd.sessionLog.kind, "root");
+    assert.equal(manifestAfterAdd.sessionLog.paneId, "w-b:root");
+    assert.equal(manifestAfterAdd.sessionLog.workspaceId, "w-b");
+    assert.equal(manifestAfterAdd.sessionLog.status, "idle");
+    assert.ok(manifestAfterAdd.sessionLog.startedAt);
+    assert.ok(manifestAfterAdd.sessionLog.lastResponseAt);
     assert.equal(
       f.calls.some(
         (args) =>
@@ -334,10 +338,12 @@ test("the legacy no-add path still requires reset to replace existing state", as
     const after = await configAt(f.configDir);
     assert.equal(after.orchestrators.length, 1);
     assert.equal(after.orchestrators[0].root.pane_id, "w-b:root");
-    assert.deepEqual(JSON.parse(await readFile(f.manifestB, "utf8")), {
-      version: 2,
-      workflows: [],
-    });
+    const manifestAfterReset = JSON.parse(await readFile(f.manifestB, "utf8"));
+    assert.deepEqual(manifestAfterReset.workflows, []);
+    assert.equal(manifestAfterReset.sessionLog.kind, "root");
+    assert.equal(manifestAfterReset.sessionLog.paneId, "w-b:root");
+    assert.equal(manifestAfterReset.sessionLog.workspaceId, "w-b");
+    assert.ok(manifestAfterReset.sessionLog.startedAt);
   } finally {
     await f.cleanup();
   }

@@ -51,7 +51,10 @@ import {
   type ParentGoal,
   type ParentGoalStatus,
   type ParentQuestionRequest,
+  type PersistenceHandle,
   type RootTurn,
+  type SessionLogEntry,
+  type SessionLogStatus,
   type WorktreeBinding,
   type Workflow,
 } from "./contract.js";
@@ -279,6 +282,38 @@ function normalizeWorkflowGoals(workflow: Workflow): Workflow {
           workflow.agentKind ??
           "herdr",
       );
+    }
+    // Migrate manifests that already have the durable provider identity but
+    // predate the session-log field. The identity is never reconstructed from
+    // a pane/tab alias; only existing persistence evidence is adopted.
+    if (lane.persistenceHandle && !lane.sessionLog) {
+      const laneStatus =
+        lane.completionReceipt ||
+        lane.status === "completion-reported" ||
+        lane.status === "completed" ||
+        lane.status === "operator-closed"
+          ? "completed"
+          : lane.status === "planned"
+            ? "planned"
+            : "dispatched";
+      lane.sessionLog = {
+        kind: "lane",
+        sessionRef: lane.persistenceHandle,
+        startedAt:
+          lane.agentStartedAt ??
+          lane.incarnationStartedAt ??
+          workflow.dispatchedAt ??
+          workflow.createdAt,
+        status: laneStatus,
+        workflowId: workflow.id,
+        laneId: lane.id,
+        ...(lane.paneId ? { paneId: lane.paneId } : {}),
+        ...(lane.tabId ? { tabId: lane.tabId } : {}),
+        ...(workflow.ownership.workspaceId
+          ? { workspaceId: workflow.ownership.workspaceId }
+          : {}),
+        ...(workflow.worktree ? { worktree: workflow.worktree } : {}),
+      };
     }
     const goalId =
       typeof lane.goalId === "string" && lane.goalId
@@ -512,6 +547,7 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
       parentGoal?: ParentGoal;
       questionRequests?: ParentQuestionRequest[];
       messageRequests?: MessageRecord[];
+      sessionLog?: SessionLogEntry;
       goalHistory?: unknown;
       queue?: unknown;
     };
@@ -527,6 +563,7 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
         parentGoal: parsed.parentGoal,
         questionRequests: parsed.questionRequests,
         messageRequests: parsed.messageRequests,
+        ...(parsed.sessionLog ? { sessionLog: parsed.sessionLog } : {}),
         ...(Array.isArray(parsed.goalHistory)
           ? { goalHistory: parsed.goalHistory as GoalHistoryRecord[] }
           : {}),
@@ -1699,6 +1736,201 @@ function nativeSessionFromAgent(value: unknown): NativeSessionRef | undefined {
   return { kind: session.kind, value: session.value };
 }
 
+const SESSION_LOG_STATUSES: SessionLogStatus[] = [
+  "planned",
+  "dispatched",
+  "working",
+  "idle",
+  "done",
+  "completed",
+  "retired",
+  "gone",
+];
+
+function validSessionLogStatus(
+  value: unknown,
+  fallback: SessionLogStatus,
+): SessionLogStatus {
+  return typeof value === "string" && SESSION_LOG_STATUSES.includes(value as SessionLogStatus)
+    ? (value as SessionLogStatus)
+    : fallback;
+}
+
+function laterTimestamp(
+  left: string | undefined,
+  right: string | undefined,
+): string | undefined {
+  if (!left) return right;
+  if (!right) return left;
+  const leftAt = Date.parse(left);
+  const rightAt = Date.parse(right);
+  if (!Number.isFinite(leftAt)) return right;
+  if (!Number.isFinite(rightAt)) return left;
+  return rightAt > leftAt ? right : left;
+}
+
+function latestLaneLedgerResponseAt(
+  workflow: Workflow,
+  lane: Lane,
+): string | undefined {
+  const events = workflow.eventController?.events;
+  if (!Array.isArray(events)) return undefined;
+  let latest: string | undefined;
+  for (const event of events) {
+    if (!isRecord(event)) continue;
+    if (event.pane_id !== undefined) {
+      if (event.pane_id !== lane.paneId) continue;
+    } else if (event.lane_id !== lane.id) continue;
+    const at =
+      typeof event.received_at === "string"
+        ? event.received_at
+        : typeof event.at === "string"
+          ? event.at
+          : undefined;
+    if (at && Number.isFinite(Date.parse(at))) latest = laterTimestamp(latest, at);
+  }
+  return latest;
+}
+
+function sessionStatusForLane(
+  lane: Lane,
+  nativeState?: string,
+  fallback: SessionLogStatus = "dispatched",
+): SessionLogStatus {
+  if (lane.sessionLog?.status === "retired") return "retired";
+  if (
+    lane.completionReceipt ||
+    lane.status === "completion-reported" ||
+    lane.status === "completed" ||
+    lane.status === "operator-closed"
+  )
+    return "completed";
+  if (nativeState === "working") return "working";
+  if (nativeState === "idle") return "idle";
+  if (nativeState === "done") return "done";
+  if (nativeState === "gone") return "gone";
+  // Herdr's blocked state has no corresponding session-log state. Preserve a
+  // prior valid lifecycle state rather than inventing a second vocabulary.
+  return validSessionLogStatus(lane.sessionLog?.status, fallback);
+}
+
+function syncLaneSessionLog(
+  workflow: Workflow,
+  lane: Lane,
+  nativeState?: string,
+): void {
+  const current = lane.sessionLog;
+  if (!current) return;
+  const responseAt = latestLaneLedgerResponseAt(workflow, lane);
+  lane.sessionLog = {
+    ...current,
+    kind: "lane",
+    workflowId: workflow.id,
+    laneId: lane.id,
+    ...(lane.paneId ? { paneId: lane.paneId } : {}),
+    ...(lane.tabId ? { tabId: lane.tabId } : {}),
+    ...(workflow.ownership.workspaceId
+      ? { workspaceId: workflow.ownership.workspaceId }
+      : {}),
+    ...(workflow.worktree ? { worktree: workflow.worktree } : {}),
+    status: sessionStatusForLane(lane, nativeState),
+    ...(responseAt
+      ? { lastResponseAt: laterTimestamp(current.lastResponseAt, responseAt) }
+      : {}),
+  };
+}
+
+function rootSessionPersistence(
+  root: ControllerRootMapping,
+  agent: unknown,
+): PersistenceHandle {
+  const native = nativeSessionFromAgent(agent);
+  if (native)
+    return toPersistenceHandle(native, root.agent_kind ?? "herdr");
+  const sessionId =
+    (isRecord(agent) && typeof agent.session_id === "string" && agent.session_id) ||
+    `${root.workspace_id}:${root.pane_id}`;
+  return {
+    provider: root.agent_kind ?? "herdr",
+    sessionId,
+    nativeHandle: {
+      kind: "pane",
+      paneId: root.pane_id,
+      workspaceId: root.workspace_id,
+    },
+  };
+}
+
+function rootSessionStatus(
+  agent: unknown,
+  fallback: SessionLogStatus = "idle",
+): SessionLogStatus {
+  const state = deepState(agent);
+  if (state === "working") return "working";
+  if (state === "idle") return "idle";
+  if (state === "done") return "done";
+  return validSessionLogStatus(fallback, "idle");
+}
+
+function rootSessionEntry(
+  root: ControllerRootMapping,
+  agent: unknown,
+  previous: SessionLogEntry | undefined,
+  startedAt: string,
+  lastResponseAt: string | undefined,
+): SessionLogEntry {
+  const prior =
+    previous?.kind === "root" &&
+    previous.paneId === root.pane_id &&
+    previous.workspaceId === root.workspace_id
+      ? previous
+      : undefined;
+  return {
+    kind: "root",
+    sessionRef: rootSessionPersistence(root, agent),
+    startedAt: prior?.startedAt ?? startedAt,
+    ...(laterTimestamp(prior?.lastResponseAt, lastResponseAt)
+      ? {
+          lastResponseAt: laterTimestamp(
+            prior?.lastResponseAt,
+            lastResponseAt,
+          ),
+        }
+      : {}),
+    status: rootSessionStatus(agent, prior?.status),
+    paneId: root.pane_id,
+    workspaceId: root.workspace_id,
+  };
+}
+
+function sessionLogEntries(manifest: Manifest): SessionLogEntry[] {
+  const entries: SessionLogEntry[] = [];
+  if (manifest.sessionLog) entries.push({ ...manifest.sessionLog });
+  for (const workflow of manifest.workflows)
+    for (const lane of workflow.lanes)
+      if (lane.sessionLog) {
+        const responseAt = latestLaneLedgerResponseAt(workflow, lane);
+        entries.push({
+          ...lane.sessionLog,
+          ...(responseAt
+            ? {
+                lastResponseAt: laterTimestamp(
+                  lane.sessionLog.lastResponseAt,
+                  responseAt,
+                ),
+              }
+            : {}),
+        });
+      }
+  return entries;
+}
+
+function goneAgentError(error: unknown): boolean {
+  return /agent_not_found|agent_not_running|agent_pane_not_found|agent_pane_unavailable|ENOENT/i.test(
+    String(error),
+  );
+}
+
 function contract(workflow: Workflow, lane: Lane): string {
   const agentKind = laneAgentKind(workflow, lane);
   return [
@@ -2598,6 +2830,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         "herdr_bootstrap_root add=true cannot be combined with reset=true; add mode never resets existing mappings or manifest state.",
       );
     const root = await currentPaneRoot(signal);
+    const rootAgent = responseRecord(
+      await runHerdr(["agent", "get", root.pane_id], signal),
+      "bootstrap root session",
+    ).agent;
     const resolvedCwd = resolve(cwd);
     const configPath = await controllerConfigPath(signal);
     const config = await loadControllerConfig(configPath);
@@ -2653,6 +2889,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const current = rootForPaneAndCwd(config);
     const conflictingPaneRoot = rootForPane(config);
     const labelEvidence: string[] = [];
+    let rootTabId: string | undefined;
     // Best-effort sync read for display labels only; authoritative manifest
     // access stays on the transactional async path.
     const readManifestForLabel = (
@@ -2695,6 +2932,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           "tab_id",
           "root pane get for tab label",
         );
+        rootTabId = tabId;
         const label = rootTabLabel();
         await runHerdr(["tab", "rename", tabId, label], signal);
         labelEvidence.push(`Root tab ${tabId} labeled ${label}.`);
@@ -2706,8 +2944,35 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         );
       }
     };
+    const persistRootTabId = async (): Promise<void> => {
+      if (!rootTabId) return;
+      await withManifestTransaction(cwd, (manifest) => {
+        if (
+          manifest.sessionLog?.kind === "root" &&
+          manifest.sessionLog.paneId === root.pane_id &&
+          manifest.sessionLog.workspaceId === root.workspace_id
+        )
+          manifest.sessionLog = { ...manifest.sessionLog, tabId: rootTabId };
+        return manifest;
+      });
+    };
     if (current && !reset) {
+      await withManifestTransaction(cwd, (manifest) => {
+        const stamp = now();
+        const priorActivity =
+          manifest.parentGoal?.supervisor?.rootTurn?.updatedAt ??
+          manifest.parentGoal?.supervisor?.rootActivity?.observedAt;
+        manifest.sessionLog = rootSessionEntry(
+          root,
+          rootAgent,
+          manifest.sessionLog,
+          manifest.sessionLog?.startedAt ?? stamp,
+          laterTimestamp(priorActivity, stamp),
+        );
+        return manifest;
+      });
       await renameRootTab();
+      await persistRootTabId();
       return {
         root,
         configPath,
@@ -2802,11 +3067,46 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             throw new Error(
               "Controller config or parent manifest has existing state. Review it, then call herdr_bootstrap_root with reset=true to retire it before claiming this manually started root.",
             );
-          if (reset) await saveManifest(cwd, { version: 2, workflows: [] });
+          const bootstrapStamp = now();
+          const priorActivity =
+            latestManifest.parentGoal?.supervisor?.rootTurn?.updatedAt ??
+            latestManifest.parentGoal?.supervisor?.rootActivity?.observedAt;
+          const refreshedRootSession = rootSessionEntry(
+            root,
+            rootAgent,
+            latestManifest.sessionLog,
+            latestManifest.sessionLog?.startedAt ?? bootstrapStamp,
+            laterTimestamp(priorActivity, bootstrapStamp),
+          );
+          // Preserve compatibility with a destructive reset of a legacy
+          // manifest that never had a root session trace. A reset with an
+          // existing trace, or a genuinely fresh reset, records the root;
+          // there is otherwise no prior root identity to preserve.
+          const persistResetSession =
+            !reset || Boolean(latestManifest.sessionLog) || !manifestHasState(latestManifest);
+          if (reset)
+            await saveManifest(cwd, {
+              version: 2,
+              workflows: [],
+              ...(persistResetSession ? { sessionLog: refreshedRootSession } : {}),
+            });
           else if (add && !manifestHasState(latestManifest))
             // A new root owns a private manifest even before its first goal or
             // workflow is created; never rewrite a manifest containing state.
-            await saveManifest(cwd, latestManifest);
+            await saveManifest(cwd, {
+              ...latestManifest,
+              sessionLog: refreshedRootSession,
+            });
+          else if (!latestManifest.sessionLog)
+            await saveManifest(cwd, {
+              ...latestManifest,
+              sessionLog: refreshedRootSession,
+            });
+          else if (current && !reset)
+            await saveManifest(cwd, {
+              ...latestManifest,
+              sessionLog: refreshedRootSession,
+            });
           await saveControllerConfig(
             configPath,
             reset || !latestConfig
@@ -2824,7 +3124,22 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       await release();
     }
     if (alreadyRegisteredAfterLock) {
+      await withManifestTransaction(cwd, (manifest) => {
+        const stamp = now();
+        const priorActivity =
+          manifest.parentGoal?.supervisor?.rootTurn?.updatedAt ??
+          manifest.parentGoal?.supervisor?.rootActivity?.observedAt;
+        manifest.sessionLog = rootSessionEntry(
+          root,
+          rootAgent,
+          manifest.sessionLog,
+          manifest.sessionLog?.startedAt ?? stamp,
+          laterTimestamp(priorActivity, stamp),
+        );
+        return manifest;
+      });
       await renameRootTab();
+      await persistRootTabId();
       return {
         root,
         configPath,
@@ -2836,6 +3151,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       };
     }
     await renameRootTab();
+    await persistRootTabId();
     return {
       root,
       configPath,
@@ -3728,8 +4044,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     // receipt, an approval) can never be silently overwritten by observation
     // results gathered while these unlocked terminal/network calls ran.
     const snapshot = workflowFor(await loadManifest(cwd), id);
-    if (!snapshot.lanes.some((lane) => lane.agentName))
-      throw new Error(`Workflow ${id} has no recorded Herdr agents.`);
+    // Retired/gone lanes remain observable through their durable session log;
+    // there may be no live Herdr agent left to query.
     requireHerdr();
 
     const observations: Array<{
@@ -3742,6 +4058,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const laneUpdates: Array<{
       id: string;
       fields: Partial<Lane>;
+      nativeState: string;
       newEvidence?: { at: string; kind: "goal-paused"; text: string };
     }> = [];
     let primaryLaneUpdate:
@@ -3752,23 +4069,34 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       | undefined;
     for (const [index, lane] of snapshot.lanes.entries()) {
       if (!lane.agentName) continue;
-      const agent = await runHerdr(["agent", "get", lane.agentName], signal);
-      const output = clip(
-        await runHerdrRaw(
-          [
-            "agent",
-            "read",
-            lane.agentName,
-            "--source",
-            "recent-unwrapped",
-            "--lines",
-            String(RECENT_AGENT_OUTPUT_LINES),
-          ],
-          signal,
-        ),
-        GOAL_PAUSE_OUTPUT_LIMIT,
-      );
-      const state = deepState(agent) ?? "unknown";
+      let agent: unknown = null;
+      let output = "";
+      let state = "unknown";
+      try {
+        agent = await runHerdr(["agent", "get", lane.agentName], signal);
+        output = clip(
+          await runHerdrRaw(
+            [
+              "agent",
+              "read",
+              lane.agentName,
+              "--source",
+              "recent-unwrapped",
+              "--lines",
+              String(RECENT_AGENT_OUTPUT_LINES),
+            ],
+            signal,
+          ),
+          GOAL_PAUSE_OUTPUT_LIMIT,
+        );
+        state = deepState(agent) ?? "unknown";
+      } catch (error) {
+        if (!goneAgentError(error)) throw error;
+        // A retired tab/worktree is expected to be unavailable. Its durable
+        // session identity is still reported and is marked gone unless the
+        // lane was already explicitly retired.
+        state = "gone";
+      }
       const agentKind = laneAgentKind(snapshot, lane);
       const agentSessionPath = deepString(agent, [
         "agent_session_path",
@@ -3812,6 +4140,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       laneUpdates.push({
         id: lane.id,
         fields,
+        nativeState: state,
         ...(goalPaused && !unchangedPause
           ? {
               newEvidence: {
@@ -3822,7 +4151,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             }
           : {}),
       });
-      if (index === 0) {
+      if (index === 0 && agent) {
         primaryLaneUpdate = {
           agent: { sessionPath: agentSessionPath, sessionId: agentSessionId },
           ...(agentKind === "pi"
@@ -3868,15 +4197,21 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         // A lane removed by a concurrent writer has nothing left to update.
         if (index === -1) continue;
         stored.lanes[index] = { ...stored.lanes[index], ...update.fields };
+        syncLaneSessionLog(stored, stored.lanes[index], update.nativeState);
         if (update.newEvidence) stored.evidence.push(update.newEvidence);
       }
+      // Controller events may have landed after the unlocked native reads;
+      // derive activity from the freshly reloaded ledger for every lane.
+      for (const lane of stored.lanes) syncLaneSessionLog(stored, lane);
       if (primaryLaneUpdate) {
         stored.agent = primaryLaneUpdate.agent;
         if (primaryLaneUpdate.pi) stored.pi = primaryLaneUpdate.pi;
       }
       const explicitlyCompleted = workflowHasExplicitSuccess(stored);
-      stored.status = explicitlyCompleted ? "completed" : observedStatus;
-      stored.outcome = explicitlyCompleted ? "completed" : "unknown";
+      if (observations.length > 0) {
+        stored.status = explicitlyCompleted ? "completed" : observedStatus;
+        stored.outcome = explicitlyCompleted ? "completed" : "unknown";
+      }
       stored.observedAt = now();
       stored.updatedAt = now();
       stored.evidence.push({
@@ -3894,7 +4229,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       observedWorkflow.eventControllerRegistration?.status === "pending"
     )
       await registerEventController(cwd, id, signal);
-    const workflow = workflowFor(await loadManifest(cwd), id);
+    const currentManifest = await loadManifest(cwd);
+    const workflow = workflowFor(currentManifest, id);
     const nowMs = Date.now();
     const messages = (workflow.messageRequests ?? []).filter((message) => {
       const at = Date.parse(message.requestedAt);
@@ -3903,7 +4239,15 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         (Number.isFinite(at) && nowMs - at <= RECENT_MESSAGE_WINDOW_MS)
       );
     });
-    return { workflow, state: workflow.status, observations, messages };
+    return {
+      workflow,
+      state: workflow.status,
+      observations,
+      messages,
+      // This is scoped to the manifest owned by the current root. It includes
+      // the root trace plus every workflow lane, including retired lanes.
+      sessionLog: sessionLogEntries(currentManifest),
+    };
   }
 
   async function resume(
@@ -4119,6 +4463,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         delivery: "pending",
       };
       current.status = "completion-reported";
+      syncLaneSessionLog(stored, current);
       updateLaneGoal(stored, current, "completed", "success");
       stored.status = workflowHasExplicitSuccess(stored)
         ? "completed"
@@ -4258,6 +4603,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       // an authorized operator reconciled the outcome, not that the lane
       // successfully called herdr_complete.
       lane.status = "operator-closed";
+      syncLaneSessionLog(stored, lane);
       // Stamp the workflow level only when every lane is terminal: the
       // controller treats workflow-wide status/outcome as a post-completion
       // signal, and one lane's reconciliation must never suppress a still-
@@ -4550,6 +4896,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         record.status = "retired";
         record.pendingTabIds = [];
         record.completedAt = timestamp;
+        for (const lane of stored.lanes)
+          if (lane.sessionLog)
+            lane.sessionLog = { ...lane.sessionLog, status: "retired" };
         stored.evidence.push({
           at: timestamp,
           kind: "lane-retirement-completed",
@@ -4593,6 +4942,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           if (record.pendingTabIds.length === 0) {
             record.status = "retired";
             record.completedAt = timestamp;
+            for (const lane of stored.lanes)
+              if (lane.sessionLog)
+                lane.sessionLog = { ...lane.sessionLog, status: "retired" };
             stored.evidence.push({
               at: timestamp,
               kind: "lane-retirement-completed",
@@ -5059,19 +5411,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     if (process.env.HERDR_ENV !== "1" || !isRootOrchestrator()) return;
     const turn = currentRootTurn(state);
     const config = readControllerConfigForCurrentPane();
-    if (
-      !config?.orchestrators.some(
-        (record) =>
-          record.root.pane_id === turn.paneId &&
-          record.root.workspace_id === turn.workspaceId &&
-          record.root.agent_kind === "pi" &&
-          (record.program?.parent_manifest_path === manifestPath(ctx.cwd) ||
-            record.workflows.some(
-              (workflow) => workflow.manifest_path === manifestPath(ctx.cwd),
-            )),
-      )
-    )
-      return;
+    const mappedRoot = config?.orchestrators.find(
+      (record) =>
+        record.root.pane_id === turn.paneId &&
+        record.root.workspace_id === turn.workspaceId &&
+        record.root.agent_kind === "pi" &&
+        (record.program?.parent_manifest_path === manifestPath(ctx.cwd) ||
+          record.workflows.some(
+            (workflow) => workflow.manifest_path === manifestPath(ctx.cwd),
+          )),
+    );
+    if (!mappedRoot) return;
     let release: (() => Promise<void>) | undefined;
     try {
       release = await acquireManifestLock(ctx.cwd, 10_000);
@@ -5080,13 +5430,32 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         return;
       const manifest = await loadManifest(ctx.cwd);
       const control = manifest.parentGoal?.supervisor;
-      if (!control) return;
       if (
         state === "idle" &&
+        control &&
         (control.rootTurn?.runId !== turn.runId ||
           control.rootTurn.state !== "active")
       )
         return;
+      const sessionPath = ctx.sessionManager.getSessionFile();
+      const sessionAgent = {
+        agent_status:
+          state === "active" ? "working" : state === "idle" ? "idle" : "unknown",
+        ...(sessionPath
+          ? { agent_session: { kind: "path" as const, value: sessionPath } }
+          : {}),
+      };
+      manifest.sessionLog = rootSessionEntry(
+        mappedRoot.root,
+        sessionAgent,
+        manifest.sessionLog,
+        manifest.sessionLog?.startedAt ?? turn.updatedAt,
+        turn.updatedAt,
+      );
+      if (!control) {
+        await saveManifest(ctx.cwd, manifest);
+        return;
+      }
       control.rootTurn = turn;
       if (state === "active" && control.lastDelivery?.status === "delivered")
         control.lastDelivery.acknowledgedAt ??= turn.updatedAt;

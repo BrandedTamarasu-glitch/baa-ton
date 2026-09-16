@@ -128,6 +128,38 @@ function sameSession(
   );
 }
 
+function laneSessionLog(
+  workflow: Workflow,
+  lane: Lane,
+  persistenceHandle: ReturnType<typeof toPersistenceHandle>,
+  status: "dispatched" | "working" | "completed",
+) {
+  return {
+    kind: "lane" as const,
+    sessionRef: persistenceHandle,
+    // agentStartedAt/incarnationStartedAt are the existing dispatch evidence;
+    // workflow.createdAt is only the legacy recovery fallback.
+    startedAt:
+      lane.sessionLog?.startedAt ??
+      lane.agentStartedAt ??
+      lane.incarnationStartedAt ??
+      workflow.dispatchedAt ??
+      workflow.createdAt,
+    ...(lane.sessionLog?.lastResponseAt
+      ? { lastResponseAt: lane.sessionLog.lastResponseAt }
+      : {}),
+    status,
+    workflowId: workflow.id,
+    laneId: lane.id,
+    ...(lane.paneId ? { paneId: lane.paneId } : {}),
+    ...(lane.tabId ? { tabId: lane.tabId } : {}),
+    ...(workflow.ownership.workspaceId
+      ? { workspaceId: workflow.ownership.workspaceId }
+      : {}),
+    ...(workflow.worktree ? { worktree: workflow.worktree } : {}),
+  };
+}
+
 /** Herdr has no native wait-for-shell command. `pane process-info` is the
  * native readiness signal: a pane is startable when its interactive shell is
  * the only foreground process (shell_pid set and matching). Gating on it
@@ -358,6 +390,8 @@ export async function dispatchTask(
           delete current.piSessionPath;
           delete current.piSessionId;
           delete current.completionReceipt;
+          if (current.sessionLog)
+            current.sessionLog = { ...current.sessionLog, status: "planned" };
           current.status = "planned";
           const goal = w.goals?.find((item) => item.id === current.goalId);
           if (goal) {
@@ -712,11 +746,18 @@ export async function dispatchTask(
       await update((w) => {
         const current = w.lanes[i];
         current.nativeSession = proof.session;
-        current.persistenceHandle = toPersistenceHandle(
+        const persistenceHandle = toPersistenceHandle(
           proof.persistence ?? proof.session,
           profile.provider,
         );
+        current.persistenceHandle = persistenceHandle;
         current.incarnationStartedAt = new Date().toISOString();
+        current.sessionLog = laneSessionLog(
+          w,
+          current,
+          persistenceHandle,
+          current.completionReceipt ? "completed" : "dispatched",
+        );
         if (proof.session.kind === "path")
           current.agentSessionPath = proof.session.value;
         else current.agentSessionId = proof.session.value;
@@ -744,7 +785,11 @@ export async function dispatchTask(
       await update((w) => {
         const current = w.lanes[i];
         current.promptedAt = new Date().toISOString();
-        if (!current.completionReceipt) current.status = "running";
+        if (!current.completionReceipt) {
+          current.status = "running";
+          if (current.sessionLog)
+            current.sessionLog = { ...current.sessionLog, status: "working" };
+        }
         const goal = w.goals?.find((item) => item.id === current.goalId);
         if (goal && goal.outcome === "unresolved") {
           goal.revision += 1;
