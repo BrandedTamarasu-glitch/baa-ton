@@ -131,11 +131,13 @@ delivered to the waiting lane. Lanes never prompt their own UI.
 
 | Harness | Adapter | Live qualification | Tested with | Notes |
 | --- | --- | --- | --- | --- |
-| Pi | `pi-launch-adapter.ts` | 2026-09-15, several lanes | pi 0.85.1 | First-class: native tools, bash interception, can host the root |
+| Pi | `pi-launch-adapter.ts` | 2026-09-15, several lanes | pi 0.85.1 | First-class: native tools, bash interception |
 | Claude Code | `claude-launch-adapter.ts` | 2026-09-16, qualification receipt + 4 receipted lanes | claude 2.1.273 | Deny-rules (push/merge/PR), SessionStart attestation |
 | Codex | `codex-launch-adapter.ts` | 2026-09-16, messaging-core + live re-verification | codex-cli 0.154.0 | Sandbox can't write worktree git metadata (parent commits); no MCP respawn; and a host `approval_policy=never` denies the lane's own mutating bridge tools — no per-server override exists, so unattended never-policy hosts can't file codex receipts (operator reconciliation applies; `on-request` works attended) |
 | OpenCode | `opencode-launch-adapter.ts` | 2026-09-15, goals/profiles lane | opencode 1.18.31 | READY handshake auto-sent, conservative bash permissions |
 | Anything else | — | Fails closed | — | By design, before topology is created |
+
+Any qualified harness can host the root — `pi`, `claude`, `codex`, or `opencode` — via `root-setup.mjs` (Pi additionally gets the native extension with bash interception). Concurrent roots are supported: bootstrap a second root with `add: true` from a distinct pane and workspace.
 
 Qualification covers the tested subscription profiles, not every model or configuration.
 Recovery and lifecycle integration still have rough edges — see the
