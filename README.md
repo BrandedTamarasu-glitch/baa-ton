@@ -1,6 +1,6 @@
 # Baa-ton
 
-<img src="assets/mascot.svg" alt="A little sheep with a terminal face" width="96" height="96">
+<img src="assets/mascot.png" alt="Baazle, the Baa-ton sheep" width="96" height="96">
 
 Baa-ton is a Herdr-owned orchestration core with thin adapters for each coding-agent harness. Herdr owns the terminals and agent processes; Baa-ton coordinates their work.
 
