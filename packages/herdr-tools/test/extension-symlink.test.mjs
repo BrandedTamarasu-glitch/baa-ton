@@ -7,7 +7,24 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const jiti = require("jiti")(import.meta.url);
+const checkoutRoot = join(
+  dirname(dirname(fileURLToPath(import.meta.url))),
+  "..",
+  "..",
+);
+// Pi bundles core extension dependencies (typebox) for extensions; bare jiti
+// does not, so alias the checkout's copy for the symlinked-load test.
+const jiti = require("jiti")(import.meta.url, {
+  alias: {
+    typebox: join(
+      checkoutRoot,
+      "node_modules",
+      "typebox",
+      "build",
+      "index.mjs",
+    ),
+  },
+});
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 
