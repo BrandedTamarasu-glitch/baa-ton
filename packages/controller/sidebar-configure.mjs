@@ -57,6 +57,8 @@ function matchingBracket(text, open) {
 
 function goalRows() {
   return [
+    '[{ token = "$herdr_role", fg = "#89b4fa", bold = true, dim = false }]',
+    '[{ token = "$herdr_workflow", fg = "#a99e92", bold = false, dim = false }]',
     '[{ token = "$herdr_goal_status", fg = "#c78a1f", bold = true, dim = false }]',
     '[{ token = "$herdr_goal_next_1", fg = "#a99e92", bold = false, dim = false }]',
     '[{ token = "$herdr_goal_next_2", fg = "#a99e92", bold = false, dim = false }]',

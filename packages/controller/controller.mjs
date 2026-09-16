@@ -1375,6 +1375,28 @@ const GOAL_SIDEBAR_TOKEN_NAMES = [
   "herdr_goal_next_3",
 ];
 
+function workflowShortId(workflowId) {
+  const generated = /^herdr-([a-z0-9]+)/i.exec(workflowId)?.[1];
+  return (generated ?? workflowId.replace(/[^a-z0-9]/gi, ""))
+    .toLowerCase()
+    .slice(0, 8) || "workflow";
+}
+
+async function publishParticipantSidebar({ role, paneId, workflowId, herdr }) {
+  try {
+    const tokens = { herdr_role: role };
+    if (workflowId) tokens.herdr_workflow = workflowShortId(workflowId);
+    await herdr.request("pane.report_metadata", {
+      pane_id: paneId,
+      source: OWNER,
+      tokens,
+      ttl_ms: 86_400_000,
+    });
+  } catch {
+    // Display-only role breadcrumbs must never change controller lifecycle.
+  }
+}
+
 function wrapSidebarText(text, width = 20) {
   const words = text.trim().split(/\s+/).filter(Boolean);
   const lines = [];
@@ -1393,6 +1415,7 @@ function wrapSidebarText(text, width = 20) {
 function parentGoalSidebarTokens(goal) {
   const next = wrapSidebarText(goal.nextAction).slice(0, 3);
   return {
+    herdr_role: "🐕 root",
     herdr_goal_status: `Goal: ${goal.status.replaceAll("-", " ")}`,
     herdr_goal_next_1: next[0] ? `Next: ${next[0]}` : null,
     herdr_goal_next_2: next[1] ?? null,
@@ -1869,6 +1892,10 @@ export async function runSupervisorTick({
           config.owner,
         ),
       );
+      // Herdr's sidebar rows are selected by canonical agent kind, while
+      // pane.report_metadata supplies the per-pane role/workflow breadcrumb.
+      // The display-only publication runs in finally, after lifecycle work,
+      // so it cannot affect live-root checks or delivery decisions.
       // Parent questions and approvals are persisted by the extension, while
       // this controller owns the parent goal. Reconcile them on the same
       // event-driven tick so the sidebar reserves "action required" for a
@@ -2164,6 +2191,21 @@ export async function runSupervisorTick({
       results.push({ manifestPath, status: outcome.status });
     } finally {
       await release();
+      // Publish both sides of the mapping; this is best effort, so a missing
+      // pane or older Herdr never blocks supervision.
+      await publishParticipantSidebar({
+        role: "🐕 root",
+        paneId: orchestrator.root.pane_id,
+        herdr: api,
+      });
+      for (const candidate of workflows)
+        for (const lane of candidate.lanes)
+          await publishParticipantSidebar({
+            role: "🐑 child",
+            paneId: lane.pane_id,
+            workflowId: candidate.workflow_id,
+            herdr: api,
+          });
     }
   }
   return { accepted: true, results, pendingWakes };

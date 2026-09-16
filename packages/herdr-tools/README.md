@@ -21,6 +21,25 @@ All operations fail closed outside a Herdr session. Dispatch, resume, and close 
 
 A registered child uses `herdr_message` for durable informational context the root should review, including late facts after `herdr_complete`; use the question flow when Zach must decide something, and use `herdr_complete` for the lane's one completion receipt. Messages are not approval requests and are controller-routed to wake the mapped root.
 
+## UI labels
+
+Herdr lanes are labeled `🐑 <slug>` and the manually bootstrapped parent tab is
+labeled `🐕 root`; the same role markers appear in the optional sidebar rows.
+Lane slugs are deterministic kebab-case made from up to five significant
+objective words after stopword removal, capped at 32 ASCII characters. New
+lane agents use `child-<workflow8>-<laneNumber>` (for example,
+`child-b5cc61d5-1`); existing names remain valid and unchanged.
+
+Herdr v0.9.0 measures tab labels with Unicode display width (including the
+East Asian Wide width of both role glyphs) before truncating, so the emoji
+format is the active format. If a future renderer loses that width handling,
+use the equivalent fallback prefixes `R: root` and `C: <slug>`.
+
+The native `rows_by_agent` selector is canonical-agent scoped, so the
+controller supplies `$herdr_role` and `$herdr_workflow` as pane metadata
+(tokens are omitted when a value is unavailable); a root does not get one
+workflow ID when it supervises multiple workflows.
+
 ## Guarantees
 
 - Manifests are private, atomic local records.

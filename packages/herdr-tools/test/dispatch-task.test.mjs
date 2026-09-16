@@ -6,7 +6,12 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const jiti = require("jiti")(import.meta.url);
-const { dispatchTask } = await jiti.import("../dispatch-task.ts");
+const {
+  childAgentName,
+  dispatchTask,
+  laneSlug,
+  laneTabLabel,
+} = await jiti.import("../dispatch-task.ts");
 const { piLaunchAdapter } = await jiti.import("../pi-launch-adapter.ts");
 const { claudeLaunchAdapter } = await jiti.import(
   "../claude-launch-adapter.ts",
@@ -38,6 +43,9 @@ async function fixture(options = {}) {
     launchProfile,
     lanes: [1, 2].map((i) => ({
       id: `lane-${i}`,
+      objective: i === 1
+        ? "Review startup handshake sequencing"
+        : "Verify durable assignment routing",
       agentKind: options.adapter?.kind ?? "pi",
       status: "planned",
       ...(laneProfiles[i - 1]
@@ -275,12 +283,42 @@ async function fixture(options = {}) {
   };
 }
 
+test("lane slugs strip stopwords, keep five significant words, and stay capped", () => {
+  assert.equal(
+    laneSlug("Add a deterministic lane tab label for review"),
+    "add-deterministic-lane-tab-label",
+  );
+  assert.equal(laneSlug("the and with"), "lane");
+  assert.equal(
+    laneSlug("A very long objective with enough words to exceed the label cap"),
+    "very-long-objective-enough-words",
+  );
+  assert.ok(laneSlug("A remarkably lengthy objective that should be capped").length <= 32);
+});
+
+test("workflow short IDs use the generated UUID prefix in child agent names", () => {
+  assert.equal(childAgentName("herdr-b5cc61d5-ignored-suffix", 1), "child-b5cc61d5-1");
+});
+
 test("opaque IDs and different checkout still produce only tabs in one designated workspace", async () => {
   const f = await fixture();
   try {
     assert.equal((await f.run()).dispatched, true);
     assert.equal(f.state.ownership.workspaceId, "task-space");
     assert.equal(f.state.ownership.paneIds.length, 2);
+    assert.deepEqual(
+      f.calls
+        .filter((call) => call[0] === "tab" && call[1] === "create")
+        .map((call) => call[call.indexOf("--label") + 1]),
+      [
+        laneTabLabel("Review startup handshake sequencing"),
+        laneTabLabel("Verify durable assignment routing"),
+      ],
+    );
+    assert.deepEqual(
+      f.state.lanes.map((lane) => lane.agentName),
+      ["child-wf-1", "child-wf-2"],
+    );
     assert.equal(f.calls.filter((c) => c[1] === "prompt").length, 2);
     assert.equal(
       f.calls.some((c) => c[0] === "workspace" && c[1] !== "get"),

@@ -2339,6 +2339,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     reset: boolean;
     manifestReset: boolean;
     alreadyRegistered: boolean;
+    evidence: string[];
   }> {
     requireHerdr();
     const root = await currentPaneRoot(signal);
@@ -2365,14 +2366,39 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         sameControllerRoot(record.root, root) &&
         record.program.id === resolve(cwd),
     );
-    if (current && !reset)
+    const labelEvidence: string[] = [];
+    const renameRootTab = async (): Promise<void> => {
+      try {
+        const paneResult = responseRecord(
+          await runHerdr(["pane", "get", root.pane_id], signal),
+          "root pane get for tab label",
+        );
+        if (!isRecord(paneResult.pane))
+          throw new Error("Herdr root pane response has no pane record.");
+        const tabId = requiredString(
+          paneResult.pane,
+          "tab_id",
+          "root pane get for tab label",
+        );
+        await runHerdr(["tab", "rename", tabId, "🐕 root"], signal);
+        labelEvidence.push(`Root tab ${tabId} labeled 🐕 root.`);
+      } catch (error) {
+        // Labels are display-only. A native renderer/API mismatch must never
+        // make a verified root bootstrap fail after its durable claim landed.
+        labelEvidence.push(`Root tab label 🐕 root could not be applied: ${String(error)}`);
+      }
+    };
+    if (current && !reset) {
+      await renameRootTab();
       return {
         root,
         configPath,
         reset: false,
         manifestReset: false,
         alreadyRegistered: true,
+        evidence: labelEvidence,
       };
+    }
     if ((config && config.orchestrators.length > 0) || manifestHasLegacyState) {
       if (!reset)
         throw new Error(
@@ -2421,12 +2447,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     } finally {
       await release();
     }
+    await renameRootTab();
     return {
       root,
       configPath,
       reset,
       manifestReset: reset,
       alreadyRegistered: false,
+      evidence: labelEvidence,
     };
   }
 
@@ -4699,9 +4727,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         content: [
           {
             type: "text",
-            text: result.alreadyRegistered
+            text: `${result.alreadyRegistered
               ? `Verified Baa-ton root ${result.root.pane_id} is already registered.`
-              : `Registered Baa-ton root ${result.root.pane_id}${result.reset ? " after retiring prior mappings" : ""}.`,
+              : `Registered Baa-ton root ${result.root.pane_id}${result.reset ? " after retiring prior mappings" : ""}.`}${result.evidence.length ? ` ${result.evidence.join(" ")}` : ""}`,
           },
         ],
         details: result,

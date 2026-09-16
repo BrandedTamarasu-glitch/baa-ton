@@ -89,11 +89,23 @@ if (args[0] === "plugin" && args[1] === "config-dir") {
       agent: child ? "pi" : "claude",
       name: child ? "child" : "root",
       pane_id: pane,
+      tab_id: child ? "w-root:t-child" : "w-root:t-root",
       workspace_id: process.env.TEST_ROOT_WORKSPACE,
       agent_session: { kind: "path", value: child ? "/sessions/child" : "/sessions/root" },
       agent_status: "idle",
     },
   });
+} else if (args[0] === "pane" && args[1] === "get") {
+  result({
+    type: "pane_info",
+    pane: {
+      pane_id: args[2],
+      tab_id: "w-root:t-root",
+      workspace_id: process.env.TEST_ROOT_WORKSPACE,
+    },
+  });
+} else if (args[0] === "tab" && args[1] === "rename") {
+  result({ type: "tab_renamed", tab_id: args[2], label: args[3] });
 } else {
   process.stderr.write("unexpected fake herdr command: " + args.join(" ") + "\\n");
   process.exitCode = 1;

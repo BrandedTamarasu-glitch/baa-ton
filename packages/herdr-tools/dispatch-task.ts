@@ -36,6 +36,73 @@ export type DispatchOptions = {
   restart?: boolean;
 };
 
+const MAX_LANE_SLUG_LENGTH = 32;
+const SLUG_STOPWORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "by",
+  "for",
+  "from",
+  "in",
+  "into",
+  "is",
+  "it",
+  "of",
+  "on",
+  "or",
+  "that",
+  "the",
+  "this",
+  "these",
+  "those",
+  "to",
+  "via",
+  "with",
+]);
+
+/**
+ * Make a compact, deterministic tab slug from the first significant words of
+ * a lane objective. ASCII output keeps labels portable across Herdr clients;
+ * the hard cap leaves room for the role marker and tab chrome.
+ */
+export function laneSlug(objective: string): string {
+  const words = (objective ?? "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .match(/[a-z0-9]+/g)
+    ?.filter((word) => !SLUG_STOPWORDS.has(word)) ?? [];
+  const selected = words.slice(0, 5);
+  if (selected.length === 0) return "lane";
+  return selected
+    .join("-")
+    .slice(0, MAX_LANE_SLUG_LENGTH)
+    .replace(/-+$/, "") || "lane";
+}
+
+/** Herdr-generated workflow IDs are `herdr-<uuid-prefix>`; retain the
+ * eight-character workflow discriminator in newly assigned agent names. */
+export function workflowShortId(workflowId: string): string {
+  const generated = workflowId.match(/^herdr-([a-z0-9]+)/i)?.[1];
+  const normalized = (generated ?? workflowId.replace(/[^a-z0-9]/gi, ""))
+    .toLowerCase()
+    .slice(0, 8);
+  return normalized || "workflow";
+}
+
+export function childAgentName(workflowId: string, laneNumber: number): string {
+  return `child-${workflowShortId(workflowId)}-${laneNumber}`;
+}
+
+export function laneTabLabel(objective: string): string {
+  return `🐑 ${laneSlug(objective)}`;
+}
+
 function nativeAgent(raw: any): any {
   return (raw?.result ?? raw)?.agent;
 }
@@ -387,7 +454,7 @@ export async function dispatchTask(
             "--cwd",
             workflow.cwd,
             "--label",
-            `${workflow.id}-${lane.id}`,
+            laneTabLabel(lane.objective ?? lane.id),
             "--env",
             `BAA_STARTUP_INTENT=${lane.startupIntentPath}`,
             "--no-focus",
@@ -421,7 +488,7 @@ export async function dispatchTask(
           const l = w.lanes[i];
           l.paneId = pane.pane_id;
           l.tabId = tab.tab_id;
-          l.agentName = `lane_${w.id.replaceAll("-", "")}_${i + 1}`;
+          l.agentName = childAgentName(w.id, i + 1);
           l.relationshipId = `herdr-rel-${randomUUID()}`;
           w.ownership.tabIds ??= [];
           w.ownership.tabIds.push(tab.tab_id);
@@ -434,6 +501,14 @@ export async function dispatchTask(
     for (let i = 0; i < workflow.lanes.length; i++) {
       let lane = workflow.lanes[i];
       const profile = profiles[i];
+      // Preserve names recorded by older manifests, but assign the new scheme
+      // whenever this dispatch is about to start an unnamed lane.
+      if (!lane.agentName) {
+        await update((w) => {
+          w.lanes[i].agentName = childAgentName(w.id, i + 1);
+        });
+        lane = workflow.lanes[i];
+      }
       const intent = JSON.parse(
         await readFile(lane.startupIntentPath!, "utf8"),
       );

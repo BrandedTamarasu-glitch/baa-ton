@@ -31,7 +31,8 @@ test("sidebar configuration appends only Baa-ton goal rows and is idempotent", (
   assert.equal(first.changed, true);
   assert.equal((first.text.match(/# >>> baa-ton goal rows/g) ?? []).length, 2);
   assert.match(first.text, /\$quota_context_normal/);
-  assert.match(first.text, /\$herdr_goal_status/);
+  assert.match(first.text, /\$herdr_role/);
+  assert.match(first.text, /\$herdr_workflow/);
   const second = configureSidebar(first.text);
   assert.equal(second.changed, false);
   assert.equal(second.text, first.text);
@@ -44,6 +45,30 @@ const CHILD = {
   pane_id: "w-child:p1",
   workspace_id: "w-child",
 };
+
+test("supervisor metadata publishes pane-scoped root and child role breadcrumbs", async () => {
+  const fixture = await createFixture();
+  const metadata = [];
+  try {
+    const result = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: {
+        async request(method, params) {
+          assert.equal(method, "pane.report_metadata");
+          metadata.push(params);
+          return { result: {} };
+        },
+      },
+    });
+    assert.equal(result.results[0].status, "no-parent-goal");
+    assert.deepEqual(metadata.map((item) => item.tokens), [
+      { herdr_role: "🐕 root" },
+      { herdr_role: "🐑 child", herdr_workflow: "bb029" },
+    ]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
 
 async function createFixture({
   root = ROOT,
@@ -1088,6 +1113,7 @@ test("a new actionable lane event requests root review once", async () => {
     assert.equal(metadata[0].source, "herdr-orchestrator");
     assert.equal(metadata[0].ttl_ms, 86_400_000);
     assert.deepEqual(metadata[0].tokens, {
+      herdr_role: "🐕 root",
       herdr_goal_status: "Goal: review requested",
       herdr_goal_next_1: "Next: Review durable done",
       herdr_goal_next_2: "event",
@@ -1372,6 +1398,7 @@ test("a bootstrapped root supervises its parent manifest before any lane exists"
   const mock = await startHerdrMock((request) => {
     if (request.method === "agent.get") return rootAgentInfo();
     if (request.method === "agent.prompt") return { result: {} };
+    if (request.method === "pane.report_metadata") return { result: {} };
     throw new Error(`Unexpected method: ${request.method}`);
   });
   try {
@@ -1417,6 +1444,7 @@ test("the Herdr-owned supervisor nudges only a due running parent goal and recor
   });
   const mock = await startHerdrMock((request) => {
     if (request.method === "agent.get") return rootAgentInfo();
+    if (request.method === "pane.report_metadata") return { result: {} };
     if (request.method === "agent.prompt") {
       assert.equal(Object.hasOwn(request.params, "wait"), false);
       assert.match(
@@ -1492,6 +1520,7 @@ test("live root activity can veto delivery even after an authoritative settled t
     }
     if (request.method === "agent.prompt")
       return { result: { type: "agent_prompted" } };
+    if (request.method === "pane.report_metadata") return { result: {} };
     throw new Error(`Unexpected method: ${request.method}`);
   });
   try {
