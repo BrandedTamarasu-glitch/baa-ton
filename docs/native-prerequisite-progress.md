@@ -153,3 +153,19 @@ New papercuts/observations from this round:
 Design philosophy now written down: [DESIGN-PHILOSOPHY.md](DESIGN-PHILOSOPHY.md) —
 enforced interface, truthful capabilities, fail-closed, bridge as transport,
 ACP tier, pane-based root authority (any qualified harness can host the root).
+
+### Cross-vendor review verdict (Claude sonnet-5, read-only lane herdr-33ff206c)
+
+First pass: **FIX-FIRST** — one blocking cross-commit interaction: `herdr_operator_close`
+stamped workflow-wide status/outcome, which the new post-completion suppression
+treats as a signal, so one lane's reconciliation would silently suppress sibling
+lanes' completion wakes in multi-lane workflows. Fixed in `48a1f91`: closure is now
+lane-scoped, workflow-level stamping waits until every lane is terminal, and a
+second lane closure is allowed with per-lane idempotency. Two regressions added
+(operator-close multi-lane scoping; sibling-done wake survives lane-scoped closure).
+Non-blocking fixes folded in: GoalOwnership/OperatorClosure re-exports, discovery-
+evidence-is-Pi-only doc line. Focused re-review verdict: **CONFIRMED-SHIP**, with a
+noted follow-up: in 3+-lane workflows, re-closing an already-closed lane with
+different evidence is unguarded once another lane's closure holds the single
+workflow-level operatorClosure record. Suite after fix: 73/73 extension + 37/37
+controller, tsc 7.0.2 clean, diff-check clean. Local main tip: `48a1f91` (not pushed).
