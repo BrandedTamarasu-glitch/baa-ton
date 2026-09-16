@@ -278,9 +278,12 @@ test("verified root may push; lanes and every other mutation stay blocked", asyn
       /require/,
     );
     assert.match(await blockedReason(`herdr workspace ${closeVerb} w1`), /require/);
+    assert.equal(await bash(`herdr tab ${closeVerb} w1:t3`), undefined, "root may retire lane tabs");
+    assert.equal(await bash(`herdr pane ${closeVerb} w1:p3`), undefined, "root may retire lane panes");
     assert.match(await blockedReason("npm run deploy"), /require/);
     setPane("w1:p2"); // unmapped pane: not the root
     assert.match(await blockedReason(`git ${pushVerb} origin main`), /require/);
+    assert.match(await blockedReason(`herdr tab ${closeVerb} w1:t3`), /require/);
   } finally {
     for (const [key, value] of Object.entries(saved))
       value === undefined

@@ -4005,14 +4005,23 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       /(?:^|[;&|]\s*)(?:git(?:\s+\S+)*\s+(?:push|merge)\b|gh\s+pr\s+create\b|glab\s+mr\s+create\b|hub\s+pull-request\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:deploy|publish|release)\b|(?:wrangler|vercel|netlify|flyctl|kubectl)\s+(?:deploy|publish|apply)\b|herdr\s+(?:workspace|tab|pane)\s+close\b)/im;
     // 2026-09-16 ruling: the verified controller-mapped root is the parent
     // executor acting with the user present, so a plain `git push` is allowed
-    // there. Every other mutation stays blocked for every caller, and a
-    // compound command that also carries a non-push mutation keeps the block.
+    // there, and it may retire its own lane tabs/panes (children remain
+    // reachable through durable manifests). Every other mutation stays
+    // blocked for every caller, workspace closure is never allowed from an
+    // agent shell (it would close the root's own session), and a compound
+    // command that also carries a non-push mutation keeps the block.
     const nonPushMutation =
-      /(?:^|[;&|]\s*)(?:git(?:\s+\S+)*\s+merge\b|gh\s+pr\s+create\b|glab\s+mr\s+create\b|hub\s+pull-request\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:deploy|publish|release)\b|(?:wrangler|vercel|netlify|flyctl|kubectl)\s+(?:deploy|publish|apply)\b|herdr\s+(?:workspace|tab|pane)\s+close\b)/im;
+      /(?:^|[;&|]\s*)(?:git(?:\s+\S+)*\s+merge\b|gh\s+pr\s+create\b|glab\s+mr\s+create\b|hub\s+pull-request\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:deploy|publish|release)\b|(?:wrangler|vercel|netlify|flyctl|kubectl)\s+(?:deploy|publish|apply)\b)/im;
+    const herdrWorkspaceClose =
+      /(?:^|[;&|]\s*)herdr\s+workspace\s+close\b/im;
+    const herdrPaneClose =
+      /(?:^|[;&|]\s*)herdr\s+(?:tab|pane)\s+close\b/im;
     if (
       process.env.HERDR_ENV === "1" &&
       (nonPushMutation.test(command) ||
-        (gitPush.test(command) && !isRootOrchestrator()))
+        herdrWorkspaceClose.test(command) ||
+        (gitPush.test(command) && !isRootOrchestrator()) ||
+        (herdrPaneClose.test(command) && !isRootOrchestrator()))
     ) {
       return {
         block: true,
