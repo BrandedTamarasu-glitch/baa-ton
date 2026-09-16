@@ -15,6 +15,7 @@ import {
   validateConfig,
 } from "../controller.mjs";
 import { configureSidebar } from "../sidebar-configure.mjs";
+import { readStore, storePath } from "../../herdr-tools/inbox/index.mjs";
 
 const ROOT = {
   target: "bb029-root",
@@ -49,6 +50,10 @@ async function createFixture({
   piGoalPauseDetection = true,
   parentGoal,
   settledRoot = true,
+  workflowStatus,
+  workflowOutcome,
+  laneStatus,
+  completionReceipt,
 } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "herdr-controller-"));
   const stateDir = join(directory, "state");
@@ -91,6 +96,8 @@ async function createFixture({
     workflows: [
       {
         id: "herdr-bb029",
+        ...(workflowStatus ? { status: workflowStatus } : {}),
+        ...(workflowOutcome ? { outcome: workflowOutcome } : {}),
         ownership: {
           createdBy: "herdr-orchestrator",
           workspaceId: child.workspace_id,
@@ -100,6 +107,8 @@ async function createFixture({
             id: child.lane_id,
             paneId: child.pane_id,
             agentName: child.target,
+            ...(laneStatus ? { status: laneStatus } : {}),
+            ...(completionReceipt ? { completionReceipt } : {}),
           },
         ],
       },
@@ -185,13 +194,13 @@ function rootAgentInfo() {
   };
 }
 
-function statusEvent(status, agent = "pi") {
+function statusEvent(status, agent = "pi", child = CHILD) {
   return {
     event: "pane_agent_status_changed",
     data: {
       type: "pane_agent_status_changed",
-      pane_id: CHILD.pane_id,
-      workspace_id: CHILD.workspace_id,
+      pane_id: child.pane_id,
+      workspace_id: child.workspace_id,
       agent_status: status,
       agent,
     },
@@ -672,6 +681,139 @@ test("protocol-22 named Pi root accepts agent kind events while serializing dupl
     assert.equal(events[0].classification, "done");
     assert.equal(events[0].wake.status, "delivered");
     assert.equal(events[0].wake.attempts, 1);
+  } finally {
+    await mock.close();
+    await fixture.cleanup();
+  }
+});
+
+test("post-completion done and idle transitions are observational and never wake the root", async () => {
+  const child = {
+    ...CHILD,
+    pane_id: "w-root:p2",
+    workspace_id: ROOT.workspace_id,
+  };
+  const fixture = await createFixture({
+    child,
+    completionReceipt: {
+      id: "incarnation-1",
+      summary: "lane completed",
+      delivery: "delivered",
+    },
+    parentGoal: {
+      version: 1,
+      id: "parent-post-completion",
+      objective: "Do not wake after completion.",
+      status: "waiting-for-event",
+      nextAction: "Wait for a durable controller event.",
+      signals: [],
+      createdAt: "2026-09-14T00:00:00.000Z",
+      updatedAt: "2026-09-14T00:00:00.000Z",
+    },
+  });
+  const requests = [];
+  const herdr = {
+    async request(method) {
+      requests.push(method);
+      return { result: {} };
+    },
+  };
+  try {
+    const result = await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("done", "pi", child),
+      stateDir: fixture.stateDir,
+      herdr,
+    });
+    const idle = await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("idle", "pi", child),
+      stateDir: fixture.stateDir,
+      herdr,
+    });
+    for (const transition of [result, idle]) {
+      assert.equal(transition.record.classification, "unclassified");
+      assert.equal(transition.record.wake.status, "not-required");
+    }
+    assert.deepEqual(
+      requests.filter((method) => method === "agent.get" || method === "agent.prompt"),
+      [],
+    );
+    const manifest = await fixture.manifest();
+    const events = manifest.workflows[0].eventController.events;
+    assert.deepEqual(
+      events.map((event) => event.classification),
+      ["unclassified", "unclassified"],
+    );
+    assert.deepEqual(manifest.parentGoal.signals, []);
+    const inbox = await readStore(storePath({ stateDir: fixture.stateDir }));
+    assert.equal(inbox.messages.length, 2, "observational events remain durable");
+    assert.equal(inbox.messages[0].states.notified, null);
+    assert.deepEqual(inbox.wake_hints, [], "observational events never enqueue a wake");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("post-completion blocked transitions remain actionable", async () => {
+  const child = {
+    ...CHILD,
+    pane_id: "w-root:p3",
+    workspace_id: ROOT.workspace_id,
+  };
+  const fixture = await createFixture({
+    child,
+    workflowStatus: "operator-closed",
+    piGoalPauseDetection: false,
+  });
+  const mock = await startHerdrMock(async (request) => {
+    if (request.method === "agent.get") return rootAgentInfo();
+    if (request.method === "agent.prompt") return { result: {} };
+    throw new Error(`Unexpected ${request.method}`);
+  });
+  try {
+    const result = await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("blocked", "pi", child),
+      stateDir: fixture.stateDir,
+      herdr: client(mock),
+    });
+    assert.equal(result.record.classification, "blocked");
+    assert.equal(result.record.wake.status, "delivered");
+    assert.equal(requestsFor(mock, "agent.prompt").length, 1);
+    const inbox = await readStore(storePath({ stateDir: fixture.stateDir }));
+    assert.equal(inbox.wake_hints.length, 1);
+  } finally {
+    await mock.close();
+    await fixture.cleanup();
+  }
+});
+
+test("pre-completion done transitions remain actionable", async () => {
+  const child = {
+    ...CHILD,
+    pane_id: "w-root:p4",
+    workspace_id: ROOT.workspace_id,
+  };
+  const fixture = await createFixture({
+    child,
+    piGoalPauseDetection: false,
+  });
+  const mock = await startHerdrMock(async (request) => {
+    if (request.method === "agent.get") return rootAgentInfo();
+    if (request.method === "agent.prompt") return { result: {} };
+    throw new Error(`Unexpected ${request.method}`);
+  });
+  try {
+    const result = await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("done", "pi", child),
+      stateDir: fixture.stateDir,
+      herdr: client(mock),
+    });
+    assert.equal(result.record.classification, "done");
+    assert.equal(result.record.wake.status, "delivered");
+    assert.equal(requestsFor(mock, "agent.prompt").length, 1);
   } finally {
     await mock.close();
     await fixture.cleanup();

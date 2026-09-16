@@ -107,5 +107,5 @@ Landed and parent-verified (eecd940, 64/64 extension + 32/32 controller, tsc and
 Genuinely remaining (open):
 
 - Codex upstream: no MCP-server respawn (dead bridge orphans lane tools for the session); sandbox cannot write linked worktree git metadata; no native wait-for-shell (our 60s process-info gate approximates it).
-- Controller still emits observational wake events for post-completion lane idles (done-classification noise); harmless but noisy.
+- Controller records post-completion lane idles as non-actionable observations (no wake), while blocked and goal-paused transitions remain actionable.
 - Bridge session env must be passed explicitly to codex MCP children (fixed in 42e77c1); any future harness with non-inheriting MCP children needs the same.

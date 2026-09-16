@@ -35,6 +35,12 @@ const SOCKET_TIMEOUT_MS = 2_500;
 const MIN_NUDGE_INTERVAL_SECONDS = 5;
 const MAX_NUDGE_INTERVAL_SECONDS = 86_400;
 const ACTIONABLE_CLASSIFICATIONS = new Set(["done", "blocked", "goal-paused"]);
+const POST_COMPLETION_STATUSES = new Set([
+  "completion-reported",
+  "completed",
+  "operator-closed",
+]);
+const POST_COMPLETION_OBSERVATION_STATUSES = new Set(["done", "idle"]);
 const SUPERVISOR_STATES = new Set(["running", "stopped", "paused"]);
 const AGENT_STATUSES = new Set([
   "idle",
@@ -995,7 +1001,29 @@ function pausedGoalIds(output) {
   return [...ids].sort((left, right) => left.localeCompare(right));
 }
 
-async function classifyEvent(event, mapping, herdr) {
+function isPostCompletionLane(workflow, mapping) {
+  const lane = workflow.lanes.find(
+    (candidate) => candidate.id === mapping.lane.lane_id,
+  );
+  return Boolean(
+    lane?.completionReceipt ||
+      POST_COMPLETION_STATUSES.has(lane?.status) ||
+      POST_COMPLETION_STATUSES.has(workflow.status) ||
+      POST_COMPLETION_STATUSES.has(workflow.outcome),
+  );
+}
+
+function suppressPostCompletionDone(classification, event, workflow, mapping) {
+  if (
+    event.data.agent_status === "done" &&
+    classification.classification === "done" &&
+    isPostCompletionLane(workflow, mapping)
+  )
+    return { ...classification, classification: "unclassified" };
+  return classification;
+}
+
+async function classifyEvent(event, mapping, herdr, workflow) {
   const fallback = {
     classification:
       event.data.agent_status === "done" ||
@@ -1008,7 +1036,7 @@ async function classifyEvent(event, mapping, herdr) {
     !mapping.workflow.pi_goal_pause_detection ||
     !PI_PAUSE_PROBE_STATUSES.has(event.data.agent_status)
   )
-    return fallback;
+    return suppressPostCompletionDone(fallback, event, workflow, mapping);
   try {
     // This one bounded read is triggered by a supported state-change hook; it
     // does not poll and runs only for an explicitly Pi-enabled workflow.
@@ -1025,19 +1053,29 @@ async function classifyEvent(event, mapping, herdr) {
       output_sha256: sha256(output),
     };
     if (goalIds.length > 0) source.goal_ids = goalIds;
-    return {
-      classification:
-        goalIds.length > 0 ? "goal-paused" : fallback.classification,
-      source,
-    };
-  } catch (error) {
-    return {
-      ...fallback,
-      source: {
-        agent_status: event.data.agent_status,
-        read_error: error instanceof Error ? error.message : String(error),
+    return suppressPostCompletionDone(
+      {
+        classification:
+          goalIds.length > 0 ? "goal-paused" : fallback.classification,
+        source,
       },
-    };
+      event,
+      workflow,
+      mapping,
+    );
+  } catch (error) {
+    return suppressPostCompletionDone(
+      {
+        ...fallback,
+        source: {
+          agent_status: event.data.agent_status,
+          read_error: error instanceof Error ? error.message : String(error),
+        },
+      },
+      event,
+      workflow,
+      mapping,
+    );
   }
 }
 
@@ -1758,7 +1796,11 @@ export async function handleHook({
           )
         : [];
     const previousTransition = priorPaneTransitions.at(-1);
+    const postCompletionObservation =
+      isPostCompletionLane(workflow, mapping) &&
+      POST_COMPLETION_OBSERVATION_STATUSES.has(event.data.agent_status);
     const isRepeatStatus =
+      !postCompletionObservation &&
       Boolean(previousTransition) &&
       previousTransition.source?.agent_status === event.data.agent_status;
     const identity =
@@ -1779,7 +1821,7 @@ export async function handleHook({
     const created = !record;
     let inboxMessage;
     if (!record) {
-      const classification = await classifyEvent(event, mapping, api);
+      const classification = await classifyEvent(event, mapping, api, workflow);
       record = newRecord(event, mapping, classification, identity);
       ledger.events.push(record);
       signalParentGoal(manifest, record);
