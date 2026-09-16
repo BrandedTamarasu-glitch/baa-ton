@@ -54,6 +54,11 @@ import {
   type WorktreeBinding,
   type Workflow,
 } from "./contract.js";
+
+export type {
+  GoalOwnership,
+  OperatorClosure,
+} from "./contract.js";
 import { dispatchTask } from "./dispatch-task.js";
 import {
   LAUNCH_PROFILE_SCHEMA_VERSION,
@@ -353,6 +358,15 @@ const PARENT_GOAL_STATUSES = new Set<ParentGoalStatus>([
   "paused",
 ]);
 const MIN_PARENT_GOAL_NUDGE_INTERVAL_SECONDS = 5;
+
+// A lane is terminal for operator-closure stamping when its own work is
+// reconciled: a receipt, an operator closure, a reported completion, or a
+// recorded completion outcome.
+const TERMINAL_LANE_STATUSES = new Set([
+  "operator-closed",
+  "completion-reported",
+  "completed",
+]);
 const MAX_PARENT_GOAL_NUDGE_INTERVAL_SECONDS = 86_400;
 
 function parentGoalNudgeInterval(value: number | undefined): number {
@@ -3313,16 +3327,19 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       };
       if (stored.operatorClosure) {
         const existing = stored.operatorClosure;
+        const sameLane = existing.laneId === requested.laneId;
         if (
-          existing.laneId !== requested.laneId ||
-          existing.who !== requested.who ||
-          existing.why !== requested.why ||
-          JSON.stringify(existing.evidence) !== JSON.stringify(requested.evidence)
+          sameLane &&
+          (existing.who !== requested.who ||
+            existing.why !== requested.why ||
+            JSON.stringify(existing.evidence) !== JSON.stringify(requested.evidence))
         )
           throw new Error(
             "Workflow already has an operator closure with different reconciliation evidence.",
           );
-        return stored;
+        if (sameLane) return stored;
+        // A different lane is reconciled separately: the workflow-level record
+        // holds the latest closure and per-lane evidence accumulates below.
       }
       const lane = stored.lanes.find((item) => item.id === normalizedLaneId);
       if (!lane) throw new Error(`Unknown lane in workflow: ${normalizedLaneId}.`);
@@ -3345,8 +3362,20 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       // an authorized operator reconciled the outcome, not that the lane
       // successfully called herdr_complete.
       lane.status = "operator-closed";
-      stored.status = "operator-closed";
-      stored.outcome = "operator-closed";
+      // Stamp the workflow level only when every lane is terminal: the
+      // controller treats workflow-wide status/outcome as a post-completion
+      // signal, and one lane's reconciliation must never suppress a still-
+      // running sibling's completion wake.
+      if (
+        stored.lanes.every(
+          (candidate) =>
+            candidate.completionReceipt ||
+            TERMINAL_LANE_STATUSES.has(candidate.status),
+        )
+      ) {
+        stored.status = "operator-closed";
+        stored.outcome = "operator-closed";
+      }
       stored.operatorClosedAt = timestamp;
       stored.evidence.push({
         at: timestamp,

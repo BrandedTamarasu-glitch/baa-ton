@@ -25,7 +25,7 @@ The common dispatcher additionally enforces workspace/pane/agent identity, start
 
 Unregistered adapters fail before topology mutation. The synthetic Codex test is **not** a claim that real Codex startup is qualified.
 
-`launch-profile.ts` validates common shape only; provider qualification belongs to the adapter. Subscription-only auth is the current policy, not an automatic fallback. The present workflow schema uses one profile per workflow; heterogeneous profiles require a versioned per-lane schema extension.
+`launch-profile.ts` validates common shape only; provider qualification belongs to the adapter. Subscription-only auth is the current policy, not an automatic fallback. The present workflow schema uses one profile per workflow; heterogeneous profiles require a versioned per-lane schema extension. Capability-discovery evidence is recorded today only for adapters implementing `discoverCatalog` (Pi); other agent kinds dispatch without discovery evidence until their adapters implement the operation.
 
 ## Prior art: Paseo provider layer (design basis for contract evolution)
 

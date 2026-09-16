@@ -56,6 +56,7 @@ async function createFixture({
   completionReceipt,
   approvalRequests,
   questionRequests,
+  siblingLane,
 } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "herdr-controller-"));
   const stateDir = join(directory, "state");
@@ -114,6 +115,15 @@ async function createFixture({
             ...(laneStatus ? { status: laneStatus } : {}),
             ...(completionReceipt ? { completionReceipt } : {}),
           },
+          ...(siblingLane
+            ? [
+                {
+                  id: siblingLane.lane_id,
+                  paneId: siblingLane.pane_id,
+                  agentName: siblingLane.target,
+                },
+              ]
+            : []),
         ],
       },
     ],
@@ -127,7 +137,7 @@ async function createFixture({
         workflow_id: "herdr-bb029",
         manifest_path: manifestPath,
         pi_goal_pause_detection: piGoalPauseDetection,
-        lanes: [child],
+        lanes: [child, ...(siblingLane ? [siblingLane] : [])],
       },
     ],
   };
@@ -755,6 +765,46 @@ test("post-completion done and idle transitions are observational and never wake
     assert.equal(inbox.messages[0].states.notified, null);
     assert.deepEqual(inbox.wake_hints, [], "observational events never enqueue a wake");
   } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("sibling completion wakes survive a lane-scoped operator closure", async () => {
+  const closedLane = {
+    ...CHILD,
+    lane_id: "lane-1",
+    target: "lane-1-agent",
+    pane_id: "w-root:p6",
+  };
+  const activeSibling = {
+    ...CHILD,
+    lane_id: "lane-2",
+    target: "lane-2-agent",
+    pane_id: "w-root:p7",
+  };
+  const fixture = await createFixture({
+    child: closedLane,
+    laneStatus: "operator-closed",
+    siblingLane: activeSibling,
+    piGoalPauseDetection: false,
+  });
+  const mock = await startHerdrMock(async (request) => {
+    if (request.method === "agent.get") return rootAgentInfo();
+    if (request.method === "agent.prompt") return { result: {} };
+    throw new Error(`Unexpected ${request.method}`);
+  });
+  try {
+    const result = await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("done", "pi", activeSibling),
+      stateDir: fixture.stateDir,
+      herdr: client(mock),
+    });
+    assert.equal(result.record.classification, "done");
+    assert.equal(result.record.wake.status, "delivered");
+    assert.equal(requestsFor(mock, "agent.prompt").length, 1);
+  } finally {
+    await mock.close();
     await fixture.cleanup();
   }
 });

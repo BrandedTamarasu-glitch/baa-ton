@@ -9,7 +9,7 @@ const require = createRequire(import.meta.url);
 const jiti = require("jiti")(import.meta.url);
 const { default: extension } = await jiti.import("../index.ts");
 
-async function fixture() {
+async function fixture({ laneOverrides } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "baa-operator-close-"));
   const cwd = join(directory, "checkout");
   const configDir = join(directory, "config");
@@ -45,16 +45,18 @@ async function fixture() {
             objective: "Reconcile the verified codex lane.",
             outcome: "unknown",
             status: "completion-reported",
-            lanes: [
-              {
-                id: laneId,
-                objective: "Finish the verified work.",
-                readOnly: false,
-                agentKind: "codex",
-                status: "done",
-                relationshipId: lane.relationship_id,
-              },
-            ],
+            lanes:
+              laneOverrides ??
+              [
+                {
+                  id: laneId,
+                  objective: "Finish the verified work.",
+                  readOnly: false,
+                  agentKind: "codex",
+                  status: "done",
+                  relationshipId: lane.relationship_id,
+                },
+              ],
             herdr: {},
             agent: {},
             agentKind: "codex",
@@ -151,6 +153,62 @@ function registeredTools() {
 }
 
 const context = (cwd) => ({ cwd, hasUI: false, mode: "json", modelRegistry: {} });
+
+test("operator closure is lane-scoped while sibling lanes still run", async () => {
+  const fixtureData = await fixture({
+    laneOverrides: [
+      {
+        id: "lane-1",
+        objective: "First lane.",
+        readOnly: false,
+        agentKind: "codex",
+        status: "done",
+        relationshipId: "relationship-1",
+      },
+      {
+        id: "lane-2",
+        objective: "Second lane.",
+        readOnly: false,
+        agentKind: "codex",
+        status: "working",
+        relationshipId: "relationship-2",
+      },
+    ],
+  });
+  const restore = setupEnvironment(fixtureData);
+  try {
+    const close = (laneId) =>
+      registeredTools()
+        .get("herdr_operator_close")
+        .execute(
+          `operator-close-${laneId}`,
+          {
+            workflowId: fixtureData.workflowId,
+            laneId,
+            who: "zach",
+            why: `Reconcile ${laneId} after parent verification.`,
+            evidence: ["parent verified and committed the lane work"],
+          },
+          undefined,
+          undefined,
+          context(fixtureData.cwd),
+        );
+    const first = await close("lane-1");
+    assert.equal(first.details.operatorClosed, true);
+    const afterFirst = first.details.workflow;
+    assert.equal(afterFirst.lanes[0].status, "operator-closed");
+    assert.equal(afterFirst.lanes[1].status, "working");
+    assert.notEqual(afterFirst.status, "operator-closed");
+    assert.notEqual(afterFirst.outcome, "operator-closed");
+    const second = await close("lane-2");
+    const afterSecond = second.details.workflow;
+    assert.equal(afterSecond.lanes[1].status, "operator-closed");
+    assert.equal(afterSecond.status, "operator-closed");
+    assert.equal(afterSecond.outcome, "operator-closed");
+  } finally {
+    restore();
+  }
+});
 
 test("operator closure records reconciliation explicitly without a lane receipt", async () => {
   const fixtureData = await fixture();
