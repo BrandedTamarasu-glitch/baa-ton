@@ -2912,6 +2912,216 @@ test("a documented pane-ID root target is accepted without an agent name", async
   }
 });
 
+test("shared manifests isolate routed completion signals, mismatch checks, and supervisor nudges per root", async () => {
+  const fixture = await createFixture({ piGoalPauseDetection: false });
+  const rootB = {
+    target: "root-b",
+    target_kind: "name",
+    agent_kind: "pi",
+    pane_id: "w-b:p1",
+    workspace_id: "w-b",
+  };
+  const childB = {
+    lane_id: "lane-b",
+    target: "child-b",
+    target_kind: "name",
+    pane_id: "w-b-child:p1",
+    workspace_id: "w-b-child",
+  };
+  const timestamp = "2026-09-16T00:00:00.000Z";
+  const goal = (id) => ({
+    version: 1,
+    id,
+    objective: id,
+    status: "active",
+    nextAction: "Continue.",
+    signals: [],
+    supervisor: {
+      version: 1,
+      state: "running",
+      intervalSeconds: 5,
+      nudgeCount: 0,
+      nextNudgeAt: timestamp,
+      rootTurn: {
+        state: "idle",
+        runId: `${id}-run`,
+        paneId: id === "parent-a" ? ROOT.pane_id : rootB.pane_id,
+        workspaceId: id === "parent-a" ? ROOT.workspace_id : rootB.workspace_id,
+        updatedAt: timestamp,
+      },
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+  const prompts = [];
+  const configPath = join(fixture.stateDir, "config.json");
+  try {
+    const manifest = await fixture.manifest();
+    manifest.parentGoals = {
+      "root-a": goal("parent-a"),
+      "root-b": goal("parent-b"),
+    };
+    manifest.workflows.push({
+      id: "herdr-b",
+      status: "running",
+      outcome: "running",
+      ownership: { createdBy: "herdr-orchestrator", workspaceId: rootB.workspace_id },
+      lanes: [{ id: childB.lane_id, paneId: childB.pane_id, agentName: childB.target }],
+    });
+    manifest.workflows[0].status = "running";
+    manifest.workflows[0].outcome = "running";
+    await writeFile(fixture.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    await writeFile(
+      configPath,
+      `${JSON.stringify(
+        {
+          version: 2,
+          owner: "herdr-orchestrator",
+          orchestrators: [
+            {
+              id: "root-a",
+              root: ROOT,
+              program: { id: "program-a", workspace_id: ROOT.workspace_id },
+              workflows: [
+                {
+                  workflow_id: "herdr-bb029",
+                  manifest_path: fixture.manifestPath,
+                  pi_goal_pause_detection: false,
+                  lanes: [CHILD],
+                },
+              ],
+            },
+            {
+              id: "root-b",
+              root: rootB,
+              program: { id: "program-b", workspace_id: rootB.workspace_id },
+              workflows: [
+                {
+                  workflow_id: "herdr-b",
+                  manifest_path: fixture.manifestPath,
+                  pi_goal_pause_detection: false,
+                  lanes: [childB],
+                },
+              ],
+            },
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+      { mode: 0o600 },
+    );
+    const herdr = {
+      async request(method, params = {}) {
+        if (method === "pane.report_metadata") return { result: {} };
+        if (method === "agent.get") {
+          const root = params.target === ROOT.target ? ROOT : rootB;
+          return {
+            type: "agent_info",
+            agent: {
+              agent: root.agent_kind,
+              name: root.target,
+              pane_id: root.pane_id,
+              workspace_id: root.workspace_id,
+              agent_status: "idle",
+            },
+          };
+        }
+        if (method === "agent.prompt") {
+          prompts.push(params);
+          return { result: { type: "agent_prompted" } };
+        }
+        throw new Error(`Unexpected ${method}`);
+      },
+    };
+
+    const first = await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("done"),
+      stateDir: fixture.stateDir,
+      herdr,
+    });
+    assert.equal(first.record.wake.status, "delivered");
+    let after = await fixture.manifest();
+    assert.equal(after.parentGoals["root-a"].signals.length, 1);
+    assert.equal(after.parentGoals["root-b"].signals.length, 0);
+    assert.deepEqual(prompts.map((item) => item.target), [ROOT.target]);
+
+    const second = await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("done", "pi", childB),
+      stateDir: fixture.stateDir,
+      herdr,
+    });
+    assert.equal(second.record.wake.status, "delivered");
+    after = await fixture.manifest();
+    assert.equal(after.parentGoals["root-a"].signals.length, 1);
+    assert.equal(after.parentGoals["root-b"].signals.length, 1);
+    assert.deepEqual(
+      prompts.slice(0, 2).map((item) => item.target),
+      [ROOT.target, rootB.target],
+      "each completion wakes only its mapped root",
+    );
+
+    // Both routed workflows are active while each root's own goal is terminal.
+    // The mismatch signal must be additive to that root's goal only.
+    after.parentGoals["root-a"].status = "completed";
+    after.parentGoals["root-b"].status = "blocked";
+    after.parentGoals["root-a"].signals = [];
+    after.parentGoals["root-b"].signals = [];
+    await writeFile(fixture.manifestPath, `${JSON.stringify(after, null, 2)}\n`);
+    await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr,
+      timestamp: "2026-09-16T00:00:01.000Z",
+    });
+    after = await fixture.manifest();
+    assert.equal(after.parentGoals["root-a"].signals.length, 1);
+    assert.equal(after.parentGoals["root-b"].signals.length, 1);
+    assert.match(after.parentGoals["root-a"].nextAction, /herdr_goal action=reset/);
+    assert.match(after.parentGoals["root-b"].nextAction, /herdr_goal action=reset/);
+
+    // Re-arm independent supervisors and verify each due nudge is delivered to
+    // its own root, not to the root that happened to be processed first.
+    for (const [key, root] of [["root-a", ROOT], ["root-b", rootB]]) {
+      const scopedGoal = after.parentGoals[key];
+      scopedGoal.status = "active";
+      scopedGoal.signals = [];
+      scopedGoal.supervisor.nextNudgeAt = timestamp;
+      scopedGoal.supervisor.lastDelivery = undefined;
+      scopedGoal.supervisor.rootTurn = {
+        ...scopedGoal.supervisor.rootTurn,
+        state: "idle",
+        paneId: root.pane_id,
+        workspaceId: root.workspace_id,
+      };
+    }
+    await writeFile(fixture.manifestPath, `${JSON.stringify(after, null, 2)}\n`);
+    const beforeNudges = prompts.length;
+    const tick = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr,
+      timestamp: "2026-09-16T00:00:02.000Z",
+    });
+    assert.deepEqual(
+      tick.results.map((result) => result.status),
+      ["delivered", "delivered"],
+    );
+    assert.deepEqual(
+      prompts.slice(beforeNudges).map((item) => item.target),
+      [ROOT.target, rootB.target],
+      "supervisor nudges remain root-scoped",
+    );
+    after = await fixture.manifest();
+    assert.equal(after.parentGoals["root-a"].supervisor.nudgeCount, 1);
+    assert.equal(after.parentGoals["root-b"].supervisor.nudgeCount, 1);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("supported working and idle status hooks classify an opt-in paused Pi goal", async () => {
   const fixture = await createFixture();
   const mock = await startHerdrMock((request) => {

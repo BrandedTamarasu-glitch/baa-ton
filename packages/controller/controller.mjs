@@ -579,6 +579,26 @@ function configuredParentManifests(config) {
   });
 }
 
+function manifestHasMultipleRoots(config, manifestPath) {
+  const normalized = resolve(manifestPath);
+  return configuredParentManifests(config).filter(
+    (entry) => resolve(entry.manifestPath) === normalized,
+  ).length > 1;
+}
+
+function recordBelongsToRoutes(record, routes) {
+  return routes.some(
+    (route) =>
+      route.workflow_id === record.workflow_id &&
+      route.lanes.some(
+        (lane) =>
+          lane.lane_id === record.lane_id &&
+          lane.pane_id === record.pane_id &&
+          lane.workspace_id === record.workspace_id,
+      ),
+  );
+}
+
 function locateMapping(config, event) {
   const matches = [];
   for (const orchestrator of config.orchestrators) {
@@ -721,7 +741,20 @@ function validateParentGoal(goal) {
       "createdAt",
       "updatedAt",
     ],
-    ["supervisor"],
+    [
+      "supervisor",
+      "root",
+      "rootIdentity",
+      "rootId",
+      "root_id",
+      "orchestratorId",
+      "orchestrator_id",
+      "scope",
+      "paneId",
+      "pane_id",
+      "workspaceId",
+      "workspace_id",
+    ],
   );
   assert(value.version === 1, "manifest.parentGoal.version must be 1.");
   for (const key of [
@@ -875,9 +908,125 @@ function validateSupervisor(supervisor) {
   return value;
 }
 
-function signalParentGoal(manifest, record, timestamp = now()) {
-  if (!("parentGoal" in manifest)) return;
-  const goal = validateParentGoal(manifest.parentGoal);
+function rootScopeAliases(orchestrator) {
+  const root = orchestrator.root;
+  return new Set([
+    orchestrator.id,
+    root.pane_id,
+    `${root.workspace_id}:${root.pane_id}`,
+    `${root.workspace_id}/${root.pane_id}`,
+  ]);
+}
+
+function rootMetadataMatches(value, orchestrator) {
+  if (!isRecord(value)) return false;
+  const aliases = rootScopeAliases(orchestrator);
+  const metadata = value.root ?? value.rootIdentity ?? value.owner;
+  if (typeof metadata === "string" && aliases.has(metadata)) return true;
+  if (isRecord(metadata)) {
+    if (
+      metadata.pane_id === orchestrator.root.pane_id &&
+      metadata.workspace_id === orchestrator.root.workspace_id
+    )
+      return true;
+    if (
+      metadata.paneId === orchestrator.root.pane_id &&
+      metadata.workspaceId === orchestrator.root.workspace_id
+    )
+      return true;
+    if (typeof metadata.id === "string" && aliases.has(metadata.id)) return true;
+  }
+  for (const key of ["rootId", "root_id", "orchestratorId", "orchestrator_id", "scope"]) {
+    if (typeof value[key] === "string" && aliases.has(value[key])) return true;
+  }
+  if (
+    (value.paneId === orchestrator.root.pane_id ||
+      value.pane_id === orchestrator.root.pane_id) &&
+    (value.workspaceId === orchestrator.root.workspace_id ||
+      value.workspace_id === orchestrator.root.workspace_id)
+  )
+    return true;
+  const turn = value.supervisor?.rootTurn;
+  return Boolean(
+    isRecord(turn) &&
+      turn.paneId === orchestrator.root.pane_id &&
+      turn.workspaceId === orchestrator.root.workspace_id,
+  );
+}
+
+function parentGoalCandidate(value) {
+  if (!isRecord(value)) return undefined;
+  if (typeof value.id === "string" && Array.isArray(value.signals)) return value;
+  for (const key of ["goal", "parentGoal", "value"])
+    if (isRecord(value[key])) return parentGoalCandidate(value[key]);
+  return undefined;
+}
+
+function goalOwnedByRoot(goal, orchestrator) {
+  const turn = goal?.supervisor?.rootTurn;
+  return !isRecord(turn) ||
+    (turn.paneId === orchestrator.root.pane_id &&
+      turn.workspaceId === orchestrator.root.workspace_id);
+}
+
+function findRootGoal(value, orchestrator, seen = new Set()) {
+  if (!isRecord(value) && !Array.isArray(value)) return undefined;
+  if (seen.has(value)) return undefined;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      if (!isRecord(entry) || !rootMetadataMatches(entry, orchestrator)) continue;
+      const candidate = parentGoalCandidate(entry);
+      if (candidate) return candidate;
+    }
+    return undefined;
+  }
+  const candidate = parentGoalCandidate(value);
+  if (candidate && rootMetadataMatches(value, orchestrator)) return candidate;
+  for (const key of rootScopeAliases(orchestrator)) {
+    if (key in value) {
+      const scoped = parentGoalCandidate(value[key]);
+      if (scoped) return scoped;
+    }
+  }
+  for (const key of ["roots", "byRoot", "by_root", "goals", "parentGoals"])
+    if (value[key] !== undefined) {
+      const scoped = findRootGoal(value[key], orchestrator, seen);
+      if (scoped) return scoped;
+    }
+  return undefined;
+}
+
+// A controller config may route multiple roots to one checkout manifest. New
+// writers can store one goal per root in parentGoals (or an equivalent
+// root-keyed container), while the historical parentGoal record remains fully
+// supported for a single-root manifest. In a shared manifest, an unowned
+// legacy goal is deliberately not selected: treating it as global would let a
+// second root consume or mutate the first root's durable authority.
+function parentGoalFor(manifest, orchestrator, shared = false) {
+  for (const key of ["parentGoals", "parentGoalByRoot", "rootParentGoals", "rootGoals"]) {
+    if (!(key in manifest)) continue;
+    const goal = findRootGoal(manifest[key], orchestrator);
+    if (goal) {
+      const validated = validateParentGoal(goal);
+      if (goalOwnedByRoot(validated, orchestrator)) return validated;
+    }
+    return undefined;
+  }
+  if (!("parentGoal" in manifest)) return undefined;
+  const legacy = manifest.parentGoal;
+  if (!shared) {
+    const goal = parentGoalCandidate(legacy);
+    return goal ? validateParentGoal(goal) : undefined;
+  }
+  const goal = findRootGoal(legacy, orchestrator);
+  if (!goal) return undefined;
+  const validated = validateParentGoal(goal);
+  return goalOwnedByRoot(validated, orchestrator) ? validated : undefined;
+}
+
+function signalParentGoal(goal, record, timestamp = now()) {
+  if (!goal) return;
   if (!ACTIONABLE_CLASSIFICATIONS.has(record.classification)) return;
   if (
     !goal.signals.some(
@@ -934,9 +1083,8 @@ function workflowIsTerminal(workflow) {
   );
 }
 
-function signalParentGoalMismatch(manifest, routedWorkflows, timestamp = now()) {
-  if (!("parentGoal" in manifest)) return false;
-  const goal = validateParentGoal(manifest.parentGoal);
+function signalParentGoalMismatch(goal, manifest, routedWorkflows, timestamp = now()) {
+  if (!goal) return false;
   if (!TERMINAL_PARENT_GOAL_STATES.has(goal.status)) return false;
   const active = routedWorkflows
     .map((route) => ({
@@ -1078,9 +1226,19 @@ function queueOriginId(workflow, queue) {
   return queue?.items.find((item) => item.workflowId === workflow.id)?.id;
 }
 
-function signalParentGoalForQueue(manifest, item, timestamp = now()) {
-  if (!("parentGoal" in manifest)) return false;
-  const goal = validateParentGoal(manifest.parentGoal);
+function queueItemBelongsToRoot(item, mapping, shared) {
+  if (!shared) return true;
+  if (rootMetadataMatches(item, mapping.orchestrator)) return true;
+  return (
+    typeof item.workflowId === "string" &&
+    mapping.orchestrator.workflows.some(
+      (workflow) => workflow.workflow_id === item.workflowId,
+    )
+  );
+}
+
+function signalParentGoalForQueue(goal, item, timestamp = now()) {
+  if (!goal) return false;
   const nextAction = `Review queue head now dispatchable: ${item.id} ${queueObjectiveSlug(item.objective)}.`;
   if (goal.status === "review-requested" && goal.nextAction === nextAction) return false;
   goal.status = "review-requested";
@@ -1089,7 +1247,12 @@ function signalParentGoalForQueue(manifest, item, timestamp = now()) {
   return true;
 }
 
-function pendingParentAction(manifest, workflows = manifest.workflows) {
+function pendingParentAction(
+  manifest,
+  workflows = manifest.workflows,
+  shared = false,
+  orchestrator,
+) {
   const actions = [];
   const add = (request, kind, workflowId) => {
     if (
@@ -1112,7 +1275,16 @@ function pendingParentAction(manifest, workflows = manifest.workflows) {
   };
   if (Array.isArray(manifest.questionRequests))
     for (const request of manifest.questionRequests)
-      add(request, "question", undefined);
+      if (
+        !shared ||
+        (orchestrator &&
+          (rootMetadataMatches(request, orchestrator) ||
+            (typeof request.workflowId === "string" &&
+              orchestrator.workflows.some(
+                (workflow) => workflow.workflow_id === request.workflowId,
+              ))))
+      )
+        add(request, "question", undefined);
   if (Array.isArray(workflows))
     for (const workflow of workflows) {
       if (!isRecord(workflow)) continue;
@@ -1139,10 +1311,20 @@ function pendingParentAction(manifest, workflows = manifest.workflows) {
     .map(({ action }) => action)[0];
 }
 
-function signalParentGoalForUserAction(manifest, workflows) {
-  if (!("parentGoal" in manifest)) return false;
-  const goal = validateParentGoal(manifest.parentGoal);
-  const pending = pendingParentAction(manifest, workflows);
+function signalParentGoalForUserAction(
+  goal,
+  manifest,
+  workflows,
+  shared = false,
+  orchestrator,
+) {
+  if (!goal) return false;
+  const pending = pendingParentAction(
+    manifest,
+    workflows,
+    shared,
+    orchestrator,
+  );
   if (!pending) return false;
   const workflowLabel = pending.workflowId
     ? ` for ${pending.workflowId}`
@@ -1448,6 +1630,7 @@ async function detectStalledLanes({
   manifestPath,
   timestamp,
   herdr,
+  goal,
 }) {
   const timestampMs = Date.parse(timestamp);
   if (!Number.isFinite(timestampMs)) return false;
@@ -1525,7 +1708,7 @@ async function detectStalledLanes({
             error instanceof Error ? error.message : String(error),
         };
       }
-      signalParentGoal(manifest, events.at(-1), timestamp);
+      signalParentGoal(goal, events.at(-1), timestamp);
       changed = true;
     }
   }
@@ -1890,6 +2073,8 @@ async function processQueueHeadWake({
   configDir,
   herdr,
   timestamp = now(),
+  goal,
+  shared = false,
 }) {
   if (!workflowIsTerminal(workflow)) return undefined;
   const queue = queueStore(manifest);
@@ -1897,11 +2082,16 @@ async function processQueueHeadWake({
   const origin = queue?.items.find((item) => item.id === originId);
   if (!origin || origin.state !== "landed") return undefined;
   const readiness = queueHeadReadiness(manifest, manifestPath);
+  if (
+    readiness.item &&
+    !queueItemBelongsToRoot(readiness.item, mapping, shared)
+  )
+    return undefined;
   if (!readiness.item || readiness.blockers.dependencies.length || readiness.blockers.files.length)
     return { status: "blocked", item: readiness.item, blockers: readiness.blockers };
   const logicalKey = `queue-head:${routeScope(mapping.orchestrator, manifestPath)}:${readiness.item.id}`;
   const occurrenceId = sha256(logicalKey);
-  const changed = signalParentGoalForQueue(manifest, readiness.item, timestamp);
+  const changed = signalParentGoalForQueue(goal, readiness.item, timestamp);
   if (changed) await atomicWriteJson(manifestPath, manifest);
   const inboxMessage = await persistControllerMessage(configDir, {
     logicalKey,
@@ -1958,9 +2148,8 @@ async function processQueueHeadWake({
   return { ...outcome, item: readiness.item, deduplicated: false };
 }
 
-function signalParentGoalForMessage(manifest, message, timestamp = now()) {
-  if (!("parentGoal" in manifest)) return false;
-  const goal = validateParentGoal(manifest.parentGoal);
+function signalParentGoalForMessage(goal, message, timestamp = now()) {
+  if (!goal) return false;
   goal.status = "review-requested";
   goal.nextAction =
     `Review child message ${message.id} from ${message.workflowId}/${message.laneId}: ${message.summary}`;
@@ -1977,6 +2166,7 @@ async function processChildMessageRequest({
   configDir,
   herdr,
   timestamp = now(),
+  goal,
 }) {
   const currentStatus = request.delivery?.status ?? "pending";
   const attempts = Number.isSafeInteger(request.delivery?.attempts) &&
@@ -2004,7 +2194,7 @@ async function processChildMessageRequest({
   };
   // This is intentionally unconditional, including terminal lanes and goals:
   // a child message is a new review signal, not post-completion lifecycle noise.
-  signalParentGoalForMessage(manifest, request, timestamp);
+  signalParentGoalForMessage(goal, request, timestamp);
   await atomicWriteJson(manifestPath, manifest);
 
   let inboxMessage;
@@ -2138,6 +2328,11 @@ export async function routeChildMessage(options = {}) {
       `Durable child message ${messageId} is missing from the authoritative manifest.`,
       "invalid_mapping",
     );
+    const goal = parentGoalFor(
+      manifest,
+      mapping.orchestrator,
+      manifestHasMultipleRoots(config, manifestPath),
+    );
     return await processChildMessageRequest({
       manifestPath,
       manifest,
@@ -2146,6 +2341,7 @@ export async function routeChildMessage(options = {}) {
       request,
       configDir,
       herdr: herdr ?? new JsonLineHerdrClient(),
+      goal,
     });
   } finally {
     await release();
@@ -2323,6 +2519,8 @@ export async function runSupervisorTick({
           config.owner,
         ),
       );
+      const sharedManifest = manifestHasMultipleRoots(config, manifestPath);
+      const goal = parentGoalFor(manifest, orchestrator, sharedManifest);
       // Queue continuation uses this existing event-driven tick as its retry
       // point. A landed predecessor can wake only a clear ordered head.
       for (const [workflowIndex, stored] of matchedWorkflows.entries()) {
@@ -2335,6 +2533,8 @@ export async function runSupervisorTick({
           configDir,
           herdr: api,
           timestamp,
+          goal,
+          shared: sharedManifest,
         });
         if (
           queueWake &&
@@ -2357,11 +2557,19 @@ export async function runSupervisorTick({
       // this controller owns the parent goal. Reconcile them on the same
       // event-driven tick so the sidebar reserves "action required" for a
       // record that actually needs Zach's decision.
-      if (signalParentGoalForUserAction(manifest, matchedWorkflows)) {
+      if (
+        signalParentGoalForUserAction(
+          goal,
+          manifest,
+          matchedWorkflows,
+          sharedManifest,
+          orchestrator,
+        )
+      ) {
         await atomicWriteJson(manifestPath, manifest);
-        if ("parentGoal" in manifest)
+        if (goal)
           await publishParentGoalSidebar(
-            validateParentGoal(manifest.parentGoal),
+            goal,
             orchestrator.root,
             api,
             queueStore(manifest),
@@ -2370,11 +2578,11 @@ export async function runSupervisorTick({
       // A terminal parent goal must not silently coexist with a newly routed
       // workflow. This check is deliberately separate from ordinary lane
       // review signals and is also run when no wake is pending.
-      if (signalParentGoalMismatch(manifest, workflows, timestamp)) {
+      if (signalParentGoalMismatch(goal, manifest, workflows, timestamp)) {
         await atomicWriteJson(manifestPath, manifest);
-        if ("parentGoal" in manifest)
+        if (goal)
           await publishParentGoalSidebar(
-            validateParentGoal(manifest.parentGoal),
+            goal,
             orchestrator.root,
             api,
             queueStore(manifest),
@@ -2390,12 +2598,13 @@ export async function runSupervisorTick({
         manifestPath,
         timestamp,
         herdr: api,
+        goal,
       });
       if (stallsChanged) {
         await atomicWriteJson(manifestPath, manifest);
-        if ("parentGoal" in manifest)
+        if (goal)
           await publishParentGoalSidebar(
-            validateParentGoal(manifest.parentGoal),
+            goal,
             orchestrator.root,
             api,
             queueStore(manifest),
@@ -2416,7 +2625,8 @@ export async function runSupervisorTick({
         const pendingRecords = stored.eventController.events.filter(
           (record) =>
             ACTIONABLE_CLASSIFICATIONS.has(record.classification) &&
-            record.wake?.status === "pending",
+            record.wake?.status === "pending" &&
+            recordBelongsToRoutes(record, workflows),
         );
         for (const record of pendingRecords) {
           record.wake = {
@@ -2494,6 +2704,7 @@ export async function runSupervisorTick({
             configDir,
             herdr: api,
             timestamp,
+            goal,
           });
           pendingWakes.push({
             manifestPath,
@@ -2502,20 +2713,19 @@ export async function runSupervisorTick({
             kind: "child-message",
             status: outcome.delivery,
           });
-          if ("parentGoal" in manifest)
+          if (goal)
             await publishParentGoalSidebar(
-              validateParentGoal(manifest.parentGoal),
+              goal,
               orchestrator.root,
               api,
               queueStore(manifest),
             );
         }
       }
-      if (!("parentGoal" in manifest)) {
+      if (!goal) {
         results.push({ manifestPath, status: "no-parent-goal" });
         continue;
       }
-      const goal = validateParentGoal(manifest.parentGoal);
       if (!("supervisor" in goal)) {
         results.push({ manifestPath, status: "supervisor-stopped" });
         continue;
@@ -2745,14 +2955,15 @@ async function recordRootActivity(config, event) {
           { workflow: candidate, lane: candidate.lanes[0] },
           config.owner,
         );
-      if (
-        !("parentGoal" in manifest) ||
-        !("supervisor" in manifest.parentGoal)
-      ) {
+      const goal = parentGoalFor(
+        manifest,
+        orchestrator,
+        manifestHasMultipleRoots(config, manifestPath),
+      );
+      if (!goal || !("supervisor" in goal)) {
         results.push({ manifestPath, status: "no-supervisor" });
         continue;
       }
-      const goal = validateParentGoal(manifest.parentGoal);
       // Detection hooks are telemetry, not Pi run boundaries. In particular an
       // idle/done event between tool calls must not release rootTurn or a wake.
       goal.supervisor.rootActivity = {
@@ -2830,6 +3041,16 @@ export async function handleHook({
       "Workflow manifest",
     );
     const workflow = validateMappedWorkflow(manifest, mapping, config.owner);
+    const sharedManifest = manifestHasMultipleRoots(
+      config,
+      mapping.workflow.manifest_path,
+    );
+    const goal = parentGoalFor(manifest, mapping.orchestrator, sharedManifest);
+    const routedManifestWorkflows = manifest.workflows.filter((candidate) =>
+      mapping.orchestrator.workflows.some(
+        (route) => route.workflow_id === candidate.id,
+      ),
+    );
     const ledger = ensureLedger(workflow);
     // Native protocol 22's pane_agent_status_changed payload carries no
     // occurrence/state_change_seq field (unlike pane_output_changed, whose
@@ -2878,15 +3099,25 @@ export async function handleHook({
       const classification = await classifyEvent(event, mapping, api, workflow);
       record = newRecord(event, mapping, classification, identity);
       ledger.events.push(record);
-      signalParentGoal(manifest, record);
+      signalParentGoal(goal, record);
       // Question/approval records are written by the extension rather than a
       // pane hook. Reconcile after the lane breadcrumb so a user request wins
       // over the review-only status and next action from this event.
-      signalParentGoalForUserAction(manifest);
+      signalParentGoalForUserAction(
+        goal,
+        manifest,
+        routedManifestWorkflows,
+        sharedManifest,
+        mapping.orchestrator,
+      );
       // A mapped event also reevaluates terminal parent-goal state. Keep this
       // after ordinary event/user signals so the mismatch action remains the
       // durable instruction presented to the root.
-      signalParentGoalMismatch(manifest, mapping.orchestrator.workflows);
+      signalParentGoalMismatch(
+        goal,
+        manifest,
+        mapping.orchestrator.workflows,
+      );
       inboxMessage = await persistControllerMessage(configDir, {
         logicalKey: `lane-event:${routeScope(mapping.orchestrator, mapping.workflow.manifest_path)}:${record.workflow_id}/${record.lane_id}/${record.classification}`,
         occurrenceId: record.identity,
@@ -2905,24 +3136,31 @@ export async function handleHook({
         wake: ACTIONABLE_CLASSIFICATIONS.has(record.classification),
       });
       await atomicWriteJson(mapping.workflow.manifest_path, manifest);
-      if ("parentGoal" in manifest)
+      if (goal)
         await publishParentGoalSidebar(
-          validateParentGoal(manifest.parentGoal),
+          goal,
           mapping.orchestrator.root,
           api,
           queueStore(manifest),
         );
     } else {
-      const userActionChanged = signalParentGoalForUserAction(manifest);
+      const userActionChanged = signalParentGoalForUserAction(
+        goal,
+        manifest,
+        routedManifestWorkflows,
+        sharedManifest,
+        mapping.orchestrator,
+      );
       const mismatchChanged = signalParentGoalMismatch(
+        goal,
         manifest,
         mapping.orchestrator.workflows,
       );
       if (userActionChanged || mismatchChanged) {
         await atomicWriteJson(mapping.workflow.manifest_path, manifest);
-        if ("parentGoal" in manifest)
+        if (goal)
           await publishParentGoalSidebar(
-            validateParentGoal(manifest.parentGoal),
+            goal,
             mapping.orchestrator.root,
             api,
             queueStore(manifest),
@@ -2938,6 +3176,8 @@ export async function handleHook({
       mapping,
       configDir,
       herdr: api,
+      goal,
+      shared: sharedManifest,
     });
     if (!ACTIONABLE_CLASSIFICATIONS.has(record.classification)) {
       return { accepted: true, deduplicated: !created, record, queueWake };
