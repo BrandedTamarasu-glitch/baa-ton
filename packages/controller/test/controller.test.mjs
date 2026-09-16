@@ -282,6 +282,49 @@ function requestsFor(mock, method) {
   return mock.requests.filter((request) => request.method === method);
 }
 
+async function seedWorkingTransition(fixture, receivedAt, child = CHILD) {
+  await handleHook({
+    eventName: "pane.agent_status_changed",
+    eventJson: statusEvent("working", "pi", child),
+    stateDir: fixture.stateDir,
+    herdr: {
+      async request(method) {
+        assert.equal(method, "pane.report_metadata");
+        return { result: {} };
+      },
+    },
+  });
+  const manifest = await fixture.manifest();
+  const transition = manifest.workflows[0].eventController.events.at(-1);
+  transition.received_at = receivedAt;
+  await writeFile(fixture.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  return transition;
+}
+
+function rootWakeApi(prompts, roots = new Map([[ROOT.target, ROOT]])) {
+  return {
+    async request(method, params = {}) {
+      if (method === "pane.report_metadata") return { result: {} };
+      if (method === "agent.prompt") {
+        prompts.push(params.text);
+        return { result: { type: "agent_prompted" } };
+      }
+      const root = roots.get(params.target);
+      assert.ok(root, `unexpected Herdr target ${params.target}`);
+      return {
+        type: "agent_info",
+        agent: {
+          agent: root.agent_kind,
+          name: root.target,
+          pane_id: root.pane_id,
+          workspace_id: root.workspace_id,
+          agent_status: "idle",
+        },
+      };
+    },
+  };
+}
+
 function parsePluginManifest(raw) {
   const top = {};
   const events = [];
@@ -2145,6 +2188,318 @@ test("the supervisor waits one normal interval after startup before nudging rest
     assert.equal(loop.started, true);
     assert.equal(calls, 0, "startup grants Herdr one full settle interval");
     await loop.stop();
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a stale working lane emits one durable advisory stall signal and wakes its root", async () => {
+  const fixture = await createFixture({
+    piGoalPauseDetection: false,
+    parentGoal: {
+      version: 1,
+      id: "parent-stall",
+      objective: "Inspect a stalled lane.",
+      status: "active",
+      nextAction: "Continue the lane.",
+      signals: [],
+      createdAt: "2026-09-14T00:00:00.000Z",
+      updatedAt: "2026-09-14T00:00:00.000Z",
+    },
+  });
+  const transitionAt = "2026-09-14T00:00:00.000Z";
+  await seedWorkingTransition(fixture, transitionAt);
+  const prompts = [];
+  const api = rootWakeApi(prompts);
+  try {
+    const first = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: api,
+      timestamp: "2026-09-14T00:06:00.000Z",
+    });
+    assert.deepEqual(first.pendingWakes, [
+      {
+        manifestPath: fixture.manifestPath,
+        workflowId: "herdr-bb029",
+        laneId: CHILD.lane_id,
+        status: "delivered",
+      },
+    ]);
+    let manifest = await fixture.manifest();
+    let stalls = manifest.workflows[0].eventController.events.filter(
+      (event) => event.classification === "stall-suspected",
+    );
+    assert.equal(stalls.length, 1);
+    assert.equal(stalls[0].wake.status, "delivered");
+    assert.equal(stalls[0].received_at, transitionAt);
+    assert.equal(stalls[0].detected_at, "2026-09-14T00:06:00.000Z");
+    assert.equal(manifest.parentGoal.status, "review-requested");
+    assert.equal(manifest.parentGoal.signals[0].classification, "stall-suspected");
+    assert.match(
+      prompts[0],
+      /\[Herdr Orchestrator stall-suspected\] workflow herdr-bb029, lane lane-child has had no recorded status transition for 6 minutes\./,
+    );
+    assert.match(
+      prompts[0],
+      /advisory only and may be a false positive on a genuinely slow turn; inspect the lane and workflow rather than assuming the lane is dead\./,
+    );
+
+    const second = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: api,
+      timestamp: "2026-09-14T00:07:00.000Z",
+    });
+    assert.deepEqual(second.pendingWakes, []);
+    manifest = await fixture.manifest();
+    stalls = manifest.workflows[0].eventController.events.filter(
+      (event) => event.classification === "stall-suspected",
+    );
+    assert.equal(stalls.length, 1);
+    assert.equal(prompts.length, 1);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a working lane that transitions before the threshold does not emit a stall signal", async () => {
+  const fixture = await createFixture({ piGoalPauseDetection: false });
+  await seedWorkingTransition(fixture, "2026-09-14T00:00:00.000Z");
+  const prompts = [];
+  try {
+    const result = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: rootWakeApi(prompts),
+      timestamp: "2026-09-14T00:04:59.000Z",
+    });
+    assert.deepEqual(result.pendingWakes, []);
+    const events = (await fixture.manifest()).workflows[0].eventController.events;
+    assert.equal(events.length, 1);
+    assert.equal(prompts.length, 0);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a lane that goes stale, transitions, and goes stale again emits a distinct second signal", async () => {
+  const fixture = await createFixture({ piGoalPauseDetection: false });
+  const prompts = [];
+  const api = rootWakeApi(prompts);
+  await seedWorkingTransition(fixture, "2026-09-14T00:00:00.000Z");
+  try {
+    await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: api,
+      timestamp: "2026-09-14T00:06:00.000Z",
+    });
+    await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("blocked"),
+      stateDir: fixture.stateDir,
+      herdr: api,
+    });
+    await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("working"),
+      stateDir: fixture.stateDir,
+      herdr: api,
+    });
+    const manifest = await fixture.manifest();
+    const resumed = manifest.workflows[0].eventController.events.at(-1);
+    resumed.received_at = "2026-09-14T00:08:00.000Z";
+    await writeFile(fixture.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+    const second = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: api,
+      timestamp: "2026-09-14T00:14:00.000Z",
+    });
+    assert.equal(
+      second.pendingWakes.filter((wake) => wake.status === "delivered").length,
+      1,
+    );
+    const events = (await fixture.manifest()).workflows[0].eventController.events;
+    const stalls = events.filter((event) => event.classification === "stall-suspected");
+    assert.equal(stalls.length, 2);
+    assert.notEqual(stalls[0].identity, stalls[1].identity);
+    assert.equal(
+      prompts.filter((text) => text.includes("stall-suspected")).length,
+      2,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a terminal lane never emits a stall signal from an old working transition", async () => {
+  const fixture = await createFixture({
+    piGoalPauseDetection: false,
+    completionReceipt: {
+      id: "incarnation-stall-terminal",
+      summary: "lane completed",
+      delivery: "delivered",
+    },
+  });
+  await seedWorkingTransition(fixture, "2026-09-14T00:00:00.000Z");
+  const prompts = [];
+  try {
+    const result = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: rootWakeApi(prompts),
+      timestamp: "2026-09-14T01:00:00.000Z",
+    });
+    assert.deepEqual(result.pendingWakes, []);
+    const events = (await fixture.manifest()).workflows[0].eventController.events;
+    assert.equal(events.some((event) => event.classification === "stall-suspected"), false);
+    assert.equal(prompts.length, 0);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("stalls are isolated to each routed root in a multi-root supervisor tick", async () => {
+  const fixture = await createFixture({ piGoalPauseDetection: false });
+  const rootB = {
+    target: "root-b",
+    target_kind: "name",
+    agent_kind: "pi",
+    pane_id: "w-b:p1",
+    workspace_id: "w-b",
+  };
+  const childB = {
+    lane_id: "lane-b",
+    target: "child-b",
+    target_kind: "name",
+    pane_id: "w-b-child:p1",
+    workspace_id: "w-b-child",
+  };
+  await seedWorkingTransition(fixture, "2026-09-14T00:00:00.000Z");
+  const secondManifestPath = join(fixture.directory, "second-stall", "manifest.json");
+  await mkdir(dirname(secondManifestPath), { recursive: true });
+  await writeFile(
+    secondManifestPath,
+    `${JSON.stringify(
+      {
+        version: 2,
+        workflows: [
+          {
+            id: "herdr-b",
+            ownership: { createdBy: "herdr-orchestrator" },
+            lanes: [
+              {
+                id: childB.lane_id,
+                paneId: childB.pane_id,
+                agentName: childB.target,
+              },
+            ],
+            eventController: {
+              version: 1,
+              events: [
+                {
+                  identity: "working-b",
+                  received_at: "2026-09-14T00:00:00.000Z",
+                  event: "pane.agent_status_changed",
+                  workflow_id: "herdr-b",
+                  lane_id: childB.lane_id,
+                  pane_id: childB.pane_id,
+                  workspace_id: childB.workspace_id,
+                  classification: "unclassified",
+                  source: { agent_status: "working" },
+                  wake: { status: "not-required", attempts: 0 },
+                },
+              ],
+            },
+          },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  await writeFile(
+    join(fixture.stateDir, "config.json"),
+    `${JSON.stringify(
+      {
+        version: 2,
+        owner: "herdr-orchestrator",
+        orchestrators: [
+          {
+            id: "root-a",
+            root: ROOT,
+            program: { id: "program-a", workspace_id: ROOT.workspace_id },
+            workflows: [
+              {
+                workflow_id: "herdr-bb029",
+                manifest_path: fixture.manifestPath,
+                pi_goal_pause_detection: false,
+                lanes: [CHILD],
+              },
+            ],
+          },
+          {
+            id: "root-b",
+            root: rootB,
+            program: { id: "program-b", workspace_id: rootB.workspace_id },
+            workflows: [
+              {
+                workflow_id: "herdr-b",
+                manifest_path: secondManifestPath,
+                pi_goal_pause_detection: false,
+                lanes: [childB],
+              },
+            ],
+          },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  const prompts = [];
+  const api = {
+    async request(method, params = {}) {
+      if (method === "pane.report_metadata") return { result: {} };
+      if (method === "agent.prompt") {
+        prompts.push({ target: params.target, text: params.text });
+        return { result: { type: "agent_prompted" } };
+      }
+      const root = params.target === ROOT.target ? ROOT : rootB;
+      return {
+        type: "agent_info",
+        agent: {
+          agent: root.agent_kind,
+          name: root.target,
+          pane_id: root.pane_id,
+          workspace_id: root.workspace_id,
+          agent_status: "idle",
+        },
+      };
+    },
+  };
+  try {
+    await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: api,
+      timestamp: "2026-09-14T00:06:00.000Z",
+    });
+    assert.deepEqual(
+      prompts.map((prompt) => prompt.target).sort(),
+      [ROOT.target, rootB.target].sort(),
+    );
+    assert.equal(
+      prompts.some((prompt) => prompt.text.includes("workflow herdr-bb029")),
+      true,
+    );
+    assert.equal(
+      prompts.some((prompt) => prompt.text.includes("workflow herdr-b")),
+      true,
+    );
+    const second = JSON.parse(await readFile(secondManifestPath, "utf8"));
+    assert.equal(
+      second.workflows[0].eventController.events.filter(
+        (event) => event.classification === "stall-suspected",
+      ).length,
+      1,
+    );
   } finally {
     await fixture.cleanup();
   }

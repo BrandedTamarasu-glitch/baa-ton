@@ -42,7 +42,15 @@ const MESSAGE_DELIVERY_STATUSES = new Set([
   "delivered",
   "uncertain",
 ]);
-const ACTIONABLE_CLASSIFICATIONS = new Set(["done", "blocked", "goal-paused"]);
+const STALL_SUSPECTED_CLASSIFICATION = "stall-suspected";
+const STALL_SUSPECTED_THRESHOLD_MS = 5 * 60 * 1_000;
+const IN_PROGRESS_AGENT_STATUSES = new Set(["working"]);
+const ACTIONABLE_CLASSIFICATIONS = new Set([
+  "done",
+  "blocked",
+  "goal-paused",
+  STALL_SUSPECTED_CLASSIFICATION,
+]);
 const TERMINAL_PARENT_GOAL_STATES = new Set([
   "completed",
   "blocked",
@@ -867,7 +875,7 @@ function validateSupervisor(supervisor) {
   return value;
 }
 
-function signalParentGoal(manifest, record) {
+function signalParentGoal(manifest, record, timestamp = now()) {
   if (!("parentGoal" in manifest)) return;
   const goal = validateParentGoal(manifest.parentGoal);
   if (!ACTIONABLE_CLASSIFICATIONS.has(record.classification)) return;
@@ -896,7 +904,7 @@ function signalParentGoal(manifest, record) {
   )
     goal.status = "review-requested";
   goal.nextAction = `Review durable ${record.classification} event ${record.identity} for ${record.workflow_id}/${record.lane_id}; continue authorized safe local work or persist a truthful waiting/blocked state.`;
-  goal.updatedAt = now();
+  goal.updatedAt = timestamp;
 }
 
 function workflowIsTerminal(workflow) {
@@ -1369,6 +1377,128 @@ function isPostCompletionLane(workflow, mapping) {
   );
 }
 
+function laneStatusTransition(record, lane) {
+  if (
+    !isRecord(record) ||
+    ![
+      "pane.agent_status_changed",
+      "pane_agent_status_changed",
+    ].includes(record.event) ||
+    (record.pane_id !== lane.pane_id &&
+      !(record.pane_id === undefined && record.lane_id === lane.lane_id)) ||
+    !isRecord(record.source) ||
+    typeof record.source.agent_status !== "string"
+  )
+    return false;
+  return true;
+}
+
+function latestLaneStatusTransition(workflow, lane) {
+  const events = workflow.eventController?.events;
+  if (!Array.isArray(events)) return undefined;
+  return events.filter((record) => laneStatusTransition(record, lane)).at(-1);
+}
+
+function stallSignalIdentity(orchestrator, manifestPath, workflowId, laneId, transition) {
+  return `stall-suspected:${routeScope(orchestrator, manifestPath)}:${workflowId}/${laneId}:${transition.identity}`;
+}
+
+function newStallRecord({
+  mapping,
+  transition,
+  identity,
+  elapsedMs,
+  timestamp,
+}) {
+  return {
+    identity,
+    // A stall signal is not a pane transition. Preserve the transition time so
+    // session-log lastResponseAt remains derived from actual lane activity.
+    received_at: transition.received_at,
+    detected_at: timestamp,
+    event: STALL_SUSPECTED_CLASSIFICATION,
+    workflow_id: mapping.workflow.workflow_id,
+    lane_id: mapping.lane.lane_id,
+    pane_id: mapping.lane.pane_id,
+    workspace_id: mapping.lane.workspace_id,
+    agent_target: mapping.lane.target,
+    ...(mapping.lane.relationship_id
+      ? { relationship_id: mapping.lane.relationship_id }
+      : {}),
+    classification: STALL_SUSPECTED_CLASSIFICATION,
+    source: {
+      agent_status: transition.source.agent_status,
+      last_event_identity: transition.identity,
+      last_event_received_at: transition.received_at,
+      detected_at: timestamp,
+      elapsed_ms: elapsedMs,
+    },
+    wake: {
+      status: "pending",
+      attempts: 0,
+      updated_at: timestamp,
+    },
+  };
+}
+
+function detectStalledLanes({
+  manifest,
+  workflows,
+  orchestrator,
+  manifestPath,
+  timestamp,
+}) {
+  const timestampMs = Date.parse(timestamp);
+  if (!Number.isFinite(timestampMs)) return false;
+  let changed = false;
+  for (const candidate of workflows) {
+    const workflow = manifest.workflows.find(
+      (stored) => isRecord(stored) && stored.id === candidate.workflow_id,
+    );
+    if (!workflow || !isRecord(workflow.eventController)) continue;
+    const events = workflow.eventController.events;
+    if (!Array.isArray(events)) continue;
+    for (const lane of candidate.lanes) {
+      const mapping = { orchestrator, workflow: candidate, lane };
+      // This is the same terminal-lane/workflow suppression used by ordinary
+      // lifecycle observations; a stale historical timestamp is irrelevant.
+      if (isPostCompletionLane(workflow, mapping)) continue;
+      const transition = latestLaneStatusTransition(workflow, lane);
+      if (
+        !transition ||
+        !IN_PROGRESS_AGENT_STATUSES.has(transition.source.agent_status)
+      )
+        continue;
+      const transitionMs = Date.parse(transition.received_at);
+      if (
+        !Number.isFinite(transitionMs) ||
+        timestampMs - transitionMs <= STALL_SUSPECTED_THRESHOLD_MS
+      )
+        continue;
+      const identity = stallSignalIdentity(
+        orchestrator,
+        manifestPath,
+        candidate.workflow_id,
+        lane.lane_id,
+        transition,
+      );
+      if (events.some((record) => record.identity === identity)) continue;
+      events.push(
+        newStallRecord({
+          mapping,
+          transition,
+          identity,
+          elapsedMs: timestampMs - transitionMs,
+          timestamp,
+        }),
+      );
+      signalParentGoal(manifest, events.at(-1), timestamp);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 function suppressPostCompletionDone(classification, event, workflow, mapping) {
   if (
     event.data.agent_status === "done" &&
@@ -1573,7 +1703,24 @@ function routeScope(orchestrator, manifestPath) {
   return `${orchestrator.id}:${sha256(resolve(manifestPath))}`;
 }
 
+function formatElapsed(milliseconds) {
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return "an unknown duration";
+  const seconds = Math.floor(milliseconds / 1_000);
+  if (seconds < 60) return `${seconds} seconds`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder === 0 ? `${minutes} minutes` : `${minutes}m ${remainder}s`;
+}
+
 function wakeText(record) {
+  if (record.classification === STALL_SUSPECTED_CLASSIFICATION) {
+    return [
+      `[Herdr Orchestrator stall-suspected] workflow ${record.workflow_id}, lane ${record.lane_id} has had no recorded status transition for ${formatElapsed(record.source?.elapsed_ms)}.`,
+      "This is advisory only and may be a false positive on a genuinely slow turn; inspect the lane and workflow rather than assuming the lane is dead.",
+      `Durable signal identity: ${record.identity}. Review the workflow manifest eventController ledger.`,
+      "This notification is observational only: do not dispatch, resume, close, push, merge, create a PR, deploy, or mutate production from it.",
+    ].join(" ");
+  }
   return [
     `[Herdr Orchestrator event] ${record.classification}: workflow ${record.workflow_id}, lane ${record.lane_id}.`,
     `Durable event identity: ${record.identity}. Review the workflow manifest eventController ledger.`,
@@ -2191,6 +2338,26 @@ export async function runSupervisorTick({
       // workflow. This check is deliberately separate from ordinary lane
       // review signals and is also run when no wake is pending.
       if (signalParentGoalMismatch(manifest, workflows, timestamp)) {
+        await atomicWriteJson(manifestPath, manifest);
+        if ("parentGoal" in manifest)
+          await publishParentGoalSidebar(
+            validateParentGoal(manifest.parentGoal),
+            orchestrator.root,
+            api,
+            queueStore(manifest),
+          );
+      }
+      // Wall-clock stall detection is sampled here, alongside the existing
+      // event-driven pending-wake reconciliation. It compares only durable
+      // lane transition timestamps; it never polls a child agent.
+      const stallsChanged = detectStalledLanes({
+        manifest,
+        workflows,
+        orchestrator,
+        manifestPath,
+        timestamp,
+      });
+      if (stallsChanged) {
         await atomicWriteJson(manifestPath, manifest);
         if ("parentGoal" in manifest)
           await publishParentGoalSidebar(

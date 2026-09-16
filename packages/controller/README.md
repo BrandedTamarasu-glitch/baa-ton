@@ -40,6 +40,8 @@ Replace all placeholders with real opaque IDs and the absolute workflow manifest
 - The optional parent-goal supervisor sends one non-waiting recovery nudge per durable work transition, only after the mapped Pi root has fully settled. Delivered/uncertain wakes survive restarts without replay; terminal snapshots cannot release an active run. See the [supervisor wake protocol and rollout limits](../herdr-tools/GOAL-ADAPTER-PROTOCOL.md#supervisor-wake-protocol).
 - The controller never dispatches, resumes, closes, creates topology, mutates Git, or contacts external services.
 
+Each supervisor tick compares the latest recorded lane transition against a five-minute wall-clock threshold. A routed lane that remains `working` beyond that threshold emits one durable `stall-suspected` signal per stale period and wakes its root; the signal is advisory, may be a false positive on a genuinely slow turn, and tells the root to inspect rather than declaring the lane dead.
+
 ## Validate
 
 ```sh
