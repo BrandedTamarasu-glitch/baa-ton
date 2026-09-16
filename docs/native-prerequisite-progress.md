@@ -96,7 +96,6 @@ Remaining delegated-core work includes neutral domain types/transactional store,
 
 Todo: #3 source prerequisites completed; #5 activation/live verification in progress; #4 delegated core pending. No Luna launched yet.
 
-
 ### Codex lane close-out (2026-09-15, herdr-44fa8053)
 
 Items 3, 6-remainder, and the permission broker landed via the Codex lane (41m work). Parent verification: focused regressions 17/17 serial (parallel-run flakiness in its test isolation noted as follow-up); work committed by parent as d3816c8 because the codex workspace-write sandbox cannot write the worktree linked git metadata. The durable completion receipt could not be recorded by the lane: its bridge instance went stale mid-flight (jiti loading across concurrent lane edits), and killing it revealed codex does not respawn dead MCP servers (dead-stub tool errors surface as type errors). Work is verified and committed; receipt reconciliation is recorded here as the operator evidence. Follow-ups: bridge restart/resilience for codex lanes, operator-closure tool for receipt-blocked workflows, sandbox exceptions for worktree git metadata.
@@ -106,6 +105,7 @@ Items 3, 6-remainder, and the permission broker landed via the Codex lane (41m w
 Landed and parent-verified (eecd940, 64/64 extension + 32/32 controller, tsc and diff-check clean): adapter-declared startup handshake with OpenCode READY wiring (dispatch 27/27), parallel test-isolation fix (inbox 4/4, MCP 5/5, repeated 42/42), doctor checks for codex sandbox git-metadata writability and bridge liveness, and `herdr_operator_close` (root-only reconciliation that never impersonates a lane receipt). README rewritten for humans (31 lines, honest harness table), docs/ADDING-A-HARNESS.md added, and assets/mascot.svg (661521c, pushed). All three receipt-blocked workflows (herdr-44fa8053, herdr-cf2fc797, herdr-ec608e46) were reconciled via herdr_operator_close with who/why/evidence.
 
 Genuinely remaining (open):
+
 - Codex upstream: no MCP-server respawn (dead bridge orphans lane tools for the session); sandbox cannot write linked worktree git metadata; no native wait-for-shell (our 60s process-info gate approximates it).
 - Controller still emits observational wake events for post-completion lane idles (done-classification noise); harmless but noisy.
 - Bridge session env must be passed explicitly to codex MCP children (fixed in 42e77c1); any future harness with non-inheriting MCP children needs the same.
