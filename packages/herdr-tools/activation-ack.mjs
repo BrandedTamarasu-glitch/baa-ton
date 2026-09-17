@@ -9,6 +9,8 @@ import {
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
+const POSIX_MODE_CHECKS = process.platform !== "win32";
+
 /** Called only by the reloaded, controller-mapped root adapter. Lives inside
  * the extension package so relative imports never cross the symlink used to
  * load the extension; the controller-side handoff stays in packages/controller. */
@@ -17,7 +19,11 @@ export async function acknowledgeActivation(configDir, identity, readNative) {
   let journal;
   try {
     const info = await lstat(path);
-    if (!info.isFile() || info.isSymbolicLink() || info.mode & 0o022)
+    if (
+      !info.isFile() ||
+      info.isSymbolicLink() ||
+      (POSIX_MODE_CHECKS && (info.mode & 0o022) !== 0)
+    )
       return undefined;
     journal = JSON.parse(await readFile(path, "utf8"));
   } catch (error) {

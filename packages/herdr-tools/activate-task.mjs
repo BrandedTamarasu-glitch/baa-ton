@@ -21,6 +21,7 @@ import { randomUUID } from "node:crypto";
 import { validateConfig } from "../controller/controller.mjs";
 const exec = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
+const POSIX_MODE_CHECKS = process.platform !== "win32";
 function parseJson(text, label) {
   try {
     return JSON.parse(text);
@@ -59,7 +60,11 @@ export async function activateTask({
     );
   const configPath = join(configDir, "config.json");
   const info = await lstat(configPath);
-  if (!info.isFile() || info.isSymbolicLink() || info.mode & 0o022)
+  if (
+    !info.isFile() ||
+    info.isSymbolicLink() ||
+    (POSIX_MODE_CHECKS && (info.mode & 0o022) !== 0)
+  )
     throw new Error("Unsafe controller configuration.");
   if (!(await lstat(extensionLink)).isSymbolicLink())
     throw new Error(
