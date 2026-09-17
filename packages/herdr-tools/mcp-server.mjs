@@ -43,6 +43,7 @@ import {
   liveHerdrAgentList,
   liveHerdrPaneProcessInfo,
 } from "./live-herdr.mjs";
+import { liveProcessParentPid } from "./live-process.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -150,6 +151,9 @@ async function refreshCurrentHerdrIdentity() {
     listAgents: liveHerdrAgentList,
     listPaneProcesses: ({ paneId }) => liveHerdrPaneProcessInfo(paneId),
     currentProcessPids: [process.pid, process.ppid],
+    currentProcessPid: process.pid,
+    getParentPid: liveProcessParentPid,
+    maxProcessAncestorDepth: 8,
     currentCwd: process.cwd(),
     allowStaticFallback: staticRootFallbackAllowed,
   });

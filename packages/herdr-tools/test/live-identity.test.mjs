@@ -89,6 +89,58 @@ test("the live pane process wins when Claude's MCP session id was regenerated", 
   });
 });
 
+test("the live pane process match walks through wrapper ancestors", async () => {
+  const parentByPid = new Map([
+    [4440, 66308],
+    [66308, 79844],
+    [79844, 90888],
+  ]);
+  const visited = [];
+  const identity = await resolveHerdrIdentity({
+    env: {
+      HERDR_PANE_ID: "w-frozen:old",
+      HERDR_WORKSPACE_ID: "w-frozen",
+      CLAUDE_CODE_SESSION_ID: "mcp-process-generated-id",
+    },
+    currentProcessPids: [4440, 66308],
+    currentProcessPid: 4440,
+    getParentPid: async (pid) => {
+      visited.push(pid);
+      return parentByPid.get(pid);
+    },
+    listAgents: async () => ({
+      result: {
+        agents: [
+          {
+            agent: "claude",
+            pane_id: "w-live:current",
+            workspace_id: "w-live",
+            cwd: "C:\\cic",
+            agent_session: {
+              agent: "claude",
+              kind: "id",
+              value: "stable-herdr-session-id",
+            },
+          },
+        ],
+      },
+    }),
+    listPaneProcesses: async () => ({
+      result: {
+        process_info: {
+          foreground_processes: [{ pid: 90888 }],
+        },
+      },
+    }),
+  });
+
+  assert.deepEqual(identity, {
+    paneId: "w-live:current",
+    workspaceId: "w-live",
+  });
+  assert.deepEqual(visited, [4440, 66308, 79844]);
+});
+
 test("a registered live static root remains usable when Claude's session id is absent from Herdr", async () => {
   const identity = await resolveHerdrIdentity({
     env: {

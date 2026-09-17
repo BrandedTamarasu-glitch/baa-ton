@@ -12,6 +12,9 @@ export function resolveHerdrIdentity(options?: {
     agent: unknown;
   }) => Promise<unknown>;
   currentProcessPids?: number[];
+  currentProcessPid?: number;
+  getParentPid?: (pid: number) => Promise<number | undefined>;
+  maxProcessAncestorDepth?: number;
   currentCwd?: string;
   allowStaticFallback?: (target: {
     fallback: HerdrIdentity;
