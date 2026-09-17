@@ -36,6 +36,9 @@ const MIN_NUDGE_INTERVAL_SECONDS = 5;
 const MAX_NUDGE_INTERVAL_SECONDS = 86_400;
 const MESSAGE_SUMMARY_MAX_LENGTH = 4_000;
 const MESSAGE_DETAILS_MAX_LENGTH = 6_000;
+// Windows ACLs do not map to Node's POSIX mode bits. Privacy is provided by
+// Herdr's per-user plugin directory there; retain the mode check on Unix.
+const POSIX_MODE_CHECKS = process.platform !== "win32";
 const MESSAGE_DELIVERY_STATUSES = new Set([
   "pending",
   "sending",
@@ -478,7 +481,7 @@ export async function loadConfig(configDir) {
   });
   assert(details.isFile(), `Controller config must be a regular file: ${path}`);
   assert(
-    (details.mode & 0o022) === 0,
+    !POSIX_MODE_CHECKS || (details.mode & 0o022) === 0,
     `Controller config must not be group- or world-writable: ${path}`,
   );
   return validateConfig(
@@ -3265,7 +3268,7 @@ async function supervisorLeaseDirectory(configDir) {
   assert(
     details.isDirectory() &&
       !details.isSymbolicLink() &&
-      (details.mode & 0o022) === 0,
+      (!POSIX_MODE_CHECKS || (details.mode & 0o022) === 0),
     `Controller config directory must be a private real directory: ${directory}`,
   );
   return directory;

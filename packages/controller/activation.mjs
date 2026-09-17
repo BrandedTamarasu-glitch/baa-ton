@@ -9,6 +9,8 @@ import {
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
+const POSIX_MODE_CHECKS = process.platform !== "win32";
+
 /** One-shot installation handoff owned by the existing Herdr hook lifecycle.
  * No timer, child process, supervisor or terminal polling is created. The
  * reloaded extension's acknowledgement lives in packages/herdr-tools. */
@@ -17,7 +19,11 @@ export async function handleActivation(configDir, event, api) {
   let journal;
   try {
     const info = await lstat(path);
-    if (!info.isFile() || info.isSymbolicLink() || info.mode & 0o022)
+    if (
+      !info.isFile() ||
+      info.isSymbolicLink() ||
+      (POSIX_MODE_CHECKS && (info.mode & 0o022) !== 0)
+    )
       throw new Error("Unsafe activation journal");
     journal = JSON.parse(await readFile(path, "utf8"));
   } catch (error) {
