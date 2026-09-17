@@ -23,6 +23,7 @@ const START_SKILL_START = "<!-- baa-ton:start-skill:start -->";
 const START_SKILL_END = "<!-- baa-ton:start-skill:end -->";
 const LEGACY_SETUP_SKILL_START = "<!-- baa-ton:setup-skill:start -->";
 const LEGACY_SETUP_SKILL_END = "<!-- baa-ton:setup-skill:end -->";
+const PROJECT_SKILLS = ["baa-ton-start", "baa-ton-configure", "baa-ton-update"];
 
 const START_SKILL_DIRECTORIES = {
   pi: [".pi", "agent", "skills"],
@@ -253,21 +254,34 @@ export function updateManagedReference(path, baaPath) {
   return { path, changed: next !== existing };
 }
 
-export function startSkillPath(projectRoot, harnessId) {
+export function projectSkillPath(projectRoot, harnessId, skillName) {
   const directory = START_SKILL_DIRECTORIES[harnessId];
   if (!directory) throw new Error(`Unknown harness ${JSON.stringify(harnessId)}.`);
-  return join(projectRoot, ...directory, "baa-ton-start", "SKILL.md");
+  if (!PROJECT_SKILLS.includes(skillName)) throw new Error(`Unknown Baa-ton skill ${JSON.stringify(skillName)}.`);
+  return join(projectRoot, ...directory, skillName, "SKILL.md");
+}
+
+export function startSkillPath(projectRoot, harnessId) {
+  return projectSkillPath(projectRoot, harnessId, "baa-ton-start");
+}
+
+export function configureSkillPath(projectRoot, harnessId) {
+  return projectSkillPath(projectRoot, harnessId, "baa-ton-configure");
+}
+
+export function updateSkillPath(projectRoot, harnessId) {
+  return projectSkillPath(projectRoot, harnessId, "baa-ton-update");
 }
 
 export function startSkillContent({ harness, baaPath, projectRoot }) {
   const rootSetupPath = join(checkoutDirectory, "packages", "herdr-tools", "root-setup.mjs");
   const setupPath = join(checkoutDirectory, "packages", "herdr-tools", "setup.mjs");
   return [
-    START_SKILL_START,
     "---",
     "name: baa-ton-start",
     "description: Start or repair Baa-ton in the current Herdr project after installation.",
     "---",
+    START_SKILL_START,
     "",
     "# Start Baa-ton",
     "",
@@ -280,6 +294,55 @@ export function startSkillContent({ harness, baaPath, projectRoot }) {
     "5. Report that the root is ready and wait for the user's task. Do not initialize a goal until the user gives the objective.",
     "",
     `If project configuration must be changed, rerun the project wizard with \`node \"${setupPath}\" --project-root \"${projectRoot}\"\`; do not guess model, auth, or thinking settings.`,
+    START_SKILL_END,
+    "",
+  ].join("\n");
+}
+
+export function configureSkillContent({ baaPath, projectRoot }) {
+  const setupPath = join(checkoutDirectory, "packages", "herdr-tools", "setup.mjs");
+  return [
+    "---",
+    "name: baa-ton-configure",
+    "description: Configure Baa-ton worker profiles and exact harness model settings for this project.",
+    "---",
+    START_SKILL_START,
+    "",
+    "# Configure Baa-ton",
+    "",
+    `Use this skill when the user wants to change which harness, model, thinking level, or authentication choice Baa-ton uses for a worker type. Read \`${baaPath}\` and \`${join(projectRoot, ".baa-ton", "config.json")}\` first.`,
+    "",
+    "1. Review the existing task profiles and preserve any user customizations.",
+    "2. Ask for exact provider, model, thinking, and auth values when they are not already known. Never invent a model ID or silently substitute one.",
+    "3. Update the matching profile's `agentKind` and exact `launchProfile` (`provider`, `model`, `thinking`, `auth`) in `.baa-ton/config.json`.",
+    "4. Show the resulting worker/profile mapping and explain that Baa-ton will live-qualify it before dispatch.",
+    "5. Do not bootstrap a root, initialize a goal, plan work, or dispatch a lane as part of configuration.",
+    "",
+    `If harness selection also needs changing, rerun the project wizard with \`node "${setupPath}" --project-root "${projectRoot}"\`.`,
+    START_SKILL_END,
+    "",
+  ].join("\n");
+}
+
+export function updateSkillContent({ projectRoot }) {
+  const setupPath = join(checkoutDirectory, "packages", "herdr-tools", "setup.mjs");
+  return [
+    "---",
+    "name: baa-ton-update",
+    "description: Update the Baa-ton checkout and refresh this project's harness integrations.",
+    "---",
+    START_SKILL_START,
+    "",
+    "# Update Baa-ton",
+    "",
+    `Use this skill only when the user asks to update Baa-ton. The project is \`${projectRoot}\`.`,
+    "",
+    "1. Preserve the project's `BAA.md`, `.baa-ton/config.json`, instruction files, and user-authored skills.",
+    `2. Update the checkout with \`git -C "${checkoutDirectory}" pull --ff-only\`. If the checkout has local changes or the fast-forward fails, stop and report it.`,
+    `3. Install dependency changes with \`npm --prefix "${checkoutDirectory}" install --no-audit --no-fund\`.`,
+    `4. Refresh the project integrations with \`node "${setupPath}" --project-root "${projectRoot}" --non-interactive\`.`,
+    "5. Report the new checkout commit and any preserved or changed project configuration. Restart the harness only if its integration requires it.",
+    "6. Do not reset active Herdr roots, retire resources, initialize goals, plan work, or dispatch lanes as part of an update.",
     START_SKILL_END,
     "",
   ].join("\n");
@@ -307,12 +370,17 @@ function removeLegacySetupSkill(projectRoot, harness) {
   return true;
 }
 
-export function installStartSkills({ projectRoot, selected, baaPath }) {
+export function installProjectSkills({ projectRoot, selected, baaPath }) {
   for (const harness of Object.keys(START_SKILL_DIRECTORIES)) removeLegacySetupSkill(projectRoot, harness);
-  return selected.map((harness) => installStartSkill(
-    startSkillPath(projectRoot, harness),
-    startSkillContent({ harness, baaPath, projectRoot }),
-  ));
+  const content = {
+    "baa-ton-start": (harness) => startSkillContent({ harness, baaPath, projectRoot }),
+    "baa-ton-configure": () => configureSkillContent({ baaPath, projectRoot }),
+    "baa-ton-update": () => updateSkillContent({ projectRoot }),
+  };
+  return selected.flatMap((harness) => PROJECT_SKILLS.map((skillName) => installStartSkill(
+    projectSkillPath(projectRoot, harness, skillName),
+    content[skillName](harness),
+  )));
 }
 
 function ensureProjectBaa(projectRoot, installedBaaPath) {
@@ -333,10 +401,11 @@ function instructionCandidates(projectRoot, selected) {
   return [...new Set(candidates)];
 }
 
-export function buildSetupConfig({ projectRoot, baaPath, detected, selected, instructionFiles, defaults, startSkills = [] }) {
+export function buildSetupConfig({ projectRoot, baaPath, detected, selected, instructionFiles, defaults, skills = [] }) {
   const configPath = join(projectRoot, BAA_CONFIG_DIRECTORY, BAA_CONFIG_NAME);
   const existing = readJson(configPath, {});
   delete existing.setupSkills;
+  delete existing.startSkills;
   if (existing.version !== undefined && existing.version !== 1)
     throw new Error(`Unsupported Baa-ton config version at ${configPath}.`);
   const profiles = { ...Object.fromEntries(Object.entries(defaults.profiles).map(([name, profile]) => [
@@ -363,7 +432,7 @@ export function buildSetupConfig({ projectRoot, baaPath, detected, selected, ins
     })),
     selectedHarnesses: selected,
     instructionFiles,
-    startSkills,
+    skills,
     profiles,
   };
 }
@@ -389,7 +458,7 @@ async function main() {
     ? options.instructionPaths
     : instructionCandidates(projectRoot, selected);
   for (const path of instructionFiles) updateManagedReference(path, baaPath);
-  const startSkills = installStartSkills({ projectRoot, selected, baaPath });
+  const skills = installProjectSkills({ projectRoot, selected, baaPath });
   const configPath = join(projectRoot, BAA_CONFIG_DIRECTORY, BAA_CONFIG_NAME);
   const config = buildSetupConfig({
     projectRoot,
@@ -398,7 +467,7 @@ async function main() {
     selected,
     instructionFiles,
     defaults,
-    startSkills: startSkills.map((skill) => skill.path),
+    skills: skills.map((skill) => skill.path),
   });
   writeJsonAtomic(configPath, config);
 
@@ -410,10 +479,10 @@ async function main() {
     console.log(`Selected harnesses: ${selected.length ? selected.join(", ") : "none"}`);
     if (instructionFiles.length) console.log(`Updated BAA.md references: ${instructionFiles.join(", ")}`);
     else console.log("No AGENTS.md or CLAUDE.md selected; pass --instructions-path to add the managed reference.");
-    if (startSkills.length) {
-      const installed = startSkills.filter((skill) => !skill.skipped).map((skill) => skill.path);
-      const skipped = startSkills.filter((skill) => skill.skipped).map((skill) => skill.path);
-      if (installed.length) console.log(`Installed start skills: ${installed.join(", ")}`);
+    if (skills.length) {
+      const installed = skills.filter((skill) => !skill.skipped).map((skill) => skill.path);
+      const skipped = skills.filter((skill) => skill.skipped).map((skill) => skill.path);
+      if (installed.length) console.log(`Installed Baa-ton skills: ${installed.join(", ")}`);
       if (skipped.length) console.log(`Preserved existing skill files: ${skipped.join(", ")}`);
       console.log("A selected harness can invoke the `baa-ton-start` skill later to start or repair Baa-ton.");
     }

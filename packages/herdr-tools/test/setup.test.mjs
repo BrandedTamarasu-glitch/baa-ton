@@ -5,10 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildSetupConfig,
-  installStartSkills,
+  configureSkillContent,
+  configureSkillPath,
+  installProjectSkills,
   managedReferenceBlock,
   startSkillContent,
   startSkillPath,
+  updateSkillContent,
+  updateSkillPath,
   updateManagedReference,
 } from "../setup.mjs";
 import { resolveTaskProfile, taskProfileConfigPath } from "../profile-config.mjs";
@@ -64,29 +68,31 @@ test("selected harnesses receive idempotent project-local start skills", async (
   const directory = await mkdtemp(join(tmpdir(), "baa-skills-"));
   try {
     const selected = ["pi", "claude", "codex", "opencode"];
-    const first = installStartSkills({
+    const first = installProjectSkills({
       projectRoot: directory,
       selected,
       baaPath: join(directory, "BAA.md"),
     });
-    assert.deepEqual(first.map((skill) => skill.skipped), [false, false, false, false]);
+    assert.equal(first.length, selected.length * 3);
+    assert.deepEqual(first.map((skill) => skill.skipped), Array(selected.length * 3).fill(false));
     for (const harness of selected) {
-      const path = startSkillPath(directory, harness);
-      const content = await readFile(path, "utf8");
-      assert.match(content, /name: baa-ton-start/);
-      assert.match(content, new RegExp(`--harness ${harness}`));
-      assert.equal(content, startSkillContent({
-        harness,
-        baaPath: join(directory, "BAA.md"),
-        projectRoot: directory,
-      }));
+      const skills = [
+        [startSkillPath(directory, harness), startSkillContent({ harness, baaPath: join(directory, "BAA.md"), projectRoot: directory }), "baa-ton-start"],
+        [configureSkillPath(directory, harness), configureSkillContent({ baaPath: join(directory, "BAA.md"), projectRoot: directory }), "baa-ton-configure"],
+        [updateSkillPath(directory, harness), updateSkillContent({ projectRoot: directory }), "baa-ton-update"],
+      ];
+      for (const [path, expected, name] of skills) {
+        const content = await readFile(path, "utf8");
+        assert.match(content, new RegExp(`name: ${name}`));
+        assert.equal(content, expected);
+      }
     }
-    const second = installStartSkills({
+    const second = installProjectSkills({
       projectRoot: directory,
       selected,
       baaPath: join(directory, "BAA.md"),
     });
-    assert.deepEqual(second.map((skill) => skill.changed), [false, false, false, false]);
+    assert.deepEqual(second.map((skill) => skill.changed), Array(selected.length * 3).fill(false));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -101,7 +107,7 @@ test("rerunning the wizard removes the owned legacy setup skill", async () => {
       legacyPath,
       "<!-- baa-ton:setup-skill:start -->\nlegacy\n<!-- baa-ton:setup-skill:end -->\n",
     );
-    installStartSkills({
+    installProjectSkills({
       projectRoot: directory,
       selected: ["claude"],
       baaPath: join(directory, "BAA.md"),

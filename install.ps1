@@ -114,3 +114,4 @@ if ($clipboardCopied) {
 Welcome
 Say "Install complete."
 Say "To get started, start your harness in that project and invoke the Baa-ton skill: baa-ton-start."
+Say "Later: use baa-ton-configure for worker/model choices or baa-ton-update for updates."

@@ -28,7 +28,7 @@ Windows CMD:
 curl -fsSL https://raw.githubusercontent.com/zachristmas/baa-ton/main/install.cmd -o install.cmd && install.cmd && del install.cmd
 ```
 
-Run the installer from the project directory you want to use. It defaults to that directory, lets you choose another, detects your installed harnesses, and runs the setup wizard. When it says `Install complete`, start the harness of your choice in that project and invoke the `baa-ton-start` skill. Configure worker profiles and model choices in that project’s `.baa-ton/config.json`. Re-running the installer updates the checkout and project configuration.
+Run the installer from the project directory you want to use. It defaults to that directory, lets you choose another, detects your installed harnesses, and runs the setup wizard. When it says `Install complete`, start the harness of your choice in that project and invoke the `baa-ton-start` skill. Use `baa-ton-configure` for worker profiles and model choices, or `baa-ton-update` to update Baa-ton. Re-running the installer updates the checkout and project configuration.
 
 Uninstall:
 
