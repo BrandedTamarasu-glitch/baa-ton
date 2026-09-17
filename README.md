@@ -1,8 +1,10 @@
 # Baa-ton
 
 <p align="center">
-  <img src="assets/mascot.png" alt="Nala, the Baa-ton dog" width="160" height="160">
+  <img src="assets/mascot.png" alt="Nala, the Baa-ton dog" width="320" height="320">
 </p>
+
+<pre align="center">───────────────────🐕  🐑  🐑  🐑  🐑  🐑  🐑──────────────────</pre>
 
 Baa-ton is a durable, harness-neutral orchestration layer for [Herdr](https://github.com/herdrdev/herdr) 0.9+. Herdr owns panes and agent processes; Baa-ton plans work, verifies agents before dispatch, and records durable receipts.
 
