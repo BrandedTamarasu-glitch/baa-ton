@@ -3,7 +3,14 @@ import { test } from "node:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildSetupConfig, managedReferenceBlock, updateManagedReference } from "../setup.mjs";
+import {
+  buildSetupConfig,
+  installSetupSkills,
+  managedReferenceBlock,
+  setupSkillContent,
+  setupSkillPath,
+  updateManagedReference,
+} from "../setup.mjs";
 import { resolveTaskProfile, taskProfileConfigPath } from "../profile-config.mjs";
 
 test("managed BAA references are idempotent and replace stale paths", async () => {
@@ -51,6 +58,38 @@ test("setup config preserves exact user profiles while adding defaults", async (
   });
   assert.deepEqual(config.selectedHarnesses, ["claude"]);
   assert.equal(config.profiles.planning.readOnly, true);
+});
+
+test("selected harnesses receive idempotent project-local setup skills", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "baa-skills-"));
+  try {
+    const selected = ["pi", "claude", "codex", "opencode"];
+    const first = installSetupSkills({
+      projectRoot: directory,
+      selected,
+      baaPath: join(directory, "BAA.md"),
+    });
+    assert.deepEqual(first.map((skill) => skill.skipped), [false, false, false, false]);
+    for (const harness of selected) {
+      const path = setupSkillPath(directory, harness);
+      const content = await readFile(path, "utf8");
+      assert.match(content, /name: baa-ton-setup/);
+      assert.match(content, new RegExp(`--harness ${harness}`));
+      assert.equal(content, setupSkillContent({
+        harness,
+        baaPath: join(directory, "BAA.md"),
+        projectRoot: directory,
+      }));
+    }
+    const second = installSetupSkills({
+      projectRoot: directory,
+      selected,
+      baaPath: join(directory, "BAA.md"),
+    });
+    assert.deepEqual(second.map((skill) => skill.changed), [false, false, false, false]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("configured task profile resolves an exact launch profile", async () => {

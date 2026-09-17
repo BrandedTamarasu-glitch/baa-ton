@@ -64,34 +64,26 @@ if (Get-Command herdr -ErrorAction SilentlyContinue) {
 
 $ProjectRoot = $PWD.Path
 Say "Running the Baa-ton project wizard in $ProjectRoot"
-& node (Join-Path $BaaTonDir "packages\herdr-tools\setup.mjs") --project-root $ProjectRoot
+& node (Join-Path $BaaTonDir "packages\herdr-tools\setup.mjs") --project-root $ProjectRoot --prompt-project
 if ($LASTEXITCODE -ne 0) {
   throw "Baa-ton project setup failed with exit code $LASTEXITCODE"
 }
 
+Say "Project wizard complete. Selected harnesses have the project-local baa-ton-setup skill."
+
 $rootPrompt = @"
-Set up Baa-ton as the root for this Herdr pane.
+Finish Baa-ton root setup in this Herdr pane.
 
-The Baa-ton checkout is at:
-$BaaTonDir
+The installer already configured the selected project and installed the
+project-local baa-ton-setup skill for the selected harnesses. Invoke that skill
+now. It must read BAA.md, complete the harness-specific connection, restart in
+this same Herdr pane only if required, call herdr_bootstrap_root, verify the root
+identity, and wait for my task.
 
-The installer has already run the harness-selection wizard for the project
-directory where it was launched. Do not ask me to run setup.mjs again.
-
-Do this in order:
-1. Confirm this is a Herdr pane and identify the current harness: Pi, Claude Code, Codex, or OpenCode.
-2. Run the matching command from this pane:
-     node "$BaaTonDir\packages\herdr-tools\root-setup.mjs" --harness claude
-   Use codex, opencode, or pi for the other harnesses.
-3. Follow the helper's one-time integration instructions. If it asks for a
-   restart, restart the harness in this same Herdr pane and continue.
-4. Call herdr_bootstrap_root and verify the returned root identity and briefing.
-5. Report exactly: "Baa-ton root ready: <harness>, <workspace>, <pane>." Then
-   wait for my task. Do not initialize a parent goal or ask for an objective yet.
-
-Read BAA.md in the checkout for the operating contract. Keep the harness in this
-pane so its Herdr identity is preserved. Never reset an existing root unless the
-pane and checkout are intentionally being replaced.
+Do not ask me to run setup.mjs, initialize a goal, or provide an objective during
+setup. If the skill is unavailable, use the installed root-setup helper as the
+fallback. Never reset an existing root unless the pane and checkout are
+intentionally being replaced.
 "@
 
 $clipboardCopied = $false
@@ -103,8 +95,8 @@ try {
 }
 
 if ($clipboardCopied) {
-  Say "Done. A ready-to-paste root setup instruction was copied to the clipboard."
+  Say "A short fallback prompt was copied to the clipboard; normally invoke baa-ton-setup from the harness."
 } else {
-  Say "Done. Clipboard copy was unavailable; use this root setup instruction:"
+  Say "Clipboard unavailable; use this fallback prompt if the harness cannot invoke baa-ton-setup:"
 }
 Write-Host $rootPrompt

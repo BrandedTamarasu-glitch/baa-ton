@@ -26,7 +26,7 @@ Windows CMD:
 curl -fsSL https://raw.githubusercontent.com/zachristmas/baa-ton/main/install.cmd -o install.cmd && install.cmd && del install.cmd
 ```
 
-Run the installer from the project directory you want to use. It clones to `~/.baa-ton` (override with `BAA_TON_DIR`), installs dependencies, links the Pi extension, registers the Herdr controller when available, and runs the harness-selection wizard for that project. It also copies one ready-to-paste root setup prompt. Re-running it updates the checkout and reruns the wizard.
+Run the installer from the project directory you want to use. It defaults the project target to that directory, then lets you enter another project directory before selecting harnesses. It clones to `~/.baa-ton` (override with `BAA_TON_DIR`), installs dependencies, links the Pi extension, registers the Herdr controller when available, and runs the project wizard. The wizard writes the project contract/config and a small project-local `baa-ton-setup` skill for each selected harness. Start a selected harness in that project and invoke the skill; a short clipboard prompt remains as a fallback. Re-running it updates the checkout and reruns the wizard.
 
 Uninstall:
 
@@ -38,7 +38,9 @@ On Windows, run `uninstall.ps1` or `uninstall.cmd`. The uninstaller removes only
 
 ## Set up a root
 
-After the installer finishes, paste its prompt into the harness running in the target Herdr pane. The project wizard has already run; the prompt identifies the current harness, runs the matching root setup, handles the one-time MCP/extension connection, and tells the harness to restart only when needed. After restart, it calls `herdr_bootstrap_root` and waits for your task.
+After the installer finishes, start a selected harness in the target project and invoke its project-local `baa-ton-setup` skill. The skill handles the one-time MCP/extension connection, restarts only when needed, calls `herdr_bootstrap_root`, and waits for your task. The installer’s short clipboard prompt is a fallback for a harness that cannot discover project skills.
+
+# Fallback for a harness that cannot discover the project-local skill:
 
 ```sh
 node ~/.baa-ton/packages/herdr-tools/root-setup.mjs --harness claude
@@ -49,7 +51,7 @@ The root setup helper prints the exact integration command for the current pane.
 
 ## Re-run project setup
 
-If you installed from the wrong directory or want to change harness selections, run the same wizard manually from the project root:
+If you installed from the wrong directory or want to change harness selections, run the same wizard manually from the project root. Press Enter to keep the current directory, or enter another existing project path when prompted:
 
 macOS, Linux, and WSL:
 

@@ -6,9 +6,10 @@
  * persisted for the user, while dispatch still performs live qualification.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const toolsDirectory = dirname(fileURLToPath(import.meta.url));
@@ -18,6 +19,15 @@ const BAA_REFERENCE_START = "<!-- baa-ton:start -->";
 const BAA_REFERENCE_END = "<!-- baa-ton:end -->";
 const BAA_CONFIG_DIRECTORY = ".baa-ton";
 const BAA_CONFIG_NAME = "config.json";
+const SETUP_SKILL_START = "<!-- baa-ton:setup-skill:start -->";
+const SETUP_SKILL_END = "<!-- baa-ton:setup-skill:end -->";
+
+const SETUP_SKILL_DIRECTORIES = {
+  pi: [".pi", "agent", "skills"],
+  claude: [".claude", "skills"],
+  codex: [".codex", "skills"],
+  opencode: [".opencode", "skills"],
+};
 
 export const HARNESSES = [
   { id: "pi", label: "Pi", binary: "pi", instructionFile: null },
@@ -31,6 +41,7 @@ function usage() {
 
 Options:
   --project-root <dir>       Project directory for .baa-ton/config.json (default: cwd)
+  --prompt-project           Ask for the project directory (default: the supplied project root)
   --instructions-path <file> Add/update the managed BAA.md reference in this file
   --harness <name>           Select a harness (repeatable: pi, claude, codex, opencode)
   --non-interactive          Use detected harnesses without opening the checkbox TUI
@@ -73,6 +84,7 @@ function loadDefaults() {
 function parseArgs(args) {
   const options = {
     projectRoot: process.cwd(),
+    promptProject: false,
     instructionPaths: [],
     harnesses: [],
     nonInteractive: false,
@@ -83,6 +95,8 @@ function parseArgs(args) {
       options.help = true;
     } else if (arg === "--non-interactive") {
       options.nonInteractive = true;
+    } else if (arg === "--prompt-project") {
+      options.promptProject = true;
     } else if (arg === "--project-root") {
       options.projectRoot = resolve(args[++index] ?? "");
     } else if (arg === "--instructions-path") {
@@ -94,6 +108,35 @@ function parseArgs(args) {
     }
   }
   return options;
+}
+
+function projectDirectoryIsUsable(path) {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function expandHome(path) {
+  return path.replace(/^~(?=$|[\\/])/, homedir());
+}
+
+async function promptProjectRoot(defaultRoot) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return defaultRoot;
+  const readline = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    while (true) {
+      const answer = await new Promise((resolveAnswer) => {
+        readline.question(`Project directory [${defaultRoot}]: `, resolveAnswer);
+      });
+      const candidate = resolve(expandHome(answer.trim() || defaultRoot));
+      if (projectDirectoryIsUsable(candidate)) return candidate;
+      console.log(`Not a directory: ${candidate}`);
+    }
+  } finally {
+    readline.close();
+  }
 }
 
 function openInteractiveHarnesses(detected) {
@@ -204,6 +247,63 @@ export function updateManagedReference(path, baaPath) {
   return { path, changed: next !== existing };
 }
 
+export function setupSkillPath(projectRoot, harnessId) {
+  const directory = SETUP_SKILL_DIRECTORIES[harnessId];
+  if (!directory) throw new Error(`Unknown harness ${JSON.stringify(harnessId)}.`);
+  return join(projectRoot, ...directory, "baa-ton-setup", "SKILL.md");
+}
+
+export function setupSkillContent({ harness, baaPath, projectRoot }) {
+  const rootSetupPath = join(checkoutDirectory, "packages", "herdr-tools", "root-setup.mjs");
+  const setupPath = join(checkoutDirectory, "packages", "herdr-tools", "setup.mjs");
+  return [
+    SETUP_SKILL_START,
+    "---",
+    "name: baa-ton-setup",
+    "description: Finish or repair Baa-ton setup in the current Herdr project after installation.",
+    "---",
+    "",
+    "# Baa-ton project setup",
+    "",
+    `Use this skill when Baa-ton is installed but the current ${harness} session does not have its root tools connected, or when setup needs to be repaired. The target project is \`${projectRoot}\`.`,
+    "",
+    `1. Read \`${baaPath}\` and confirm this is the intended Herdr pane.`,
+    `2. Run: \`node \"${rootSetupPath}\" --harness ${harness}\`.`,
+    "3. Follow the helper's one-time integration instruction and restart this harness in the same pane if it requests a restart.",
+    "4. Call `herdr_bootstrap_root` and verify the returned workspace and pane identity.",
+    "5. Report that the root is ready and wait for the user's task. Do not initialize a goal until the user gives the objective.",
+    "",
+    `If project configuration must be changed, rerun \`node \"${setupPath}\" --project-root \"${projectRoot}\"\` from a terminal; do not guess model, auth, or thinking settings.`,
+    SETUP_SKILL_END,
+    "",
+  ].join("\n");
+}
+
+function installSetupSkill(path, content) {
+  if (existsSync(path)) {
+    const existing = readFileSync(path, "utf8");
+    if (!existing.includes(SETUP_SKILL_START) || !existing.includes(SETUP_SKILL_END))
+      return { path, changed: false, skipped: true };
+    if (existing === content) return { path, changed: false, skipped: false };
+  }
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  writeFileSync(path, content, { mode: 0o600 });
+  return { path, changed: true, skipped: false };
+}
+
+export function installSetupSkills({ projectRoot, selected, baaPath }) {
+  return selected.map((harness) => installSetupSkill(
+    setupSkillPath(projectRoot, harness),
+    setupSkillContent({ harness, baaPath, projectRoot }),
+  ));
+}
+
+function ensureProjectBaa(projectRoot, installedBaaPath) {
+  const projectBaaPath = join(projectRoot, "BAA.md");
+  if (!existsSync(projectBaaPath)) copyFileSync(installedBaaPath, projectBaaPath);
+  return resolve(projectBaaPath);
+}
+
 function instructionCandidates(projectRoot, selected) {
   const candidates = [];
   for (const harness of HARNESSES.filter((item) => selected.includes(item.id))) {
@@ -216,7 +316,7 @@ function instructionCandidates(projectRoot, selected) {
   return [...new Set(candidates)];
 }
 
-export function buildSetupConfig({ projectRoot, baaPath, detected, selected, instructionFiles, defaults }) {
+export function buildSetupConfig({ projectRoot, baaPath, detected, selected, instructionFiles, defaults, setupSkills = [] }) {
   const configPath = join(projectRoot, BAA_CONFIG_DIRECTORY, BAA_CONFIG_NAME);
   const existing = readJson(configPath, {});
   if (existing.version !== undefined && existing.version !== 1)
@@ -245,6 +345,7 @@ export function buildSetupConfig({ projectRoot, baaPath, detected, selected, ins
     })),
     selectedHarnesses: selected,
     instructionFiles,
+    setupSkills,
     profiles,
   };
 }
@@ -255,31 +356,46 @@ async function main() {
     console.log(usage());
     return;
   }
-  const projectRoot = resolve(options.projectRoot);
+  const defaultProjectRoot = resolve(options.projectRoot);
+  const projectRoot = options.promptProject && !options.nonInteractive
+    ? await promptProjectRoot(defaultProjectRoot)
+    : defaultProjectRoot;
   if (!isAbsolute(projectRoot)) throw new Error("--project-root must resolve to an absolute path.");
   const defaults = loadDefaults();
   const detected = detectHarnesses();
   const interactiveSelection = options.nonInteractive ? undefined : await openInteractiveHarnesses(detected);
   const selected = interactiveSelection ?? selectedHarnessIds(options, detected);
-  const baaPath = resolve(process.env.BAA_TON_BAA_PATH ?? join(checkoutDirectory, "BAA.md"));
+  const installedBaaPath = resolve(process.env.BAA_TON_BAA_PATH ?? join(checkoutDirectory, "BAA.md"));
+  const baaPath = ensureProjectBaa(projectRoot, installedBaaPath);
   const instructionFiles = options.instructionPaths.length
     ? options.instructionPaths
     : instructionCandidates(projectRoot, selected);
   for (const path of instructionFiles) updateManagedReference(path, baaPath);
+  const setupSkills = installSetupSkills({ projectRoot, selected, baaPath });
   const configPath = join(projectRoot, BAA_CONFIG_DIRECTORY, BAA_CONFIG_NAME);
-  writeJsonAtomic(configPath, buildSetupConfig({
+  const config = buildSetupConfig({
     projectRoot,
     baaPath,
     detected,
     selected,
     instructionFiles,
     defaults,
-  }));
+    setupSkills: setupSkills.map((skill) => skill.path),
+  });
+  writeJsonAtomic(configPath, config);
 
   console.log(`Baa-ton setup recorded at ${configPath}`);
+  console.log(`Project contract: ${baaPath}`);
   console.log(`Selected harnesses: ${selected.length ? selected.join(", ") : "none"}`);
   if (instructionFiles.length) console.log(`Updated BAA.md references: ${instructionFiles.join(", ")}`);
   else console.log("No AGENTS.md or CLAUDE.md selected; pass --instructions-path to add the managed reference.");
+  if (setupSkills.length) {
+    const installed = setupSkills.filter((skill) => !skill.skipped).map((skill) => skill.path);
+    const skipped = setupSkills.filter((skill) => skill.skipped).map((skill) => skill.path);
+    if (installed.length) console.log(`Installed setup skills: ${installed.join(", ")}`);
+    if (skipped.length) console.log(`Preserved existing setup files: ${skipped.join(", ")}`);
+    console.log("A selected harness can invoke the `baa-ton-setup` skill later to repair this setup.");
+  }
   console.log("\nTask profiles:");
   for (const [name, profile] of Object.entries(defaults.profiles))
     console.log(`  ${name}: ${profile.description}`);

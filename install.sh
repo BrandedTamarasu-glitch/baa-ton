@@ -75,40 +75,32 @@ fi
 
 say "Running the Baa-ton project wizard in $PWD"
 if [ -r /dev/tty ] && [ -t 1 ]; then
-  node "$BAA_TON_DIR/packages/herdr-tools/setup.mjs" --project-root "$PWD" < /dev/tty
+  node "$BAA_TON_DIR/packages/herdr-tools/setup.mjs" --project-root "$PWD" --prompt-project < /dev/tty
 else
   node "$BAA_TON_DIR/packages/herdr-tools/setup.mjs" --project-root "$PWD" --non-interactive
 fi
 
+say "Project wizard complete. Selected harnesses have the project-local baa-ton-setup skill."
+
 root_prompt=$(cat <<EOF
-Set up Baa-ton as the root for this Herdr pane.
+Finish Baa-ton root setup in this Herdr pane.
 
-The Baa-ton checkout is at:
-$BAA_TON_DIR
+The installer already configured the selected project and installed the
+project-local baa-ton-setup skill for the selected harnesses. Invoke that skill
+now. It must read BAA.md, complete the harness-specific connection, restart in
+this same Herdr pane only if required, call herdr_bootstrap_root, verify the root
+identity, and wait for my task.
 
-The installer has already run the harness-selection wizard for the project
-directory where it was launched. Do not ask me to run setup.mjs again.
-
-Do this in order:
-1. Confirm this is a Herdr pane and identify the current harness: Pi, Claude Code, Codex, or OpenCode.
-2. Run the matching command from this pane:
-     node "$BAA_TON_DIR/packages/herdr-tools/root-setup.mjs" --harness claude
-   Use codex, opencode, or pi for the other harnesses.
-3. Follow the helper's one-time integration instructions. If it asks for a
-   restart, restart the harness in this same Herdr pane and continue.
-4. Call herdr_bootstrap_root and verify the returned root identity and briefing.
-5. Report exactly: "Baa-ton root ready: <harness>, <workspace>, <pane>." Then
-   wait for my task. Do not initialize a parent goal or ask for an objective yet.
-
-Read BAA.md in the checkout for the operating contract. Keep the harness in this
-pane so its Herdr identity is preserved. Never reset an existing root unless the
-pane and checkout are intentionally being replaced.
+Do not ask me to run setup.mjs, initialize a goal, or provide an objective during
+setup. If the skill is unavailable, use the installed root-setup helper as the
+fallback. Never reset an existing root unless the pane and checkout are
+intentionally being replaced.
 EOF
 )
 
 if copy_to_clipboard "$root_prompt"; then
-  say "Done. A ready-to-paste root setup instruction was copied to the clipboard."
+  say "A short fallback prompt was copied to the clipboard; normally invoke baa-ton-setup from the harness."
 else
-  say "Done. No clipboard utility was found; use this root setup instruction:"
+  say "Clipboard unavailable; use this fallback prompt if the harness cannot invoke baa-ton-setup:"
 fi
 printf '%s\n' "$root_prompt"
