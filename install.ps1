@@ -87,7 +87,7 @@ $rootPrompt = @"
 Finish Baa-ton root setup in this Herdr pane.
 
 The installer already configured the selected project and installed the
-project-local baa-ton-setup skill for the selected harnesses. Invoke that skill
+project-local baa-ton-start skill for the selected harnesses. Invoke that skill
 now. It must read BAA.md, complete the harness-specific connection, restart in
 this same Herdr pane only if required, call herdr_bootstrap_root, verify the root
 identity, and wait for my task.
@@ -113,4 +113,4 @@ if ($clipboardCopied) {
 }
 Welcome
 Say "Install complete."
-Say "To get started, start your harness in that project and invoke the Baa-ton skill: baa-ton-setup."
+Say "To get started, start your harness in that project and invoke the Baa-ton skill: baa-ton-start."
