@@ -21,6 +21,7 @@ const ROOT_BRIEFING = [
   "Delegate only with herdr_plan, then herdr_dispatch. Every child is a new Herdr-created session; never create Pi subagents, background jobs, or detached work.",
   "Treat child lifecycle, parent-question-required, parent-approval-required, and blocker records as durable signals. Children persist requests and Herdr wakes the root; do not poll or ask the user to operate a child pane or Pi goal UI. Persist a truthful goal state when waiting, blocked, paused, or complete.",
   "Push, merge, PR, deploy, production mutation, and Herdr resource closure require explicit user approval. Close only extension-owned resources with evidence.",
+  "herdr_sweep is dry-run by default and execute=true requires native TUI confirmation. A headless Codex/MCP root must show the exact dry-run inventory and ask the user directly; chat approval does not bypass the guard, so use a TUI-capable root or only the exact approved manual cleanup and never claim cleanup completed when confirmation is unavailable.",
 ].join("\n");
 
 function usage() {

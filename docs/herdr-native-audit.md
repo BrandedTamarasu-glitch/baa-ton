@@ -86,7 +86,7 @@ Completion, questions, answers, lifecycle events, and supervisor wakes use diffe
 
 **Sources:** `herdr-tools/mcp-server.mjs`; `index.ts::persistRootTurn`, `confirmExecution`, `tool_call` handler; `controller.mjs::runSupervisorTick`.
 
-The bridge ignores `on()` handlers, discards prompt guidelines/bootstrap context, supplies `hasUI:false`, omits schema validation, and ignores execution timeout/cancellation options. Thus Pi-only question interception and lifecycle tracking do not exist in other clients. Root operations requiring TUI confirmation are impossible through ordinary MCP unless the narrow hard-coded BB-029 policy applies. My supervisor patch explicitly gates on Pi, so it is not the requested all-harness solution.
+The bridge ignores `on()` handlers, discards prompt guidelines/bootstrap context, supplies `hasUI:false`, omits schema validation, and ignores execution timeout/cancellation options. Thus Pi-only question interception and lifecycle tracking do not exist in other clients. Root operations requiring TUI confirmation are impossible through ordinary MCP unless a TUI-capable root or exact approved manual path is used; headless callers must show the dry-run inventory and ask the user directly rather than silently treating the operation as complete. My supervisor patch explicitly gates on Pi, so it is not the requested all-harness solution.
 
 **Required:** extract a harness-independent orchestration API; make Pi, MCP, and CLI thin adapters. Use a proper validated/cancellable MCP transport. Provide a first-class request-input/request-approval operation usable by every participant rather than intercepting one harness's tool. Approval belongs to the authorized user's decision channel, not to the presence of Pi TUI APIs.
 

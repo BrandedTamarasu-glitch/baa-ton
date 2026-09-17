@@ -62,8 +62,9 @@ writer. The trace remains readable after a lane tab is retired or a worktree is
 removed. `herdr_observe` returns the current root's root-plus-lane entries in
 `details.sessionLog`; the manifest is the durable source of truth. `herdr_resume` natively reattaches `done`/`gone` lanes through the parity
 adapter table in `HARNESS-ADAPTERS.md`; it retains the original `startedAt` and
-records the new incarnation's start separately. Cleanup/retirement remains a
-follow-up round built on this trace.
+records the new incarnation's start separately. Cleanup/retirement is a
+root-only operation built on this trace; see the cleanup section below for the
+confirmation and headless-MCP handoff rules.
 
 ## Cleanup sweep
 
