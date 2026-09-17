@@ -94,6 +94,7 @@ if (args[0] === "plugin" && args[1] === "config-dir") {
           agent: "claude",
           pane_id: process.env.TEST_LIVE_PANE,
           workspace_id: process.env.TEST_LIVE_WORKSPACE,
+          cwd: process.env.TEST_LIVE_CWD,
           agent_session: {
             agent: "claude",
             kind: "id",
@@ -443,6 +444,7 @@ test("MCP pane process correlation survives a regenerated Claude session id", as
         CLAUDE_CODE_SESSION_ID: "mcp-process-generated-id",
         TEST_LIVE_PANE: "w-process:current",
         TEST_LIVE_WORKSPACE: "w-process",
+        TEST_LIVE_CWD: "C:\\cic",
         TEST_PROCESS_MATCH_PANE: "w-process:current",
         TEST_ROOT_WORKSPACE: "w-process",
         PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),

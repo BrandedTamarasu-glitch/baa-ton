@@ -97,7 +97,11 @@ function sameWorkingDirectory(agent, currentCwd) {
   return values.some((value) => {
     if (value === currentCwd) return true;
     const windowsPath = value.includes("\\") || currentCwd.includes("\\");
-    return windowsPath && value.replaceAll("\\", "/").toLowerCase() === currentCwd.replaceAll("\\", "/").toLowerCase();
+    return (
+      windowsPath &&
+      value.replaceAll("\\", "/").toLowerCase() ===
+        currentCwd.replaceAll("\\", "/").toLowerCase()
+    );
   });
 }
 
@@ -115,13 +119,12 @@ function processIdsFromPayload(payload) {
     .filter((value) => Number.isSafeInteger(value) && value > 0);
 }
 
-function liveClaudeAgents(agents, currentCwd) {
+function liveClaudeAgents(agents) {
   return agents.filter(
     (agent) =>
       isRecord(agent) &&
       agentKind(agent) === "claude" &&
-      agentIdentity(agent) &&
-      sameWorkingDirectory(agent, currentCwd),
+      agentIdentity(agent),
   );
 }
 
@@ -132,26 +135,30 @@ async function processMatchedAgents({
 }) {
   if (typeof listPaneProcesses !== "function" || currentProcessPids.size === 0)
     return [];
-  const matches = [];
-  for (const agent of agents) {
-    try {
-      const processIds = new Set(
-        processIdsFromPayload(
-          await listPaneProcesses({
-            paneId: agent.pane_id,
-            workspaceId: agent.workspace_id,
-            agent,
-          }),
-        ),
-      );
-      if ([...currentProcessPids].some((pid) => processIds.has(pid)))
-        matches.push(agent);
-    } catch {
-      // Process info is an optional Herdr capability. A transient failure
-      // must not discard a valid session-id or static-root fallback.
-    }
-  }
-  return matches;
+  return (
+    await Promise.all(
+      agents.map(async (agent) => {
+        try {
+          const processIds = new Set(
+            processIdsFromPayload(
+              await listPaneProcesses({
+                paneId: agent.pane_id,
+                workspaceId: agent.workspace_id,
+                agent,
+              }),
+            ),
+          );
+          return [...currentProcessPids].some((pid) => processIds.has(pid))
+            ? agent
+            : undefined;
+        } catch {
+          // Process info is an optional Herdr capability. A transient failure
+          // must not discard a valid session-id or static-root fallback.
+          return undefined;
+        }
+      }),
+    )
+  ).filter(Boolean);
 }
 
 /**
@@ -182,7 +189,11 @@ export async function resolveHerdrIdentity({
     );
 
   const agents = agentListFromPayload(await listAgents());
-  const candidates = liveClaudeAgents(agents, currentCwd);
+  // Do not use cwd as a candidate filter. Claude may launch a project-scoped
+  // MCP server from the server package directory instead of the project cwd;
+  // the MCP/Claude PID is still an unambiguous pane anchor. Cwd is only a
+  // tiebreaker if Herdr reports the same PID in multiple panes.
+  const candidates = liveClaudeAgents(agents);
   const processMatches = await processMatchedAgents({
     agents: candidates,
     listPaneProcesses,
@@ -193,10 +204,15 @@ export async function resolveHerdrIdentity({
     ),
   });
   if (processMatches.length === 1) return agentIdentity(processMatches[0]);
-  if (processMatches.length > 1)
+  if (processMatches.length > 1) {
+    const cwdMatches = currentCwd
+      ? processMatches.filter((agent) => sameWorkingDirectory(agent, currentCwd))
+      : [];
+    if (cwdMatches.length === 1) return agentIdentity(cwdMatches[0]);
     throw new Error(
       `The MCP process matched multiple live Herdr Claude panes by PID.`,
     );
+  }
 
   const sessionMatches = candidates.filter(
     (agent) =>

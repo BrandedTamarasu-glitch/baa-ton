@@ -52,7 +52,9 @@ test("the live pane process wins when Claude's MCP session id was regenerated", 
       HERDR_WORKSPACE_ID: "w-frozen",
       CLAUDE_CODE_SESSION_ID: "mcp-process-generated-id",
     },
-    currentCwd: "C:\\repo",
+    // The MCP server may start from the Baa-ton package cwd instead of the
+    // user's project cwd; PID matching must still see this Claude pane.
+    currentCwd: "C:\\Users\\zchri\\.baa-ton\\packages\\herdr-tools",
     currentProcessPids: [4242],
     listAgents: async () => ({
       result: {
