@@ -28,8 +28,10 @@ test("authorized isolated task migration preserves other mappings and is idempot
       source = join(directory, "source"),
       configDir = join(directory, "config"),
       extensionLink = join(directory, "extension");
+    const oldExtensionTarget =
+      process.platform === "win32" ? "C:\\old\\source" : "/old/source";
     await Promise.all([cwd, source, configDir].map((path) => mkdir(path)));
-    await symlink("/old/source", extensionLink);
+    await symlink(oldExtensionTarget, extensionLink);
     const child = {
       lane_id: "lane",
       target: "w17:p1",
@@ -85,7 +87,7 @@ test("authorized isolated task migration preserves other mappings and is idempot
       },
     };
     assert.equal((await activateTask(options)).dryRun, true);
-    assert.equal(await readlink(extensionLink), "/old/source");
+    assert.equal(await readlink(extensionLink), oldExtensionTarget);
     const result = await activateTask({ ...options, execute: true });
     assert.equal(result.activated, true);
     const after = JSON.parse(

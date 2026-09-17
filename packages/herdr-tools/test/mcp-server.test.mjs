@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { once } from "node:events";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import { join, dirname, delimiter } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -67,16 +67,17 @@ async function rootBridgeFixture() {
   const stateDir = join(directory, "config");
   const cwd = join(directory, "workspace");
   const binDir = join(directory, "bin");
-  const herdr = join(binDir, "herdr");
+  const herdr = join(
+    binDir,
+    process.platform === "win32" ? "herdr.cmd" : "herdr",
+  );
+  const herdrScript = join(binDir, "herdr.mjs");
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
   await mkdir(cwd, { recursive: true });
   await mkdir(binDir, { recursive: true, mode: 0o700 });
   // This read-only native stub proves the bridge uses the live pane identity
   // while keeping the test independent of a focused Herdr client.
-  await writeFile(
-    herdr,
-    `#!/usr/bin/env node
-const args = process.argv.slice(2);
+  const script = `const args = process.argv.slice(2);
 const result = (value) => process.stdout.write(JSON.stringify({ result: value }) + "\\n");
 if (args[0] === "plugin" && args[1] === "config-dir") {
   result({ config_dir: process.env.TEST_CONFIG_DIR });
@@ -110,9 +111,13 @@ if (args[0] === "plugin" && args[1] === "config-dir") {
   process.stderr.write("unexpected fake herdr command: " + args.join(" ") + "\\n");
   process.exitCode = 1;
 }
-`,
-    { mode: 0o755 },
-  );
+`;
+  if (process.platform === "win32") {
+    await writeFile(herdrScript, script);
+    await writeFile(herdr, `@echo off\r\nnode "%~dp0herdr.mjs" %*\r\n`);
+  } else {
+    await writeFile(herdr, `#!/usr/bin/env node\n${script}`, { mode: 0o755 });
+  }
   return {
     directory,
     stateDir,
@@ -185,7 +190,7 @@ test("mapped root bridge exposes root-role parity and returns non-Pi root ground
     HERDR_PLUGIN_CONFIG_DIR: fixture.stateDir,
     TEST_CONFIG_DIR: fixture.stateDir,
     TEST_ROOT_WORKSPACE: fixture.root.workspace_id,
-    PATH: `${fixture.binDir}:${process.env.PATH}`,
+    PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
   };
   try {
     let workflowId;

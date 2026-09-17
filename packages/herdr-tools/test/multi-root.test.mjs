@@ -16,6 +16,10 @@ const require = createRequire(import.meta.url);
 const jiti = require("jiti")(import.meta.url);
 const { default: extension } = await jiti.import("../index.ts");
 
+function regexEscape(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function root(paneId, workspaceId) {
   return {
     target: paneId,
@@ -444,7 +448,7 @@ test("add refuses to replace a different checkout on the same pane", async () =>
     await assert.rejects(
       bootstrap(f, f.cwdB, { add: true }),
       new RegExp(
-        `already registered.*orchestrator root-a.*cwd ${f.cwdA}.*requires reset=true`,
+        `already registered.*orchestrator root-a.*cwd ${regexEscape(f.cwdA)}.*requires reset=true`,
         "i",
       ),
     );
