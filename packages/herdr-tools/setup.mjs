@@ -26,7 +26,7 @@ const LEGACY_SETUP_SKILL_END = "<!-- baa-ton:setup-skill:end -->";
 const PROJECT_SKILLS = ["baa-ton-start", "baa-ton-configure", "baa-ton-update"];
 
 const START_SKILL_DIRECTORIES = {
-  pi: [".pi", "agent", "skills"],
+  pi: [".pi", "skills"],
   claude: [".claude", "skills"],
   codex: [".codex", "skills"],
   opencode: [".opencode", "skills"],

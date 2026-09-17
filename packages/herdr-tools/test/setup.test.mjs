@@ -68,6 +68,10 @@ test("selected harnesses receive idempotent project-local start skills", async (
   const directory = await mkdtemp(join(tmpdir(), "baa-skills-"));
   try {
     const selected = ["pi", "claude", "codex", "opencode"];
+    assert.equal(
+      startSkillPath(directory, "pi"),
+      join(directory, ".pi", "skills", "baa-ton-start", "SKILL.md"),
+    );
     const first = installProjectSkills({
       projectRoot: directory,
       selected,
