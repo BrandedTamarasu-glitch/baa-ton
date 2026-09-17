@@ -12,13 +12,14 @@ function Say($msg) { Write-Host "==>" $msg -ForegroundColor Blue }
 function Die($msg) { Write-Host "error: $msg" -ForegroundColor Red; exit 1 }
 function Welcome() {
   Write-Host ""
-  Write-Host "🐕  🐑 🐑 🐑 🐑 🐑 🐑"
   @'
 ,-----.    ,---.    ,---.         ,--------. ,-----. ,--.  ,--.
 |  |) /_  /  O  \  /  O  \ ,-----.'--.  .--''  .-.  '|  ,'.|  |
 |  .-.  \|  .-.  ||  .-.  |'-----'   |  |   |  | |  ||  |' '  |
 |  '--' /|  | |  ||  | |  |          |  |   '  '-'  '|  | `   |
 `------' `--' `--'`--' `--'          `--'    `-----' `--'  `--'
+
+───────────────────🐕  🐑  🐑  🐑  🐑  🐑  🐑──────────────────
 
                  your agent herd is ready
 '@ | Write-Host
