@@ -118,6 +118,15 @@ if (args[0] === "plugin" && args[1] === "config-dir") {
       agent_status: "idle",
     },
   });
+} else if (args[0] === "pane" && args[1] === "process-info") {
+  const pane = args[3];
+  const matches = pane === process.env.TEST_PROCESS_MATCH_PANE;
+  result({
+    type: "pane_process_info",
+    process_info: {
+      foreground_processes: matches ? [{ pid: process.ppid }] : [],
+    },
+  });
 } else if (args[0] === "pane" && args[1] === "get") {
   result({
     type: "pane_info",
@@ -412,6 +421,94 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
         { paneId: "w-live-b:second", workspaceId: "w-live-b" },
         { paneId: "w-live-c:third", workspaceId: "w-live-c" },
       ],
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("MCP pane process correlation survives a regenerated Claude session id", async () => {
+  const fixture = await rootBridgeFixture();
+  try {
+    await withMcpServer(
+      {
+        HERDR_ENV: "1",
+        // Simulate a frozen project registration and a fresh MCP-only value
+        // that is not present in Herdr's stable agent_session record.
+        HERDR_PANE_ID: "w-frozen:original",
+        HERDR_WORKSPACE_ID: "w-frozen",
+        HERDR_PLUGIN_CONFIG_DIR: fixture.stateDir,
+        TEST_CONFIG_DIR: fixture.stateDir,
+        TEST_CLAUDE_SESSION_ID: "stable-herdr-session-id",
+        CLAUDE_CODE_SESSION_ID: "mcp-process-generated-id",
+        TEST_LIVE_PANE: "w-process:current",
+        TEST_LIVE_WORKSPACE: "w-process",
+        TEST_PROCESS_MATCH_PANE: "w-process:current",
+        TEST_ROOT_WORKSPACE: "w-process",
+        PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
+      },
+      async (rpc) => {
+        const bootstrap = await rpc("tools/call", {
+          name: "herdr_bootstrap_root",
+          arguments: { add: true },
+        });
+        assert.equal(bootstrap.result.isError, undefined);
+        assert.equal(
+          bootstrap.result.structuredContent.root.pane_id,
+          "w-process:current",
+        );
+        assert.equal(
+          bootstrap.result.structuredContent.root.workspace_id,
+          "w-process",
+        );
+      },
+      { cwd: fixture.cwd },
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("MCP falls back to a registered static root when process and session hints do not match", async () => {
+  const fixture = await rootBridgeFixture();
+  const baseEnv = {
+    HERDR_ENV: "1",
+    HERDR_PANE_ID: fixture.root.pane_id,
+    HERDR_WORKSPACE_ID: fixture.root.workspace_id,
+    HERDR_PLUGIN_CONFIG_DIR: fixture.stateDir,
+    TEST_CONFIG_DIR: fixture.stateDir,
+    TEST_ROOT_WORKSPACE: fixture.root.workspace_id,
+    PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
+  };
+  try {
+    await withMcpServer(baseEnv, async (rpc) => {
+      const bootstrap = await rpc("tools/call", {
+        name: "herdr_bootstrap_root",
+        arguments: { add: true },
+      });
+      assert.equal(bootstrap.result.isError, undefined);
+    }, { cwd: fixture.cwd });
+
+    await withMcpServer(
+      {
+        ...baseEnv,
+        CLAUDE_CODE_SESSION_ID: "mcp-process-generated-id",
+        TEST_CLAUDE_SESSION_ID: "stable-herdr-session-id",
+        TEST_LIVE_PANE: fixture.root.pane_id,
+        TEST_LIVE_WORKSPACE: fixture.root.workspace_id,
+      },
+      async (rpc) => {
+        const doctor = await rpc("tools/call", {
+          name: "herdr_doctor",
+          arguments: {},
+        });
+        assert.equal(doctor.result.isError, undefined);
+        const routing = doctor.result.structuredContent.checks.find(
+          (check) => check.id === "plugin-enablement-and-routing",
+        );
+        assert.match(routing.detail, /This pane is a registered root/);
+      },
+      { cwd: fixture.cwd },
     );
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });

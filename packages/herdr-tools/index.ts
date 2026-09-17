@@ -2415,17 +2415,48 @@ function readControllerConfigForCurrentPane(): ControllerConfig | undefined {
   }
 }
 
-function isRootOrchestrator(): boolean {
-  const paneId = process.env[HERDR_PANE_ID_ENV];
-  const workspaceId = process.env.HERDR_WORKSPACE_ID;
-  if (!paneId || !workspaceId) return false;
+function isRegisteredRootIdentity(identity: {
+  paneId?: string;
+  workspaceId?: string;
+}): boolean {
+  if (!identity.paneId || !identity.workspaceId) return false;
   return (
     readControllerConfigForCurrentPane()?.orchestrators.some(
       (record) =>
-        record.root.pane_id === paneId &&
-        record.root.workspace_id === workspaceId,
+        record.root.pane_id === identity.paneId &&
+        record.root.workspace_id === identity.workspaceId,
     ) ?? false
   );
+}
+
+function liveClaudeAgentAtIdentity(
+  agents: unknown[],
+  identity: { paneId?: string; workspaceId?: string },
+): boolean {
+  return agents.some((value) => {
+    if (!isRecord(value)) return false;
+    const session = isRecord(value.agent_session)
+      ? value.agent_session
+      : undefined;
+    const kind =
+      typeof value.agent === "string"
+        ? value.agent
+        : typeof session?.agent === "string"
+          ? session.agent
+          : undefined;
+    return (
+      kind === "claude" &&
+      value.pane_id === identity.paneId &&
+      value.workspace_id === identity.workspaceId
+    );
+  });
+}
+
+function isRootOrchestrator(): boolean {
+  return isRegisteredRootIdentity({
+    paneId: process.env[HERDR_PANE_ID_ENV],
+    workspaceId: process.env.HERDR_WORKSPACE_ID,
+  });
 }
 
 type CurrentRootScope = {
@@ -2989,6 +3020,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       (await resolveHerdrIdentity({
         env: process.env,
         listAgents: () => runHerdr(["agent", "list"], signal),
+        currentCwd: process.cwd(),
+        allowStaticFallback: ({ fallback, agents }) =>
+          isRegisteredRootIdentity(fallback) &&
+          liveClaudeAgentAtIdentity(agents, fallback),
       }));
     applyHerdrIdentity(process.env, identity);
     return identity;
