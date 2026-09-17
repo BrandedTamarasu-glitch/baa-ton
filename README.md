@@ -1,221 +1,122 @@
 # Baa-ton
 
 <p align="center">
-  <img src="assets/mascot.png" alt="Baazle, the Baa-ton sheep" width="192" height="192">
+  <img src="assets/mascot.png" alt="Baazle, the Baa-ton sheep" width="160" height="160">
 </p>
 
-Baa-ton is an orchestration core for [Herdr](https://github.com/herdrdev/herdr) (0.9+), the
-terminal multiplexer for coding agents. Herdr owns the terminals and the agent processes;
-Baa-ton plans their work, checks each agent before handing it a task, and keeps a record of
-what actually happened.
+Baa-ton is a durable, harness-neutral orchestration layer for [Herdr](https://github.com/herdrdev/herdr) 0.9+. Herdr owns panes and agent processes; Baa-ton plans work, verifies agents before dispatch, and records durable receipts.
 
 ## Install
 
-**macOS, Linux, WSL:**
+macOS, Linux, and WSL:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/zachristmas/baa-ton/main/install.sh | bash
 ```
 
-**Windows PowerShell:**
+Windows PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/zachristmas/baa-ton/main/install.ps1 | iex
 ```
 
-**Windows CMD:**
+Windows CMD:
 
 ```bat
 curl -fsSL https://raw.githubusercontent.com/zachristmas/baa-ton/main/install.cmd -o install.cmd && install.cmd && del install.cmd
 ```
 
-The script clones to `~/.baa-ton` (override with `BAA_TON_DIR`), installs dependencies,
-links the Pi extension, and links the Herdr controller plugin when the Herdr CLI is
-present. It also prints—and copies when the platform clipboard is available—a ready-to-paste
-root setup instruction. Idempotent — re-run to update.
+The installer clones to `~/.baa-ton` (override with `BAA_TON_DIR`), installs dependencies, links the Pi extension, and registers the Herdr controller when available. It also copies a ready-to-paste root setup prompt. Re-running it updates the checkout.
 
-**Uninstall:**
+Uninstall:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/zachristmas/baa-ton/main/uninstall.sh | bash
 ```
 
-The Unix script prompts before removing the Baa-ton checkout, Pi extension link, and
-Herdr controller registration. For automation, append `bash -s -- --yes`. On Windows
-PowerShell, run `irm https://raw.githubusercontent.com/zachristmas/baa-ton/main/uninstall.ps1 | iex`
-and confirm, or download and run `uninstall.ps1 -Force`; Windows CMD users can run
-`curl -fsSL https://raw.githubusercontent.com/zachristmas/baa-ton/main/uninstall.cmd -o uninstall.cmd && uninstall.cmd`.
-Uninstall deliberately preserves Herdr shared configuration, project workflow manifests,
-and harness MCP configuration; remove those separately only when you intend to discard
-that state.
+On Windows, run `uninstall.ps1` or `uninstall.cmd`. The uninstaller removes only Baa-ton-owned links, plugins, and checkout files; it preserves shared Herdr config, project manifests, and harness MCP config.
 
-**Or as a Pi package** (extension only, no controller): `pi install git:github.com/zachristmas/baa-ton`
+## Set up a project
 
-**From source**, for development:
+Run the guided wizard from the project root. It detects installed harnesses and presents a checkbox TUI for confirmation:
 
 ```sh
-git clone git@github.com:zachristmas/baa-ton.git
-cd baa-ton && npm install
-ln -s "$PWD/packages/herdr-tools" ~/.pi/agent/extensions/herdr-orchestrator
-herdr plugin link "$PWD/packages/controller"
+node ~/.baa-ton/packages/herdr-tools/setup.mjs --project-root "$PWD"
 ```
 
-You'll need [Herdr](https://github.com/herdrdev/herdr) 0.9+, Node.js 20+, and one of the
-qualified harnesses—Pi, Claude Code, Codex, or OpenCode—running inside a Herdr pane.
-The installer wires Pi directly; paste its setup instruction into the harness you want
-to host the root, or use the [root setup helper](packages/herdr-tools/README.md#any-harness-as-root)
-for Claude Code, Codex, or OpenCode. From that pane, call `herdr_bootstrap_root` once to
-claim the root, then `herdr_plan` → `herdr_dispatch` to delegate. Full details:
-[workflow tools](packages/herdr-tools/README.md) ·
-[event controller](packages/controller/README.md).
+PowerShell:
 
-**Run the tests** (harness CLIs on `PATH` required for adapter tests):
+```powershell
+node "$HOME\.baa-ton\packages\herdr-tools\setup.mjs" --project-root "$PWD"
+```
+
+The wizard writes `.baa-ton/config.json`, preserves exact profile choices, and adds a managed reference to `BAA.md` in existing `AGENTS.md` or `CLAUDE.md` files. Use `--instructions-path <file>` to choose another instruction file. It supports Pi, Claude Code, Codex, and OpenCode; detection is advisory and dispatch still qualifies the exact model, thinking level, and auth.
+
+From the target Herdr pane, configure the root harness:
 
 ```sh
-npm test
+node ~/.baa-ton/packages/herdr-tools/root-setup.mjs --harness claude --write
+# use pi, codex, or opencode as appropriate
 ```
 
-The suite runs the workflow smoke check plus the workflow and controller tests. To run
-just one package, use `npm run test:extension` or `npm run test:controller`. Local
-tests don't replace live harness qualification.
+Then have the harness call `herdr_bootstrap_root`, initialize the parent goal, and use `herdr_plan` → `herdr_dispatch`. The installer’s copied prompt walks through this sequence.
 
-## Why Baa-ton
+For manual/source setup, see [workflow tools](packages/herdr-tools/README.md#any-harness-as-root).
 
-**What problem does it solve?** Running several coding agents at once is easy. Trusting
-what they tell you is not. Baa-ton makes delegation *durable and verifiable* instead of
-hope-and-scrollback.
+## Task profiles
 
-- *"The agent said tests passed."* Claims aren't receipts. A lane only completes by
-  storing a durable `herdr_complete` receipt, and the parent independently re-runs the
-  checks before accepting anything.
-- *"My session died mid-round."* Plans, lane assignments, events, and receipts all live
-  in transactional manifests, so reloading or restarting just picks the round back up
-  from the ledger.
-- *"Which of my six panes needs me?"* The event controller only wakes the parent for
-  events that need a human: done, blocked, or a question only you can answer. It
-  suppresses everything else; `action-required` means *you* must act.
-- *"Don't let it push to prod."* Lanes are fenced per harness, through interception,
-  deny-rules, and sandboxes. Push, merge, deploy, and resource closure always require
-  a human.
-- *"I want Codex to implement and Claude to review."* One versioned contract works
-  across any qualified harness, so lanes can mix vendors freely. Capability discovery
-  checks that a model or thinking level actually exists, instead of just hoping.
+Profiles give the root a short, stable intent while `.baa-ton/config.json` holds the exact provider/model/thinking/auth launch settings.
 
-**Who is it for?** Anyone driving coding agents from a terminal through Herdr who wants
-parallel work they can actually trust.
+| Profile | Use it for |
+| --- | --- |
+| `planning` | Explore and produce a plan; read-only. |
+| `quick` | A small, well-bounded change. |
+| `balanced` | The normal implementation default. |
+| `implementation` | A larger multi-file change with stronger execution. |
+| `sustained` | A well-specified long-running task: good context, low cost, low effort. |
+| `review` | Read-only correctness and regression review. |
+| `deep-review` | Read-only high-scrutiny review for risky changes. |
 
-**What it is not.** Not a daemon, not a hosted service, not CI. It never spawns processes
-(Herdr does), and every harness that isn't explicitly qualified fails closed.
+Pass a profile name to `herdr_plan` with `taskProfile`. Configure exact launch profiles explicitly; an unknown or incomplete profile fails closed instead of silently falling back.
 
-## What it does
+## BAA.md
 
-It plans work into lanes, one writer per worktree workflow, with read-only lanes set
-aside for review. Before it assigns anything, it checks the exact provider, model,
-thinking level, and auth, confirms startup attestation, and discovers capabilities
-live, so unverified harnesses fail closed *before* any terminal is created. Every
-harness talks to it through one MCP bridge covering all ten `herdr_*` tools, and
-lifecycle events turn into durable wakes and receipts, so nothing has to poll.
+`BAA.md` is the canonical Baa-ton Agent Agreement. It is intentionally short and harness-neutral: it covers root/child roles, delegation, receipts, verification, safety gates, and profile selection. The setup wizard manages only its reference block in an instruction file, so your surrounding `AGENTS.md` or `CLAUDE.md` remains yours.
 
-## Example prompts
-
-You talk to a root session in a Herdr pane; Baa-ton does the rest. Real shapes that work today:
-
-**Delegate one bounded task**
-
-```text
-Close the failing tests in packages/controller — delegate to a luna lane
-in a worktree and verify it yourself before we merge.
-```
-→ The root plans a single-lane workflow (BB-029 local scope), dispatches it after startup
-proof, the lane works/tests/commits and files its receipt, the root re-runs the suite and
-reports evidence.
-
-**Run a parallel round**
-
-```text
-Close these three gaps. Parallelize the disjoint ones, sequence the ones
-that share files, and have Claude review the whole diff before we push.
-```
-→ One workflow per writer over separate worktrees, parent verification between lanes,
-then a read-only cross-vendor review lane. No push without your explicit gate.
-
-**Answer a lane's question**
-
-```text
-(the lane hit a decision) → you get woken with the question
-Pick option 2 — reuse the existing adapter.
-```
-→ Questions persist durably and route to the mapped root; your answer is recorded and
-delivered to the waiting lane. Lanes never prompt their own UI.
+Existing projects using `ORCHESTRATOR.md` should migrate that contract to `BAA.md` and update their instruction-file reference.
 
 ## Supported harnesses
 
-| Harness | Adapter | Live qualification | Tested with | Notes |
-| --- | --- | --- | --- | --- |
-| Pi | `pi-launch-adapter.ts` | 2026-09-15, several lanes | pi 0.85.1 | First-class: native tools, bash interception |
-| Claude Code | `claude-launch-adapter.ts` | 2026-09-16, qualification receipt + 4 receipted lanes | claude 2.1.273 | Deny-rules (push/merge/PR), SessionStart attestation |
-| Codex | `codex-launch-adapter.ts` | 2026-09-16, messaging-core + live re-verification | codex-cli 0.154.0 | Sandbox can't write worktree git metadata (parent commits); no MCP respawn; and a host `approval_policy=never` denies the lane's own mutating bridge tools — no per-server override exists, so unattended never-policy hosts can't file codex receipts (operator reconciliation applies; `on-request` works attended) |
-| OpenCode | `opencode-launch-adapter.ts` | 2026-09-15, goals/profiles lane | opencode 1.18.31 | READY handshake auto-sent, conservative bash permissions |
-| Anything else | — | Fails closed | — | By design, before topology is created |
+| Harness | Integration |
+| --- | --- |
+| Pi | Native extension; root or lane. |
+| Claude Code | MCP bridge plus startup attestation and deny rules. |
+| Codex | Headless MCP bridge; native confirmation requires a TUI-capable root. |
+| OpenCode | MCP bridge with conservative permissions. |
 
-Any qualified harness can host the root — `pi`, `claude`, `codex`, or `opencode` — via `root-setup.mjs` (Pi additionally gets the native extension with bash interception). Concurrent roots are supported: bootstrap a second root with `add: true` from a distinct pane and workspace.
+Support is qualification-by-profile, not a promise that every model or configuration works. Unqualified harnesses and launch profiles fail before topology is created.
 
-Concurrent roots may also share one checkout directory and its durable manifest. Each root is keyed by its own pane/workspace identity, so parent goals, goal history, queues, root session traces, and controller wake/review handling remain independent; the legacy single `parentGoal` projection stays owned by the originally registered root.
+## Operating guarantees
 
-Qualification covers the tested subscription profiles, not every model or configuration.
-Recovery and lifecycle integration still have rough edges — see the
-[progress log](docs/native-prerequisite-progress.md) for evidence and limitations.
+- Herdr owns terminal topology; Baa-ton does not spawn detached processes.
+- Plans, events, queues, sessions, and receipts are durable local records.
+- Writers use isolated worktrees; read-only review lanes are explicit.
+- Push, merge, deploy, and resource closure remain human-gated.
+- `herdr_sweep` is dry-run by default; execution requires the native confirmation dialog. A headless MCP caller must show the exact inventory and obtain approval before cleanup.
 
-## How it fits together
+## Tests
 
-```mermaid
-flowchart TD
-    subgraph herdr["Herdr — owns the terminals"]
-        R["root pane<br/>(parent session)"]
-        L["lane panes<br/>any qualified harness"]
-    end
-    subgraph core["Baa-ton core"]
-        P["plan · dispatch<br/>verify, then start"]
-        B["MCP bridge<br/>the herdr_* tools"]
-        K["event controller<br/>durable wakes + receipts"]
-    end
-    R --> P
-    P -->|"verified start"| L
-    L <-->|"tools"| B
-    L -->|"lifecycle events"| K
-    K -->|"wake"| R
+```sh
+npm install
+npm test
 ```
 
-Read it as one loop: the root plans and dispatches through the core, lanes only start
-once they're verified, they call the bridge for tools, their events feed the
-controller, and the controller wakes the root back up.
+`npm run test:extension` and `npm run test:controller` run the packages separately. Live harness qualification is tracked in the [progress log](docs/native-prerequisite-progress.md).
 
-A delegation round looks like this:
+## More
 
-```mermaid
-sequenceDiagram
-    participant U as Root (with user)
-    participant H as Herdr
-    participant L as Lane agent
-    U->>H: herdr_plan — lanes, profiles, worktree
-    U->>H: herdr_dispatch — startup proof verified
-    H->>L: new session in assigned cwd
-    L->>L: work · foreground tests · commit
-    L-->>U: herdr_complete receipt (durable)
-    Note over L,U: done / blocked / question events wake the root
-    U->>U: independent parent verification
-```
-
-Parallel writers each get their own workflow and worktree, with disjoint file
-ownership; if two lanes would touch the same files, they're sequenced instead.
-Integration is the parent's job: land the changes one at a time, re-run the merged
-test suite, and get a cross-vendor review before anything ships.
-
-## Go deeper
-
-- [Design philosophy](docs/DESIGN-PHILOSOPHY.md) — enforced interface, truthful capabilities, fail closed.
-- [Add a harness](docs/ADDING-A-HARNESS.md) — implement the adapter and prove it works.
-- [Launch contract and evidence](packages/herdr-tools/HARNESS-ADAPTERS.md) — the versioned adapter contract.
-- [Workflow tools and MCP setup](packages/herdr-tools/README.md) — planning, parallel lanes, worktrees.
-- [Event controller](packages/controller/README.md) — durable wakes, receipts, goal statuses.
-- [Progress log](docs/native-prerequisite-progress.md) — evidence, qualifications, open gaps.
+- [Workflow tools and MCP setup](packages/herdr-tools/README.md)
+- [Event controller](packages/controller/README.md)
+- [Adding a harness](docs/ADDING-A-HARNESS.md)
+- [Design philosophy](docs/DESIGN-PHILOSOPHY.md)
+- [Launch contract and evidence](packages/herdr-tools/HARNESS-ADAPTERS.md)

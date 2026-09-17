@@ -323,6 +323,7 @@ export type LaneInput =
       objective: string;
       readOnly?: boolean;
       agentKind?: AgentKind;
+      taskProfile?: string;
       launchProfile?: unknown;
       dependencies?: string[];
       dependsOn?: string[];
@@ -369,6 +370,7 @@ export type Lane = {
   goalRevision?: number;
   dependencies?: string[];
   goalOwnership?: GoalOwnership;
+  taskProfile?: string;
   launchProfile?: LaunchProfile;
   launchProfileVersion?: LaunchProfileVersion;
   incarnationId?: string;
@@ -512,6 +514,7 @@ export type Workflow = {
   };
   launchProfile?: LaunchProfile;
   launchProfileVersion?: LaunchProfileVersion;
+  taskProfile?: string;
   goalSchemaVersion: 1;
   rootGoalId: string;
   goals: GoalRecord[];

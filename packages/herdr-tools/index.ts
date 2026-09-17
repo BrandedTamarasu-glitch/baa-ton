@@ -86,6 +86,7 @@ import {
 } from "./harness-adapter.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { acknowledgeActivation } from "./activation-ack.mjs";
+import { resolveTaskProfile } from "./profile-config.mjs";
 
 // routeChildMessage lives in the controller package, which is a sibling of
 // this package inside the baa-ton checkout. Pi may load this extension
@@ -1298,6 +1299,8 @@ function normalizedLanes(
   defaultAgentKind: AgentKind,
   workflowId: string,
   rootGoalId: string,
+  defaultReadOnly = false,
+  profileResolver?: (name: string) => ReturnType<typeof resolveTaskProfile>,
 ): Lane[] {
   const values = inputs.length ? inputs : [objective];
   return values.map((input, index) => {
@@ -1307,7 +1310,7 @@ function normalizedLanes(
       return {
         id: laneId,
         objective: input,
-        readOnly: false,
+        readOnly: defaultReadOnly,
         agentKind: defaultAgentKind,
         status: "planned",
         goalId,
@@ -1322,18 +1325,28 @@ function normalizedLanes(
       };
     if (!input || typeof input.objective !== "string" || !input.objective)
       throw new Error("Each lane object needs a non-empty objective.");
+    const configuredProfile = input.taskProfile
+      ? profileResolver?.(input.taskProfile)
+      : undefined;
+    if (input.taskProfile && !profileResolver)
+      throw new Error(`Task profile ${input.taskProfile} cannot be resolved in this planning context.`);
+    if (input.taskProfile && input.launchProfile !== undefined)
+      throw new Error(`Lane ${laneId} cannot specify both taskProfile and launchProfile.`);
     const launchProfile =
-      input.launchProfile === undefined
+      configuredProfile?.launchProfile ??
+      (input.launchProfile === undefined
         ? undefined
         : validateLaunchProfile(
             input.launchProfile,
             `Lane ${laneId} launchProfile`,
-          );
+          ));
     return {
       id: laneId,
       objective: input.objective,
-      readOnly: input.readOnly === true,
-      agentKind: validateAgentKind(input.agentKind ?? defaultAgentKind),
+      readOnly: defaultReadOnly || configuredProfile?.readOnly === true || input.readOnly === true,
+      agentKind: validateAgentKind(
+        input.agentKind ?? configuredProfile?.agentKind ?? defaultAgentKind,
+      ),
       status: "planned",
       goalId,
       goalRevision: 1,
@@ -1352,6 +1365,7 @@ function normalizedLanes(
             launchProfileVersion: LAUNCH_PROFILE_SCHEMA_VERSION,
           }
         : {}),
+      ...(input.taskProfile ? { taskProfile: input.taskProfile } : {}),
     };
   });
 }
@@ -4392,6 +4406,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     agentKindInput?: unknown,
     launchProfileInput?: unknown,
     queueItemId?: string,
+    taskProfileInput?: unknown,
   ): Promise<Workflow> {
     let objective = objectiveInput?.trim() ?? "";
     let linkedQueueItem: QueueItem | undefined;
@@ -4421,7 +4436,29 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       objective = linkedQueueItem.objective;
     }
     if (!objective) throw new Error("objective is required to plan a workflow.");
-    const agentKind = validateAgentKind(agentKindInput ?? "pi");
+    const target = await plannedCwd(cwd, worktreeCwd);
+    const taskProfile =
+      taskProfileInput === undefined
+        ? undefined
+        : typeof taskProfileInput === "string" && taskProfileInput.trim()
+          ? taskProfileInput.trim()
+          : (() => {
+              throw new Error("taskProfile must be a non-empty profile name.");
+            })();
+    const configuredProfile = taskProfile
+      ? resolveTaskProfile(cwd, taskProfile)
+      : undefined;
+    if (taskProfile && launchProfileInput !== undefined)
+      throw new Error("taskProfile and launchProfile cannot both be supplied.");
+    if (
+      configuredProfile?.agentKind &&
+      agentKindInput !== undefined &&
+      configuredProfile.agentKind !== agentKindInput
+    )
+      throw new Error(`Task profile ${taskProfile} requires agentKind ${configuredProfile.agentKind}.`);
+    const agentKind = validateAgentKind(
+      agentKindInput ?? configuredProfile?.agentKind ?? "pi",
+    );
     const authorizationPolicy =
       authorizationPolicyInput === undefined
         ? undefined
@@ -4433,7 +4470,6 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       throw new Error(
         `authorizationPolicy.scope.workflow requires an objective containing ${BB029_AUTHORIZATION_SCOPE}.`,
       );
-    const target = await plannedCwd(cwd, worktreeCwd);
     const id = `herdr-${randomUUID().slice(0, 8)}`;
     const rootGoalId = `goal-${id}`;
     const lanes = normalizedLanes(
@@ -4442,6 +4478,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       agentKind,
       id,
       rootGoalId,
+      configuredProfile?.readOnly === true,
+      (name) => resolveTaskProfile(cwd, name),
     );
     if (
       target.worktree &&
@@ -4475,9 +4513,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       );
     const rootSessionPath = rootAgent.agent_session.value;
     const launchProfile =
-      launchProfileInput === undefined
+      configuredProfile?.launchProfile ??
+      (launchProfileInput === undefined
         ? undefined
-        : validateLaunchProfile(launchProfileInput);
+        : validateLaunchProfile(launchProfileInput));
     const stamp = now();
     const goals = createWorkflowGoals(id, objective, lanes);
     const workflow: Workflow = {
@@ -4497,6 +4536,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         rootPaneId: root.pane_id,
         rootSessionPath,
       },
+      ...(taskProfile ? { taskProfile } : {}),
       launchProfile,
       ...(launchProfile
         ? { launchProfileVersion: LAUNCH_PROFILE_SCHEMA_VERSION }
@@ -7488,10 +7528,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     name: "herdr_plan",
     label: "Herdr Plan",
     description:
-      "Create a durable local plan manifest for Herdr-managed agent lanes, optionally linked to a dispatchable queue item.",
+      "Create a durable local plan manifest for Herdr-managed agent lanes, optionally using a named task profile or linking to a dispatchable queue item.",
     promptSnippet: "Plan a Herdr-only delegated agent workflow.",
     promptGuidelines: [
-      "Use herdr_plan before herdr_dispatch; select any documented Herdr agentKind when needed. Pass queueItemId to consume the clear queue head and copy its objective/notes. Supply authorizationPolicy only for the narrowly validated BB-029 local-only scope.",
+      "Use herdr_plan before herdr_dispatch; select a named taskProfile from .baa-ton/config.json when configured, or provide an exact launchProfile. Pass queueItemId to consume the clear queue head and copy its objective/notes. Supply authorizationPolicy only for the narrowly validated BB-029 local-only scope.",
     ],
     parameters: Type.Object(
       {
@@ -7506,6 +7546,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                   objective: Type.String(),
                   readOnly: Type.Optional(Type.Boolean()),
                   agentKind: Type.Optional(Type.String()),
+                  taskProfile: Type.Optional(Type.String({ minLength: 1 })),
                   dependencies: Type.Optional(Type.Array(Type.String())),
                   dependsOn: Type.Optional(Type.Array(Type.String())),
                   launchProfile: Type.Optional(
@@ -7527,6 +7568,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ),
         worktreeCwd: Type.Optional(Type.String()),
         agentKind: Type.Optional(Type.String()),
+        taskProfile: Type.Optional(Type.String({ minLength: 1 })),
         launchProfile: Type.Optional(
           Type.Object(
             {
@@ -7577,6 +7619,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         params.agentKind,
         params.launchProfile,
         params.queueItemId,
+        params.taskProfile,
       );
       return {
         content: [

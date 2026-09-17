@@ -68,8 +68,13 @@ Set up Baa-ton as the root for this Herdr pane.
 The Baa-ton checkout is at:
 $BaaTonDir
 
+First run the guided setup from the target project root. It detects installed
+harnesses, lets me confirm them with checkboxes, records the task profiles, and
+updates an existing project instruction file or the explicit --instructions-path I provide:
+  node "$BaaTonDir\packages\herdr-tools\setup.mjs" --project-root "<project-root>"
+
 I am using one of the supported harnesses: Pi, Claude Code, Codex, or OpenCode.
-Determine the current harness and run the matching command from this Herdr pane:
+From the target Herdr pane, run the matching root setup command:
   node "$BaaTonDir\packages\herdr-tools\root-setup.mjs" --harness claude
   (use codex, opencode, or pi as appropriate)
 
