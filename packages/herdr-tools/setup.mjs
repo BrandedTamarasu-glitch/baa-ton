@@ -388,7 +388,9 @@ async function main() {
   });
   writeJsonAtomic(configPath, config);
 
-  if (!options.quiet) {
+  if (options.quiet) {
+    console.log(`Project ready at ${projectRoot}. Configure worker profiles and model choices in ${configPath}.`);
+  } else {
     console.log(`Baa-ton setup recorded at ${configPath}`);
     console.log(`Project contract: ${baaPath}`);
     console.log(`Selected harnesses: ${selected.length ? selected.join(", ") : "none"}`);

@@ -117,5 +117,5 @@ else
   say "The setup skill was installed, but the optional fallback prompt could not be copied."
 fi
 welcome
-say "Install complete at $PWD"
+say "Install complete."
 say "To get started, start your harness in that project and invoke the Baa-ton skill: baa-ton-setup."

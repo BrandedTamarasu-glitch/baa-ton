@@ -112,5 +112,5 @@ if ($clipboardCopied) {
   Say "The setup skill was installed, but the optional fallback prompt could not be copied."
 }
 Welcome
-Say "Install complete at $ProjectRoot"
+Say "Install complete."
 Say "To get started, start your harness in that project and invoke the Baa-ton skill: baa-ton-setup."
