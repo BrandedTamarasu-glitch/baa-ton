@@ -27,14 +27,9 @@ if (-not (Test-Path (Join-Path $BaaTonDir ".git"))) {
 }
 
 Say "Installing dependencies"
-Push-Location $BaaTonDir
-try {
-  npm install --no-audit --no-fund
-  if ($LASTEXITCODE -ne 0) {
-    throw "npm install failed with exit code $LASTEXITCODE"
-  }
-} finally {
-  Pop-Location
+& cmd.exe /d /c ('cd /d "' + $BaaTonDir + '" && npm install --no-audit --no-fund')
+if ($LASTEXITCODE -ne 0) {
+  throw "npm install failed with exit code $LASTEXITCODE"
 }
 
 New-Item -ItemType Directory -Force -Path $PiExtDir | Out-Null
