@@ -28,7 +28,11 @@ Windows CMD:
 curl -fsSL https://raw.githubusercontent.com/zachristmas/baa-ton/main/install.cmd -o install.cmd && install.cmd && del install.cmd
 ```
 
-Run the installer from the project directory you want to use. It defaults to that directory, lets you choose another, detects your installed harnesses, and runs the setup wizard. When it says `Install complete`, start the harness of your choice in that project and invoke the `baa-ton-start` skill. Use `baa-ton-configure` for worker profiles and model choices, or `baa-ton-update` to update Baa-ton. Re-running the installer updates the checkout and project configuration.
+Run the installer from the project directory you want to use. It defaults to that directory, lets you choose another, detects your installed harnesses, and installs the project skills.
+
+When it says `Install complete`, open the harness of your choice in that project and invoke `baa-ton-start`, then describe your task. Use `baa-ton-configure` to choose worker profiles and model assignments, or `baa-ton-update` to update Baa-ton and refresh the project integration.
+
+Re-running the installer updates the checkout and project configuration.
 
 Uninstall:
 
@@ -40,16 +44,24 @@ On Windows, run `uninstall.ps1` or `uninstall.cmd`. The uninstaller removes only
 
 ## Set up a root
 
-After the installer finishes, start a selected harness in the target project and invoke its project-local `baa-ton-start` skill. The skill handles the one-time MCP/extension connection, restarts only when needed, calls `herdr_bootstrap_root`, and waits for your task. The installer’s short clipboard prompt is a fallback for a harness that cannot discover project skills.
+Start a supported harness in the target project and invoke `baa-ton-start`. It connects the harness, bootstraps the current Herdr pane as the Baa-ton root, and waits for your task.
 
-# Fallback for a harness that cannot discover the project-local skill:
+If the harness cannot discover project skills, use this fallback:
 
 ```sh
 node ~/.baa-ton/packages/herdr-tools/root-setup.mjs --harness claude
 # use pi, codex, or opencode as appropriate
 ```
 
-The root setup helper prints the exact integration command for the current pane. Keep the harness in that pane so Herdr identity is preserved. The root should report its workspace and pane, then wait; initialize a parent goal only after you provide the actual objective.
+Keep the harness in the same Herdr pane so its identity is preserved.
+
+## Configure workers
+
+Invoke `baa-ton-configure` in the project to edit `.baa-ton/config.json`, where each task profile’s harness, provider, model, thinking, and auth settings are stored. It only changes configuration; it does not start work.
+
+## Update Baa-ton
+
+Invoke `baa-ton-update` in the project to update the shared Baa-ton checkout, install dependency changes, and refresh the project integrations. Your project contract, configuration, instructions, and user-authored skills are preserved.
 
 ## Re-run project setup
 
@@ -90,8 +102,6 @@ Pass a profile name to `herdr_plan` with `taskProfile`. Configure exact launch p
 ## BAA.md
 
 `BAA.md` is the canonical Baa-ton Agent Agreement. It is intentionally short and harness-neutral: it covers root/child roles, delegation, receipts, verification, safety gates, and profile selection. The setup wizard manages only its reference block in an instruction file, so your surrounding `AGENTS.md` or `CLAUDE.md` remains yours.
-
-Existing projects using `ORCHESTRATOR.md` should migrate that contract to `BAA.md` and update their instruction-file reference.
 
 ## Supported harnesses
 
