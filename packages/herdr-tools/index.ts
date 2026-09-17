@@ -1787,18 +1787,25 @@ async function secureControllerConfigDirectory(path: string): Promise<string> {
       "Herdr controller config directory must be a real directory.",
     );
   const identity = { dev: details.dev, ino: details.ino };
-  await chmod(directory, 0o700);
-  details = await lstat(directory);
-  if (
-    !details.isDirectory() ||
-    details.isSymbolicLink() ||
-    details.dev !== identity.dev ||
-    details.ino !== identity.ino ||
-    (details.mode & 0o077) !== 0
-  )
-    throw new Error(
-      "Herdr controller config directory could not be securely repaired to private mode (0700).",
-    );
+  // Node exposes POSIX mode bits on Unix, but Windows ACLs do not map to
+  // those bits and chmod is not a privacy control there. The directory is
+  // still required to be a real, non-symlink directory; on Windows it lives
+  // under Herdr's per-user plugin config root, whose ACLs are managed by the
+  // Herdr installation. Keep the strict mode repair/check on POSIX hosts.
+  if (process.platform !== "win32") {
+    await chmod(directory, 0o700);
+    details = await lstat(directory);
+    if (
+      !details.isDirectory() ||
+      details.isSymbolicLink() ||
+      details.dev !== identity.dev ||
+      details.ino !== identity.ino ||
+      (details.mode & 0o077) !== 0
+    )
+      throw new Error(
+        "Herdr controller config directory could not be securely repaired to private mode (0700).",
+      );
+  }
   return directory;
 }
 
