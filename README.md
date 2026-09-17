@@ -1,7 +1,7 @@
 # Baa-ton
 
 <p align="center">
-  <img src="assets/mascot.png" alt="Baazle, the Baa-ton sheep" width="160" height="160">
+  <img src="assets/mascot.png" alt="Nala, the Baa-ton dog" width="160" height="160">
 </p>
 
 Baa-ton is a durable, harness-neutral orchestration layer for [Herdr](https://github.com/herdrdev/herdr) 0.9+. Herdr owns panes and agent processes; Baa-ton plans work, verifies agents before dispatch, and records durable receipts.
@@ -26,7 +26,7 @@ Windows CMD:
 curl -fsSL https://raw.githubusercontent.com/zachristmas/baa-ton/main/install.cmd -o install.cmd && install.cmd && del install.cmd
 ```
 
-Run the installer from the project directory you want to use. It defaults the project target to that directory, then lets you enter another project directory before selecting harnesses. It clones to `~/.baa-ton` (override with `BAA_TON_DIR`), installs dependencies, links the Pi extension, registers the Herdr controller when available, and runs the project wizard. The wizard writes the project contract/config and a small project-local `baa-ton-setup` skill for each selected harness. Start a selected harness in that project and invoke the skill; a short clipboard prompt remains as a fallback. Re-running it updates the checkout and reruns the wizard.
+Run the installer from the project directory you want to use. It defaults to that directory, lets you choose another, detects your installed harnesses, and runs the setup wizard. When it says `Install complete`, start the harness of your choice in that project and invoke the `baa-ton-setup` skill. Re-running the installer updates the checkout and setup.
 
 Uninstall:
 

@@ -45,6 +45,7 @@ Options:
   --instructions-path <file> Add/update the managed BAA.md reference in this file
   --harness <name>           Select a harness (repeatable: pi, claude, codex, opencode)
   --non-interactive          Use detected harnesses without opening the checkbox TUI
+  --quiet                    Print only errors (for installer use)
   --help                     Show this help
 
 The wizard detects installed harnesses, lets you confirm them, records the
@@ -88,6 +89,7 @@ function parseArgs(args) {
     instructionPaths: [],
     harnesses: [],
     nonInteractive: false,
+    quiet: false,
   };
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -97,6 +99,8 @@ function parseArgs(args) {
       options.nonInteractive = true;
     } else if (arg === "--prompt-project") {
       options.promptProject = true;
+    } else if (arg === "--quiet") {
+      options.quiet = true;
     } else if (arg === "--project-root") {
       options.projectRoot = resolve(args[++index] ?? "");
     } else if (arg === "--instructions-path") {
@@ -384,23 +388,25 @@ async function main() {
   });
   writeJsonAtomic(configPath, config);
 
-  console.log(`Baa-ton setup recorded at ${configPath}`);
-  console.log(`Project contract: ${baaPath}`);
-  console.log(`Selected harnesses: ${selected.length ? selected.join(", ") : "none"}`);
-  if (instructionFiles.length) console.log(`Updated BAA.md references: ${instructionFiles.join(", ")}`);
-  else console.log("No AGENTS.md or CLAUDE.md selected; pass --instructions-path to add the managed reference.");
-  if (setupSkills.length) {
-    const installed = setupSkills.filter((skill) => !skill.skipped).map((skill) => skill.path);
-    const skipped = setupSkills.filter((skill) => skill.skipped).map((skill) => skill.path);
-    if (installed.length) console.log(`Installed setup skills: ${installed.join(", ")}`);
-    if (skipped.length) console.log(`Preserved existing setup files: ${skipped.join(", ")}`);
-    console.log("A selected harness can invoke the `baa-ton-setup` skill later to repair this setup.");
+  if (!options.quiet) {
+    console.log(`Baa-ton setup recorded at ${configPath}`);
+    console.log(`Project contract: ${baaPath}`);
+    console.log(`Selected harnesses: ${selected.length ? selected.join(", ") : "none"}`);
+    if (instructionFiles.length) console.log(`Updated BAA.md references: ${instructionFiles.join(", ")}`);
+    else console.log("No AGENTS.md or CLAUDE.md selected; pass --instructions-path to add the managed reference.");
+    if (setupSkills.length) {
+      const installed = setupSkills.filter((skill) => !skill.skipped).map((skill) => skill.path);
+      const skipped = setupSkills.filter((skill) => skill.skipped).map((skill) => skill.path);
+      if (installed.length) console.log(`Installed setup skills: ${installed.join(", ")}`);
+      if (skipped.length) console.log(`Preserved existing setup files: ${skipped.join(", ")}`);
+      console.log("A selected harness can invoke the `baa-ton-setup` skill later to repair this setup.");
+    }
+    console.log("\nTask profiles:");
+    for (const [name, profile] of Object.entries(defaults.profiles))
+      console.log(`  ${name}: ${profile.description}`);
+    console.log("\nExact provider/model/thinking/auth values remain user configuration and are live-qualified at dispatch.");
+    console.log(`Run from the target Herdr pane for root setup: node ${join(checkoutDirectory, "packages/herdr-tools/root-setup.mjs")} --harness <name>`);
   }
-  console.log("\nTask profiles:");
-  for (const [name, profile] of Object.entries(defaults.profiles))
-    console.log(`  ${name}: ${profile.description}`);
-  console.log("\nExact provider/model/thinking/auth values remain user configuration and are live-qualified at dispatch.");
-  console.log(`Run from the target Herdr pane for root setup: node ${join(checkoutDirectory, "packages/herdr-tools/root-setup.mjs")} --harness <name>`);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href)

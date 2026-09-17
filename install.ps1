@@ -10,6 +10,19 @@ $Repo = "https://github.com/zachristmas/baa-ton"
 
 function Say($msg) { Write-Host "==>" $msg -ForegroundColor Blue }
 function Die($msg) { Write-Host "error: $msg" -ForegroundColor Red; exit 1 }
+function Welcome() {
+  Write-Host ""
+  Write-Host "🐕  🐑 🐑 🐑 🐑 🐑 🐑"
+  @'
+,-----.    ,---.    ,---.         ,--------. ,-----. ,--.  ,--.
+|  |) /_  /  O  \  /  O  \ ,-----.'--.  .--''  .-.  '|  ,'.|  |
+|  .-.  \|  .-.  ||  .-.  |'-----'   |  |   |  | |  ||  |' '  |
+|  '--' /|  | |  ||  | |  |          |  |   '  '-'  '|  | `   |
+`------' `--' `--'`--' `--'          `--'    `-----' `--'  `--'
+
+                 your agent herd is ready
+'@ | Write-Host
+}
 
 foreach ($tool in @("git", "node")) {
   if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
@@ -64,12 +77,10 @@ if (Get-Command herdr -ErrorAction SilentlyContinue) {
 
 $ProjectRoot = $PWD.Path
 Say "Running the Baa-ton project wizard in $ProjectRoot"
-& node (Join-Path $BaaTonDir "packages\herdr-tools\setup.mjs") --project-root $ProjectRoot --prompt-project
+& node (Join-Path $BaaTonDir "packages\herdr-tools\setup.mjs") --project-root $ProjectRoot --prompt-project --quiet
 if ($LASTEXITCODE -ne 0) {
   throw "Baa-ton project setup failed with exit code $LASTEXITCODE"
 }
-
-Say "Project wizard complete. Selected harnesses have the project-local baa-ton-setup skill."
 
 $rootPrompt = @"
 Finish Baa-ton root setup in this Herdr pane.
@@ -95,8 +106,10 @@ try {
 }
 
 if ($clipboardCopied) {
-  Say "A short fallback prompt was copied to the clipboard; normally invoke baa-ton-setup from the harness."
+  # The skill is the normal path; keep the clipboard fallback silent.
 } else {
-  Say "Clipboard unavailable; use this fallback prompt if the harness cannot invoke baa-ton-setup:"
+  Say "The setup skill was installed, but the optional fallback prompt could not be copied."
 }
-Write-Host $rootPrompt
+Welcome
+Say "Install complete at $ProjectRoot"
+Say "To get started, start your harness in that project and invoke the Baa-ton skill: baa-ton-setup."

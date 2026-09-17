@@ -12,6 +12,19 @@ REPO="https://github.com/zachristmas/baa-ton"
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
+welcome() {
+  printf '\n🐕  🐑 🐑 🐑 🐑 🐑 🐑\n\n'
+  cat <<'EOF'
+,-----.    ,---.    ,---.         ,--------. ,-----. ,--.  ,--.
+|  |) /_  /  O  \  /  O  \ ,-----.'--.  .--''  .-.  '|  ,'.|  |
+|  .-.  \|  .-.  ||  .-.  |'-----'   |  |   |  | |  ||  |' '  |
+|  '--' /|  | |  ||  | |  |          |  |   '  '-'  '|  | `   |
+`------' `--' `--'`--' `--'          `--'    `-----' `--'  `--'
+
+                 your agent herd is ready
+EOF
+}
+
 copy_to_clipboard() {
   local value="$1"
   if command -v pbcopy >/dev/null 2>&1; then
@@ -75,12 +88,10 @@ fi
 
 say "Running the Baa-ton project wizard in $PWD"
 if [ -r /dev/tty ] && [ -t 1 ]; then
-  node "$BAA_TON_DIR/packages/herdr-tools/setup.mjs" --project-root "$PWD" --prompt-project < /dev/tty
+  node "$BAA_TON_DIR/packages/herdr-tools/setup.mjs" --project-root "$PWD" --prompt-project --quiet < /dev/tty
 else
-  node "$BAA_TON_DIR/packages/herdr-tools/setup.mjs" --project-root "$PWD" --non-interactive
+  node "$BAA_TON_DIR/packages/herdr-tools/setup.mjs" --project-root "$PWD" --non-interactive --quiet
 fi
-
-say "Project wizard complete. Selected harnesses have the project-local baa-ton-setup skill."
 
 root_prompt=$(cat <<EOF
 Finish Baa-ton root setup in this Herdr pane.
@@ -99,8 +110,10 @@ EOF
 )
 
 if copy_to_clipboard "$root_prompt"; then
-  say "A short fallback prompt was copied to the clipboard; normally invoke baa-ton-setup from the harness."
+  :
 else
-  say "Clipboard unavailable; use this fallback prompt if the harness cannot invoke baa-ton-setup:"
+  say "The setup skill was installed, but the optional fallback prompt could not be copied."
 fi
-printf '%s\n' "$root_prompt"
+welcome
+say "Install complete at $PWD"
+say "To get started, start your harness in that project and invoke the Baa-ton skill: baa-ton-setup."
