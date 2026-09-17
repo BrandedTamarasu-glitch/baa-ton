@@ -34,6 +34,21 @@ links the Pi extension, and links the Herdr controller plugin when the Herdr CLI
 present. It also prints—and copies when the platform clipboard is available—a ready-to-paste
 root setup instruction. Idempotent — re-run to update.
 
+**Uninstall:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zachristmas/baa-ton/main/uninstall.sh | bash
+```
+
+The Unix script prompts before removing the Baa-ton checkout, Pi extension link, and
+Herdr controller registration. For automation, append `bash -s -- --yes`. On Windows
+PowerShell, run `irm https://raw.githubusercontent.com/zachristmas/baa-ton/main/uninstall.ps1 | iex`
+and confirm, or download and run `uninstall.ps1 -Force`; Windows CMD users can run
+`curl -fsSL https://raw.githubusercontent.com/zachristmas/baa-ton/main/uninstall.cmd -o uninstall.cmd && uninstall.cmd`.
+Uninstall deliberately preserves Herdr shared configuration, project workflow manifests,
+and harness MCP configuration; remove those separately only when you intend to discard
+that state.
+
 **Or as a Pi package** (extension only, no controller): `pi install git:github.com/zachristmas/baa-ton`
 
 **From source**, for development:
