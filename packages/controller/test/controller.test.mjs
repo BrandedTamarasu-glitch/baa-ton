@@ -339,28 +339,31 @@ function parsePluginManifest(raw) {
   const top = {};
   const events = [];
   const actions = [];
+  const panes = [];
   let current = top;
   for (const untrimmed of raw.split(/\r?\n/)) {
     const line = untrimmed.trim();
     if (!line || line.startsWith("#")) continue;
-    if (["[[events]]", "[[startup]]", "[[actions]]"].includes(line)) {
+    if (["[[events]]", "[[startup]]", "[[actions]]", "[[panes]]"].includes(line)) {
       current = {};
       (line === "[[events]]"
         ? events
         : line === "[[actions]]"
           ? actions
-          : (top.startup ??= [])
+          : line === "[[panes]]"
+            ? panes
+            : (top.startup ??= [])
       ).push(current);
       continue;
     }
     const match =
-      /^(id|name|version|min_herdr_version|description|platforms|on|command|title) = (.+)$/.exec(
+      /^(id|name|version|min_herdr_version|description|platforms|on|command|title|placement) = (.+)$/.exec(
         line,
       );
     assert.ok(match, `unsupported or malformed manifest line: ${line}`);
     current[match[1]] = JSON.parse(match[2]);
   }
-  return { top, events, actions };
+  return { top, events, actions, panes };
 }
 
 test("manifest has the required ID, compatible version floor, and supported event hooks", async () => {
@@ -408,6 +411,10 @@ test("manifest has the required ID, compatible version floor, and supported even
       ],
     },
   ]);
+  assert.deepEqual(manifest.panes, [{
+    id: "supervisor", title: "Baa-ton controller supervisor", placement: "tab",
+    command: ["node", "controller.mjs", "supervisor"],
+  }]);
   assert.deepEqual(manifest.events, [
     {
       on: "pane.agent_status_changed",

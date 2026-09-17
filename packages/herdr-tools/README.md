@@ -38,6 +38,9 @@ claim to verify, regardless of notification status. No notification authorizes
 integration, publication, cleanup, or redispatch. This recovery requires the
 updated controller supervisor to be running; reloading only the Pi extension
 does not reload an already-running controller process.
+For safe activation on an existing server, see the controller's
+[supervisor plugin-pane entrypoint](../controller/README.md#activate-an-already-installed-supervisor).
+Herdr's startup hooks do not run on plugin enable; disable/enable is not a restart.
 
 ## Messaging the parent
 
