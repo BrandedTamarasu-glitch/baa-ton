@@ -1821,7 +1821,10 @@ async function loadControllerConfig(
   }
   if (!details.isFile() || details.isSymbolicLink())
     throw new Error("Herdr controller config must be a regular file.");
-  if ((details.mode & 0o022) !== 0)
+  // Windows ACLs are not represented by POSIX mode bits; Herdr owns the
+  // per-user plugin directory there, so the mode-bit writable check applies
+  // only on hosts where Node can report meaningful POSIX permissions.
+  if (process.platform !== "win32" && (details.mode & 0o022) !== 0)
     throw new Error(
       "Herdr controller config must not be group- or world-writable.",
     );
@@ -2380,7 +2383,7 @@ function readControllerConfigForCurrentPane(): ControllerConfig | undefined {
     if (
       !details.isFile() ||
       details.isSymbolicLink() ||
-      (details.mode & 0o022) !== 0
+      (process.platform !== "win32" && (details.mode & 0o022) !== 0)
     )
       return undefined;
     return validateControllerConfig(JSON.parse(readFileSync(path, "utf8")));
