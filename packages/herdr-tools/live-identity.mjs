@@ -105,6 +105,12 @@ function sameWorkingDirectory(agent, currentCwd) {
   });
 }
 
+function normalizeProcessId(value) {
+  const numeric =
+    typeof value === "number" ? value : Number.parseInt(String(value), 10);
+  return Number.isSafeInteger(numeric) && numeric > 0 ? numeric : undefined;
+}
+
 function processIdsFromPayload(payload) {
   const result = isRecord(payload?.result) ? payload.result : payload;
   const info = isRecord(result?.process_info) ? result.process_info : result;
@@ -112,11 +118,7 @@ function processIdsFromPayload(payload) {
   const values = [info.shell_pid, info.foreground_process_group_id];
   if (Array.isArray(info.foreground_processes))
     values.push(...info.foreground_processes.map((process) => process?.pid));
-  return values
-    .map((value) =>
-      typeof value === "number" ? value : Number.parseInt(String(value), 10),
-    )
-    .filter((value) => Number.isSafeInteger(value) && value > 0);
+  return values.map(normalizeProcessId).filter(Boolean);
 }
 
 function liveClaudeAgents(agents) {
@@ -128,29 +130,24 @@ function liveClaudeAgents(agents) {
   );
 }
 
-async function processMatchedAgents({
-  agents,
-  listPaneProcesses,
-  currentProcessPids,
-}) {
-  if (typeof listPaneProcesses !== "function" || currentProcessPids.size === 0)
-    return [];
+async function paneProcessEntries({ agents, listPaneProcesses }) {
+  if (typeof listPaneProcesses !== "function") return [];
   return (
     await Promise.all(
       agents.map(async (agent) => {
         try {
-          const processIds = new Set(
-            processIdsFromPayload(
-              await listPaneProcesses({
-                paneId: agent.pane_id,
-                workspaceId: agent.workspace_id,
-                agent,
-              }),
+          return {
+            agent,
+            processIds: new Set(
+              processIdsFromPayload(
+                await listPaneProcesses({
+                  paneId: agent.pane_id,
+                  workspaceId: agent.workspace_id,
+                  agent,
+                }),
+              ),
             ),
-          );
-          return [...currentProcessPids].some((pid) => processIds.has(pid))
-            ? agent
-            : undefined;
+          };
         } catch {
           // Process info is an optional Herdr capability. A transient failure
           // must not discard a valid session-id or static-root fallback.
@@ -161,12 +158,67 @@ async function processMatchedAgents({
   ).filter(Boolean);
 }
 
+function processMatchedAgents(entries, currentProcessPids) {
+  if (currentProcessPids.size === 0) return [];
+  return entries
+    .filter((entry) =>
+      [...currentProcessPids].some((pid) => entry.processIds.has(pid)),
+    )
+    .map((entry) => entry.agent);
+}
+
+async function resolveProcessMatches({
+  agents,
+  listPaneProcesses,
+  currentProcessPids,
+  currentProcessPid,
+  getParentPid,
+  maxProcessAncestorDepth,
+}) {
+  const entries = await paneProcessEntries({ agents, listPaneProcesses });
+  const lookupPids = new Set(
+    [...currentProcessPids].map(normalizeProcessId).filter(Boolean),
+  );
+  const processPid = normalizeProcessId(currentProcessPid);
+  if (processPid) lookupPids.add(processPid);
+  let matches = processMatchedAgents(entries, lookupPids);
+  if (
+    matches.length > 0 ||
+    entries.length === 0 ||
+    typeof getParentPid !== "function" ||
+    !processPid
+  )
+    return { matches, lookupPids };
+
+  let cursor = processPid;
+  const maxDepth = Number.isSafeInteger(maxProcessAncestorDepth)
+    ? Math.max(0, maxProcessAncestorDepth)
+    : 8;
+  for (let depth = 0; depth < maxDepth; depth += 1) {
+    let parentPid;
+    try {
+      parentPid = normalizeProcessId(await getParentPid(cursor));
+    } catch {
+      break;
+    }
+    if (!parentPid || parentPid === cursor) break;
+    cursor = parentPid;
+    lookupPids.add(parentPid);
+    matches = processMatchedAgents(entries, lookupPids);
+    if (matches.length > 0) break;
+  }
+  return { matches, lookupPids };
+}
+
 /**
  * @param {{
  *   env?: Record<string, string | undefined>,
  *   listAgents?: () => Promise<unknown>,
  *   listPaneProcesses?: (target: {paneId: string, workspaceId: string, agent: unknown}) => Promise<unknown>,
  *   currentProcessPids?: number[],
+ *   currentProcessPid?: number,
+ *   getParentPid?: (pid: number) => Promise<number | undefined>,
+ *   maxProcessAncestorDepth?: number,
  *   currentCwd?: string,
  *   allowStaticFallback?: (target: {fallback: {paneId?: string, workspaceId?: string}, agents: unknown[], sessionId: string}) => boolean | Promise<boolean>,
  * }} options
@@ -177,6 +229,9 @@ export async function resolveHerdrIdentity({
   listAgents,
   listPaneProcesses,
   currentProcessPids = [process.pid, process.ppid],
+  currentProcessPid = process.pid,
+  getParentPid,
+  maxProcessAncestorDepth = 8,
   currentCwd,
   allowStaticFallback,
 } = {}) {
@@ -194,15 +249,19 @@ export async function resolveHerdrIdentity({
   // the MCP/Claude PID is still an unambiguous pane anchor. Cwd is only a
   // tiebreaker if Herdr reports the same PID in multiple panes.
   const candidates = liveClaudeAgents(agents);
-  const processMatches = await processMatchedAgents({
+  const processLookup = await resolveProcessMatches({
     agents: candidates,
     listPaneProcesses,
     currentProcessPids: new Set(
       currentProcessPids
-        .map((value) => Number(value))
-        .filter((value) => Number.isSafeInteger(value) && value > 0),
+        .map(normalizeProcessId)
+        .filter(Boolean),
     ),
+    currentProcessPid,
+    getParentPid,
+    maxProcessAncestorDepth,
   });
+  const processMatches = processLookup.matches;
   if (processMatches.length === 1) return agentIdentity(processMatches[0]);
   if (processMatches.length > 1) {
     const cwdMatches = currentCwd
@@ -234,7 +293,7 @@ export async function resolveHerdrIdentity({
     throw new Error(
       `Claude session ${sessionId} is not present in the live Herdr agent list ` +
         `(mcp_pid=${process.pid}, mcp_ppid=${process.ppid}, ` +
-        `lookup_pids=${currentProcessPids.join(",") || "<none>"}, ` +
+        `lookup_pids=${[...processLookup.lookupPids].join(",") || "<none>"}, ` +
         `cwd=${currentCwd ?? "<unset>"}, ` +
         `claude_candidates=${candidates.length}, ` +
         `pid_matches=${processMatches.length}, ` +
