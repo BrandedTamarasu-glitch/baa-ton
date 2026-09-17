@@ -517,6 +517,39 @@ test("MCP falls back to a registered static root when process and session hints 
   }
 });
 
+test("MCP identity failures include the live server PID diagnostics", async () => {
+  const fixture = await rootBridgeFixture();
+  try {
+    await withMcpServer(
+      {
+        HERDR_ENV: "1",
+        HERDR_PANE_ID: "w-frozen:original",
+        HERDR_WORKSPACE_ID: "w-frozen",
+        HERDR_PLUGIN_CONFIG_DIR: fixture.stateDir,
+        TEST_CONFIG_DIR: fixture.stateDir,
+        CLAUDE_CODE_SESSION_ID: "mcp-process-generated-id",
+        PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
+      },
+      async (rpc) => {
+        const doctor = await rpc("tools/call", {
+          name: "herdr_doctor",
+          arguments: {},
+        });
+        assert.equal(doctor.result.isError, true);
+        const message = doctor.result.content[0].text;
+        assert.match(message, /mcp_pid=\d+, mcp_ppid=\d+/);
+        assert.match(message, /lookup_pids=\d+,\d+/);
+        assert.match(message, /claude_candidates=0/);
+        assert.match(message, /pid_matches=0/);
+        assert.match(message, /session_matches=0/);
+      },
+      { cwd: fixture.cwd },
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
 test("tools/call outside a Herdr session and unknown tools still fail predictably", async () => {
   await withMcpServer({ HERDR_ENV: "0" }, async (rpc) => {
     const listed = await rpc("tools/list");
