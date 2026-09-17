@@ -76,7 +76,11 @@ import {
   type LaunchProfileVersion,
   validateLaunchProfile,
 } from "./launch-profile.js";
-import { piLaunchAdapter, verifyActualProfile } from "./pi-launch-adapter.js";
+import {
+  piLaunchAdapter,
+  verifyActualProfile,
+  mapPiToolNamesToProtocolOperations,
+} from "./pi-launch-adapter.js";
 import { claudeLaunchAdapter } from "./claude-launch-adapter.js";
 import { codexLaunchAdapter } from "./codex-launch-adapter.js";
 import { opencodeLaunchAdapter } from "./opencode-launch-adapter.js";
@@ -6786,10 +6790,70 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const results: string[] = [];
       const warnings: string[] = [];
       for (const { workflow, lane } of lanes) {
-        const response = responseRecord(
-          await runHerdr(["agent", "get", lane.pane_id], signal),
-          `lane bridge ${lane.lane_id}`,
-        );
+        // Load the stored manifest lane first: a gone pane is only tolerable
+        // when the lane already holds a durable completion receipt.
+        let attestation: unknown = null;
+        let storedLane: Lane | undefined;
+        try {
+          const manifest = JSON.parse(
+            await readFile(workflow.manifest_path, "utf8"),
+          ) as Manifest;
+          const stored = manifest.workflows.find(
+            (candidate) => candidate.id === workflow.workflow_id,
+          );
+          storedLane = stored?.lanes.find(
+            (candidate) => candidate.id === lane.lane_id,
+          );
+          if (storedLane?.startupIntentPath)
+            attestation = JSON.parse(
+              await readFile(`${storedLane.startupIntentPath}.ready`, "utf8"),
+            );
+        } catch {
+          attestation = null;
+        }
+        let response: Record<string, unknown>;
+        try {
+          response = responseRecord(
+            await runHerdr(["agent", "get", lane.pane_id], signal),
+            `lane bridge ${lane.lane_id}`,
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          // runHerdrRaw embeds the CLI error envelope in its exception. Match
+          // its code, not text that an unrelated error could mention.
+          const prefix = `herdr agent get ${lane.pane_id} failed: `;
+          let failure: unknown;
+          try {
+            if (message.startsWith(prefix))
+              failure = JSON.parse(message.slice(prefix.length));
+          } catch {
+            // Unstructured or truncated failures must remain failures.
+          }
+          if (
+            !isRecord(failure) ||
+            !isRecord(failure.error) ||
+            failure.error.code !== "agent_not_found"
+          ) throw error;
+          // The pane is gone. Terminal status alone is insufficient: only a
+          // durable completion receipt with an ID and summary proves the lane
+          // finished before its pane disappeared.
+          const receipt = storedLane?.completionReceipt;
+          if (
+            isRecord(receipt) &&
+            typeof receipt.id === "string" &&
+            receipt.id.trim().length > 0 &&
+            typeof receipt.summary === "string" &&
+            receipt.summary.trim().length > 0
+          ) {
+            warnings.push(
+              `${lane.lane_id} (${lane.pane_id}) pane is gone; lane has durable completion receipt ${receipt.id}`,
+            );
+            continue;
+          }
+          throw new Error(
+            `Lane ${lane.lane_id} pane ${lane.pane_id} is gone without a durable completion receipt.`,
+          );
+        }
         const agent = response.agent;
         if (!isRecord(agent))
           throw new Error(
@@ -6813,25 +6877,21 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         // bridge has no independently addressable socket to ping. Missing or
         // incomplete evidence is surfaced as a warning rather than guessed
         // healthy from a pane status alone.
-        let attestation: any = null;
-        try {
-          const manifest = await loadManifest(workflow.manifest_path);
-          const stored = manifest.workflows.find(
-            (candidate) => candidate.id === workflow.workflow_id,
-          );
-          const storedLane = stored?.lanes.find(
-            (candidate) => candidate.id === lane.lane_id,
-          );
-          if (storedLane?.startupIntentPath)
-            attestation = JSON.parse(
-              await readFile(`${storedLane.startupIntentPath}.ready`, "utf8"),
-            );
-        } catch {
-          attestation = null;
-        }
-        const operations = isRecord(attestation)
-          ? attestation.operations
-          : undefined;
+        const piIdentityMatches = agent.agent === "pi" &&
+          isRecord(attestation) &&
+          attestation.paneId === lane.pane_id &&
+          attestation.workspaceId === lane.workspace_id &&
+          typeof storedLane?.startupNonce === "string" &&
+          attestation.nonce === storedLane.startupNonce &&
+          isRecord(agent.agent_session) &&
+          agent.agent_session.kind === "path" &&
+          typeof attestation.sessionPath === "string" &&
+          agent.agent_session.value === attestation.sessionPath;
+        const operations = agent.agent === "pi"
+          ? piIdentityMatches && isRecord(attestation)
+            ? mapPiToolNamesToProtocolOperations(attestation.tools)
+            : undefined
+          : isRecord(attestation) ? attestation.operations : undefined;
         if (
           !Array.isArray(operations) ||
           !STARTUP_PROOF_REQUIRED_OPERATIONS.every((operation) =>

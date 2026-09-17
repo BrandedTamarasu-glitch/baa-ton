@@ -150,3 +150,117 @@ test("herdr_doctor fails closed when native Herdr connectivity is unavailable", 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("doctor reads the routed manifest and normalizes identity-bound Pi tool attestations", async () => {
+  const { directory, cwd, configDir } = await fixture();
+  const env = { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1", HERDR_WORKSPACE_ID: "w1", HERDR_PLUGIN_CONFIG_DIR: configDir };
+  const saved = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
+  try {
+    Object.assign(process.env, env);
+    const manifestDir = join(cwd, ".pi", "herdr-orchestrator");
+    await mkdir(manifestDir, { recursive: true });
+    const manifestPath = join(manifestDir, "manifest.json");
+    const startup = join(manifestDir, "startup.json");
+    const manifest = JSON.stringify({ version: 2, workflows: [{ id: "workflow-a", lanes: [{ id: "lane-a", startupIntentPath: startup, startupNonce: "nonce-a" }] }] });
+    await writeFile(manifestPath, manifest);
+    const root = { target: "w1:p1", target_kind: "pane_id", pane_id: "w1:p1", workspace_id: "w1", agent_kind: "pi" };
+    await writeFile(join(configDir, "config.json"), JSON.stringify({ version: 2, owner: "herdr-orchestrator", orchestrators: [{ id: "root-a", root, program: { id: cwd, workspace_id: "w1", parent_manifest_path: manifestPath }, workflows: [{ workflow_id: "workflow-a", manifest_path: manifestPath, lanes: [{ lane_id: "lane-a", target: "w1:p2", target_kind: "pane_id", pane_id: "w1:p2", workspace_id: "w1" }] }] }] }));
+    const tools = new Map();
+    const agent = { agent: "pi", pane_id: "w1:p2", workspace_id: "w1", interactive_ready: true, agent_session: { kind: "path", value: "/tmp/session-a" } };
+    extension({ on() {}, registerCommand() {}, registerTool: tool => tools.set(tool.name, tool), async exec(_command, args) {
+      if (args[0] === "plugin" && args[1] === "config-dir") return { code: 0, stderr: "", stdout: configDir };
+      if (args[0] === "agent" && args[1] === "get") return { code: 0, stderr: "", stdout: JSON.stringify({ result: { agent } }) };
+      throw new Error(`unexpected command: ${args}`);
+    } });
+    const ctx = { cwd, hasUI: false, modelRegistry: {} };
+    const ready = { nonce: "nonce-a", paneId: "w1:p2", workspaceId: "w1", sessionPath: "/tmp/session-a", tools: ["herdr_plan", "herdr_dispatch", "herdr_complete"] };
+    async function check(attestation) {
+      await writeFile(`${startup}.ready`, JSON.stringify(attestation));
+      const report = await tools.get("herdr_doctor").execute("doctor", {}, undefined, undefined, ctx);
+      return report.details.checks.find(check => check.id === "lane-bridge-liveness");
+    }
+    assert.equal((await check(ready)).status, "ok");
+    for (const invalid of [{ ...ready, nonce: "stale" }, { ...ready, paneId: "other" }, { ...ready, workspaceId: "other" }, { ...ready, sessionPath: "/tmp/other" }, { ...ready, tools: ["herdr_plan"] }]) {
+      assert.equal((await check(invalid)).status, "warn");
+    }
+    agent.agent = "codex";
+    assert.equal((await check({ operations: ["plan", "dispatch", "complete"] })).status, "ok");
+    agent.pane_id = "different-pane";
+    assert.equal((await check(ready)).status, "fail");
+    assert.equal(await readFile(manifestPath, "utf8"), manifest);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) value === undefined ? delete process.env[key] : process.env[key] = value;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("lane-bridge-liveness tolerates gone panes only with durable completion receipts", async () => {
+  const { directory, cwd, configDir } = await fixture();
+  const env = { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1", HERDR_WORKSPACE_ID: "w1", HERDR_PLUGIN_CONFIG_DIR: configDir };
+  const saved = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
+  try {
+    Object.assign(process.env, env);
+    const manifestDir = join(cwd, ".pi", "herdr-orchestrator");
+    await mkdir(manifestDir, { recursive: true });
+    const manifestPath = join(manifestDir, "manifest.json");
+    const startup = join(manifestDir, "startup.json");
+    const root = { target: "w1:p1", target_kind: "pane_id", pane_id: "w1:p1", workspace_id: "w1", agent_kind: "pi" };
+    // Two mapped lanes: lane-live (w1:p2, alive) and lane-gone (w1:p3, pane removed).
+    await writeFile(join(configDir, "config.json"), JSON.stringify({ version: 2, owner: "herdr-orchestrator", orchestrators: [{ id: "root-a", root, program: { id: cwd, workspace_id: "w1", parent_manifest_path: manifestPath }, workflows: [{ workflow_id: "workflow-a", manifest_path: manifestPath, lanes: [
+      { lane_id: "lane-live", target: "w1:p2", target_kind: "pane_id", pane_id: "w1:p2", workspace_id: "w1" },
+      { lane_id: "lane-gone", target: "w1:p3", target_kind: "pane_id", pane_id: "w1:p3", workspace_id: "w1" },
+    ] }] }] }));
+    const liveAgent = { agent: "pi", pane_id: "w1:p2", workspace_id: "w1", interactive_ready: true, agent_session: { kind: "path", value: "/tmp/session-a" } };
+    await writeFile(`${startup}.ready`, JSON.stringify({ nonce: "nonce-a", paneId: "w1:p2", workspaceId: "w1", sessionPath: "/tmp/session-a", tools: ["herdr_plan", "herdr_dispatch", "herdr_complete"] }));
+    let goneResult = { code: 1, stderr: "", stdout: JSON.stringify({ error: { code: "agent_not_found", message: "agent target w1:p3 not found" }, id: "cli:agent:get" }) };
+    const tools = new Map();
+    extension({ on() {}, registerCommand() {}, registerTool: tool => tools.set(tool.name, tool), async exec(_command, args) {
+      if (args[0] === "plugin" && args[1] === "config-dir") return { code: 0, stderr: "", stdout: configDir };
+      if (args[0] === "agent" && args[1] === "get" && args[2] === "w1:p2") return { code: 0, stderr: "", stdout: JSON.stringify({ result: { agent: liveAgent } }) };
+      if (args[0] === "agent" && args[1] === "get" && args[2] === "w1:p3") return goneResult;
+      throw new Error(`unexpected command: ${args}`);
+    } });
+    const ctx = { cwd, hasUI: false, modelRegistry: {} };
+    async function check(goneLane) {
+      await writeFile(manifestPath, JSON.stringify({ version: 2, workflows: [{ id: "workflow-a", lanes: [
+        { id: "lane-live", startupIntentPath: startup, startupNonce: "nonce-a" },
+        goneLane,
+      ] }] }));
+      const report = await tools.get("herdr_doctor").execute("doctor", {}, undefined, undefined, ctx);
+      return report.details.checks.find(entry => entry.id === "lane-bridge-liveness");
+    }
+
+    // Completed + missing pane: durable receipt with id and summary -> warn.
+    const receipted = await check({ id: "lane-gone", status: "done", completionReceipt: { id: "receipt-b", summary: "Reviewed README", delivery: "delivered" } });
+    assert.equal(receipted.status, "warn");
+    assert.match(receipted.detail, /lane-live \(w1:p2\) native\/bridge evidence present/);
+    assert.match(receipted.detail, /lane-gone \(w1:p3\) pane is gone; lane has durable completion receipt receipt-b/);
+
+    // Unfinished + missing pane: no receipt -> fail even with terminal status.
+    const terminalOnly = await check({ id: "lane-gone", status: "done" });
+    assert.equal(terminalOnly.status, "fail");
+    assert.match(terminalOnly.detail, /lane-gone pane w1:p3 is gone without a durable completion receipt/);
+
+    // Receipt missing a summary is not durable evidence -> fail.
+    const emptySummary = await check({ id: "lane-gone", status: "done", completionReceipt: { id: "receipt-b", summary: "", delivery: "delivered" } });
+    assert.equal(emptySummary.status, "fail");
+    assert.match(emptySummary.detail, /without a durable completion receipt/);
+
+    for (const receipt of [{ id: "", summary: "Done" }, { id: "receipt-b", summary: "   " }]) {
+      assert.equal((await check({ id: "lane-gone", completionReceipt: receipt })).status, "fail");
+    }
+
+    // Unrelated CLI errors must still fail, receipt or not.
+    goneResult = { code: 1, stderr: "", stdout: JSON.stringify({ error: { code: "internal_error", message: "agent_not_found lookup failed: socket unavailable" }, id: "cli:agent:get" }) };
+    const unrelated = await check({ id: "lane-gone", status: "done", completionReceipt: { id: "receipt-b", summary: "Reviewed README", delivery: "delivered" } });
+    assert.equal(unrelated.status, "fail");
+    assert.match(unrelated.detail, /internal_error/);
+    assert.doesNotMatch(unrelated.detail, /without a durable completion receipt/);
+
+    goneResult = { code: 1, stderr: "agent_not_found (unstructured)", stdout: "" };
+    assert.equal((await check({ id: "lane-gone", completionReceipt: { id: "receipt-b", summary: "Done" } })).status, "fail");
+  } finally {
+    for (const [key, value] of Object.entries(saved)) value === undefined ? delete process.env[key] : process.env[key] = value;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
