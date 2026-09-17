@@ -91,6 +91,7 @@ import {
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { acknowledgeActivation } from "./activation-ack.mjs";
 import { resolveTaskProfile } from "./profile-config.mjs";
+import { resolveHerdrIdentity } from "./live-identity.mjs";
 
 // routeChildMessage lives in the controller package, which is a sibling of
 // this package inside the baa-ton checkout. Pi may load this extension
@@ -2976,6 +2977,19 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     return parseJson(await runHerdrRaw(args, signal, timeoutMs));
   }
 
+  async function refreshHerdrIdentity(
+    signal?: AbortSignal,
+  ): Promise<{ paneId?: string; workspaceId?: string }> {
+    const identity = await resolveHerdrIdentity({
+      env: process.env,
+      listAgents: () => runHerdr(["agent", "list"], signal),
+    });
+    if (identity.paneId) process.env[HERDR_PANE_ID_ENV] = identity.paneId;
+    if (identity.workspaceId)
+      process.env.HERDR_WORKSPACE_ID = identity.workspaceId;
+    return identity;
+  }
+
   async function sendMessage(
     cwd: string,
     workflowId: string,
@@ -3145,6 +3159,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     signal?: AbortSignal,
     queue?: QueueStore,
   ): Promise<void> {
+    await refreshHerdrIdentity(signal);
     if (!isRootOrchestrator()) return;
     const paneId = process.env[HERDR_PANE_ID_ENV];
     if (!paneId) return;
@@ -3168,6 +3183,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   }
 
   async function clearParentGoalSidebar(signal?: AbortSignal): Promise<void> {
+    await refreshHerdrIdentity(signal);
     if (!isRootOrchestrator()) return;
     const paneId = process.env[HERDR_PANE_ID_ENV];
     if (!paneId) return;
@@ -3374,7 +3390,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   async function currentPaneRoot(
     signal?: AbortSignal,
   ): Promise<ControllerRootMapping> {
-    const paneId = process.env[HERDR_PANE_ID_ENV];
+    const identity = await refreshHerdrIdentity(signal);
+    const paneId = identity.paneId;
     if (!paneId)
       throw new Error(
         `${HERDR_PANE_ID_ENV} is required to discover the current pane identity.`,
@@ -3399,6 +3416,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   async function discoverControllerRoot(
     signal?: AbortSignal,
   ): Promise<ControllerRootMapping> {
+    await refreshHerdrIdentity(signal);
     if (!isRootOrchestrator())
       throw new Error(
         "Only the verified controller-mapped root may register the event controller.",
@@ -6963,7 +6981,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     ctx: ExtensionContext,
     state: RootTurn["state"],
   ): Promise<void> {
-    if (process.env.HERDR_ENV !== "1" || !isRootOrchestrator()) return;
+    if (process.env.HERDR_ENV !== "1") return;
+    await refreshHerdrIdentity(ctx.signal);
+    if (!isRootOrchestrator()) return;
     const turn = currentRootTurn(state);
     const config = readControllerConfigForCurrentPane();
     const mappedRoot = config?.orchestrators.find(
@@ -7044,6 +7064,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     sessionManager: { getSessionFile(): string | undefined };
     signal?: AbortSignal;
   }): Promise<void> {
+    await refreshHerdrIdentity(ctx.signal);
     if (!isRootOrchestrator()) return;
     const activation = await acknowledgeActivation(
       dirname(rootConfigPath()),
@@ -7083,6 +7104,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   });
   pi.on("session_start", async (_event, ctx) => {
     rootRunId = randomUUID();
+    await refreshHerdrIdentity(ctx.signal);
     await persistRootTurn(ctx, "unknown");
     const startupPath = process.env.BAA_STARTUP_INTENT;
     if (startupPath) {
@@ -7131,6 +7153,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
+    if (process.env.HERDR_ENV === "1")
+      await refreshHerdrIdentity(ctx.signal);
     // SAFETY: Pi's event union requires a runtime tool-name guard before bash input is available.
     const call = event as unknown as {
       toolName?: string;
@@ -7202,6 +7226,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event, ctx) => {
     if (process.env.HERDR_ENV !== "1") return {};
+    await refreshHerdrIdentity(ctx.signal);
     await persistRootTurn(ctx, "active");
     return {
       systemPrompt: `${event.systemPrompt}\n\nHerdr controller active. Use available Herdr tools only as permitted by role; do not poll. Continue authorized safe local work until waiting, blocked, paused, or complete. Herdr delegation policy: delegate only via herdr_plan then herdr_dispatch. Every child must be a new Herdr-created session using its declared agentKind from the installed Herdr compatibility set. Never use Pi subagents, Pi background tasks, detached/background child jobs, or direct Pi child-session launches. Use herdr_observe for completion and herdr_close with evidence for extension-owned resources only.${await rootBootstrapPrompt(ctx.cwd)}`,

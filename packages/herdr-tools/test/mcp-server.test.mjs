@@ -24,6 +24,7 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
       // execute concurrently; fixtures below provide their own config when
       // they need one.
       BAA_STARTUP_INTENT: undefined,
+      CLAUDE_CODE_SESSION_ID: undefined,
       HERDR_PLUGIN_CONFIG_DIR: undefined,
       HERDR_PLUGIN_STATE_DIR: undefined,
       HERDR_PANE_ID: "w-test:p1",
@@ -81,6 +82,23 @@ async function rootBridgeFixture() {
 const result = (value) => process.stdout.write(JSON.stringify({ result: value }) + "\\n");
 if (args[0] === "plugin" && args[1] === "config-dir") {
   result({ config_dir: process.env.TEST_CONFIG_DIR });
+} else if (args[0] === "agent" && args[1] === "list") {
+  result({
+    type: "agent_list",
+    agents: process.env.TEST_CLAUDE_SESSION_ID
+      ? [{
+          agent: "claude",
+          pane_id: process.env.TEST_LIVE_PANE,
+          workspace_id: process.env.TEST_LIVE_WORKSPACE,
+          agent_session: {
+            agent: "claude",
+            kind: "id",
+            value: process.env.TEST_CLAUDE_SESSION_ID,
+          },
+          agent_status: "idle",
+        }]
+      : [],
+  });
 } else if (args[0] === "agent" && args[1] === "get") {
   const pane = args[2];
   const child = pane === "w-root:child";
@@ -274,6 +292,71 @@ test("mapped root bridge exposes root-role parity and returns non-Pi root ground
       assert.equal(childGoal.result.isError, true);
       assert.match(childGoal.result.content[0].text, /verified controller-mapped root/);
     }, { cwd: fixture.cwd });
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("one project-scoped MCP registration resolves concurrent Claude panes by live session", async () => {
+  const fixture = await rootBridgeFixture();
+  const baseEnv = {
+    HERDR_ENV: "1",
+    // This is deliberately the frozen project registration snapshot. Neither
+    // live Claude pane below actually occupies this pane or workspace.
+    HERDR_PANE_ID: "w-frozen:original",
+    HERDR_WORKSPACE_ID: "w-frozen",
+    HERDR_PLUGIN_CONFIG_DIR: fixture.stateDir,
+    TEST_CONFIG_DIR: fixture.stateDir,
+    PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
+  };
+  try {
+    const first = {
+      ...baseEnv,
+      CLAUDE_CODE_SESSION_ID: "claude-session-second",
+      TEST_CLAUDE_SESSION_ID: "claude-session-second",
+      TEST_LIVE_PANE: "w-live-b:second",
+      TEST_LIVE_WORKSPACE: "w-live-b",
+      TEST_ROOT_WORKSPACE: "w-live-b",
+    };
+    await withMcpServer(first, async (rpc) => {
+      const bootstrap = await rpc("tools/call", {
+        name: "herdr_bootstrap_root",
+        arguments: { add: true },
+      });
+      assert.equal(bootstrap.result.isError, undefined);
+      assert.equal(bootstrap.result.structuredContent.root.pane_id, "w-live-b:second");
+      assert.equal(bootstrap.result.structuredContent.root.workspace_id, "w-live-b");
+    }, { cwd: fixture.cwd });
+
+    const second = {
+      ...baseEnv,
+      CLAUDE_CODE_SESSION_ID: "claude-session-third",
+      TEST_CLAUDE_SESSION_ID: "claude-session-third",
+      TEST_LIVE_PANE: "w-live-c:third",
+      TEST_LIVE_WORKSPACE: "w-live-c",
+      TEST_ROOT_WORKSPACE: "w-live-c",
+    };
+    await withMcpServer(second, async (rpc) => {
+      const bootstrap = await rpc("tools/call", {
+        name: "herdr_bootstrap_root",
+        arguments: { add: true },
+      });
+      assert.equal(bootstrap.result.isError, undefined);
+      assert.equal(bootstrap.result.structuredContent.root.pane_id, "w-live-c:third");
+      assert.equal(bootstrap.result.structuredContent.root.workspace_id, "w-live-c");
+    }, { cwd: fixture.cwd });
+
+    const config = JSON.parse(await readFile(join(fixture.stateDir, "config.json"), "utf8"));
+    assert.deepEqual(
+      config.orchestrators.map((record) => ({
+        paneId: record.root.pane_id,
+        workspaceId: record.root.workspace_id,
+      })),
+      [
+        { paneId: "w-live-b:second", workspaceId: "w-live-b" },
+        { paneId: "w-live-c:third", workspaceId: "w-live-c" },
+      ],
+    );
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });
   }
