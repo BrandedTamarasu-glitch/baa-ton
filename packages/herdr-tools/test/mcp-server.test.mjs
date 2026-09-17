@@ -79,11 +79,14 @@ async function rootBridgeFixture() {
   await mkdir(binDir, { recursive: true, mode: 0o700 });
   // This read-only native stub proves the bridge uses the live pane identity
   // while keeping the test independent of a focused Herdr client.
-  const script = `const args = process.argv.slice(2);
+  const script = `const { appendFileSync } = require("node:fs");
+const args = process.argv.slice(2);
 const result = (value) => process.stdout.write(JSON.stringify({ result: value }) + "\\n");
 if (args[0] === "plugin" && args[1] === "config-dir") {
   result({ config_dir: process.env.TEST_CONFIG_DIR });
 } else if (args[0] === "agent" && args[1] === "list") {
+  if (process.env.TEST_AGENT_LIST_LOG)
+    appendFileSync(process.env.TEST_AGENT_LIST_LOG, "agent-list\\n");
   result({
     type: "agent_list",
     agents: process.env.TEST_CLAUDE_SESSION_ID
@@ -362,6 +365,7 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
       TEST_LIVE_PANE: "w-live-c:third",
       TEST_LIVE_WORKSPACE: "w-live-c",
       TEST_ROOT_WORKSPACE: "w-live-c",
+      TEST_AGENT_LIST_LOG: join(fixture.directory, "agent-list.log"),
     };
     await withMcpServer(second, async (rpc) => {
       const bootstrap = await rpc("tools/call", {
@@ -371,8 +375,33 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
       assert.equal(bootstrap.result.isError, undefined);
       assert.equal(bootstrap.result.structuredContent.root.pane_id, "w-live-c:third");
       assert.equal(bootstrap.result.structuredContent.root.workspace_id, "w-live-c");
+
+      const doctor = await rpc("tools/call", {
+        name: "herdr_doctor",
+        arguments: {},
+      });
+      assert.equal(doctor.result.isError, undefined);
+      const routing = doctor.result.structuredContent.checks.find(
+        (check) => check.id === "plugin-enablement-and-routing",
+      );
+      assert.match(routing.detail, /This pane is a registered root/);
+
+      const plan = await rpc("tools/call", {
+        name: "herdr_plan",
+        arguments: {
+          objective: "Plan immediately after live root bootstrap",
+          lanes: ["live identity regression"],
+        },
+      });
+      assert.equal(plan.result.isError, undefined);
+      assert.match(plan.result.content[0].text, /Planned herdr-/);
     }, { cwd: fixture.cwd });
 
+    const agentListCalls = (await readFile(join(fixture.directory, "agent-list.log"), "utf8"))
+      .trim()
+      .split("\n")
+      .filter(Boolean).length;
+    assert.equal(agentListCalls, 3, "each MCP request should share its one live lookup with extension lifecycle handlers");
     const config = JSON.parse(await readFile(join(fixture.stateDir, "config.json"), "utf8"));
     assert.deepEqual(
       config.orchestrators.map((record) => ({

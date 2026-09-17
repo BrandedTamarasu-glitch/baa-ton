@@ -34,7 +34,11 @@ import {
   storePath,
   updateMessage,
 } from "./inbox/index.mjs";
-import { resolveHerdrIdentity } from "./live-identity.mjs";
+import {
+  applyHerdrIdentity,
+  clearAppliedHerdrIdentity,
+  resolveHerdrIdentity,
+} from "./live-identity.mjs";
 import { liveHerdrAgentList } from "./live-herdr.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
@@ -142,8 +146,7 @@ async function refreshCurrentHerdrIdentity() {
     env: process.env,
     listAgents: liveHerdrAgentList,
   });
-  if (identity.paneId) process.env.HERDR_PANE_ID = identity.paneId;
-  if (identity.workspaceId) process.env.HERDR_WORKSPACE_ID = identity.workspaceId;
+  applyHerdrIdentity(process.env, identity);
   return identity;
 }
 
@@ -701,10 +704,12 @@ async function callTool(id, params) {
   // the parent through MCP.
   if (ROOT_EXECUTOR_TOOLS.has(params.name)) {
     const route = await currentRoute();
-    if (route?.role !== "root")
+    if (route?.role !== "root") {
+      clearAppliedHerdrIdentity();
       return toolError(
         "Only the verified controller-mapped root may perform this operation.",
       );
+    }
   }
 
   const controller = new AbortController();
@@ -787,6 +792,7 @@ async function callTool(id, params) {
         );
       }
     }
+    clearAppliedHerdrIdentity();
   }
 }
 
