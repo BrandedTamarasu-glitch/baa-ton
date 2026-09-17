@@ -3,9 +3,11 @@
  *
  * Claude's project-scoped MCP configuration freezes the HERDR_* values that
  * were present when the registration was created. CLAUDE_CODE_SESSION_ID is
- * not frozen, however, and Herdr exposes that same session id on its live
- * agent records. Harnesses without that session id intentionally retain the
- * inherited static identity.
+ * not frozen, however, and may be regenerated for an MCP subprocess when a
+ * Claude process restarts. It is therefore only a hint. When available, the
+ * live pane process tree is the authoritative correlation; the session id is
+ * used as a secondary fallback. Harnesses without that session id
+ * intentionally retain the inherited static identity.
  */
 
 function isRecord(value) {
@@ -71,11 +73,106 @@ function agentListFromPayload(payload) {
   return isRecord(result) && Array.isArray(result.agents) ? result.agents : [];
 }
 
+function agentKind(agent) {
+  return (
+    nonEmptyString(agent?.agent) ??
+    nonEmptyString(agent?.agent_session?.agent)
+  );
+}
+
+function agentIdentity(agent) {
+  if (!isRecord(agent)) return undefined;
+  const paneId = nonEmptyString(agent.pane_id);
+  const workspaceId = nonEmptyString(agent.workspace_id);
+  if (!paneId || !workspaceId) return undefined;
+  return { paneId, workspaceId };
+}
+
+function sameWorkingDirectory(agent, currentCwd) {
+  if (!currentCwd) return true;
+  const values = [agent?.cwd, agent?.foreground_cwd].filter(
+    (value) => typeof value === "string" && value,
+  );
+  if (values.length === 0) return true;
+  return values.some((value) => {
+    if (value === currentCwd) return true;
+    const windowsPath = value.includes("\\") || currentCwd.includes("\\");
+    return windowsPath && value.replaceAll("\\", "/").toLowerCase() === currentCwd.replaceAll("\\", "/").toLowerCase();
+  });
+}
+
+function processIdsFromPayload(payload) {
+  const result = isRecord(payload?.result) ? payload.result : payload;
+  const info = isRecord(result?.process_info) ? result.process_info : result;
+  if (!isRecord(info)) return [];
+  const values = [info.shell_pid, info.foreground_process_group_id];
+  if (Array.isArray(info.foreground_processes))
+    values.push(...info.foreground_processes.map((process) => process?.pid));
+  return values
+    .map((value) =>
+      typeof value === "number" ? value : Number.parseInt(String(value), 10),
+    )
+    .filter((value) => Number.isSafeInteger(value) && value > 0);
+}
+
+function liveClaudeAgents(agents, currentCwd) {
+  return agents.filter(
+    (agent) =>
+      isRecord(agent) &&
+      agentKind(agent) === "claude" &&
+      agentIdentity(agent) &&
+      sameWorkingDirectory(agent, currentCwd),
+  );
+}
+
+async function processMatchedAgents({
+  agents,
+  listPaneProcesses,
+  currentProcessPids,
+}) {
+  if (typeof listPaneProcesses !== "function" || currentProcessPids.size === 0)
+    return [];
+  const matches = [];
+  for (const agent of agents) {
+    try {
+      const processIds = new Set(
+        processIdsFromPayload(
+          await listPaneProcesses({
+            paneId: agent.pane_id,
+            workspaceId: agent.workspace_id,
+            agent,
+          }),
+        ),
+      );
+      if ([...currentProcessPids].some((pid) => processIds.has(pid)))
+        matches.push(agent);
+    } catch {
+      // Process info is an optional Herdr capability. A transient failure
+      // must not discard a valid session-id or static-root fallback.
+    }
+  }
+  return matches;
+}
+
 /**
- * @param {{env?: Record<string, string | undefined>, listAgents?: () => Promise<unknown>}} options
+ * @param {{
+ *   env?: Record<string, string | undefined>,
+ *   listAgents?: () => Promise<unknown>,
+ *   listPaneProcesses?: (target: {paneId: string, workspaceId: string, agent: unknown}) => Promise<unknown>,
+ *   currentProcessPids?: number[],
+ *   currentCwd?: string,
+ *   allowStaticFallback?: (target: {fallback: {paneId?: string, workspaceId?: string}, agents: unknown[], sessionId: string}) => boolean | Promise<boolean>,
+ * }} options
  * @returns {Promise<{paneId?: string, workspaceId?: string}>}
  */
-export async function resolveHerdrIdentity({ env = process.env, listAgents } = {}) {
+export async function resolveHerdrIdentity({
+  env = process.env,
+  listAgents,
+  listPaneProcesses,
+  currentProcessPids = [process.pid, process.ppid],
+  currentCwd,
+  allowStaticFallback,
+} = {}) {
   const fallback = staticIdentity(env);
   const sessionId = nonEmptyString(env.CLAUDE_CODE_SESSION_ID);
   if (!sessionId) return fallback;
@@ -84,26 +181,42 @@ export async function resolveHerdrIdentity({ env = process.env, listAgents } = {
       "A live Herdr agent-list lookup is required when CLAUDE_CODE_SESSION_ID is present.",
     );
 
-  const matches = agentListFromPayload(await listAgents()).filter((agent) => {
-    if (!isRecord(agent) || !isRecord(agent.agent_session)) return false;
-    const kind = nonEmptyString(agent.agent) ?? nonEmptyString(agent.agent_session.agent);
-    return (
-      kind === "claude" &&
-      nonEmptyString(agent.agent_session.value) === sessionId &&
-      nonEmptyString(agent.pane_id) !== undefined &&
-      nonEmptyString(agent.workspace_id) !== undefined
-    );
+  const agents = agentListFromPayload(await listAgents());
+  const candidates = liveClaudeAgents(agents, currentCwd);
+  const processMatches = await processMatchedAgents({
+    agents: candidates,
+    listPaneProcesses,
+    currentProcessPids: new Set(
+      currentProcessPids
+        .map((value) => Number(value))
+        .filter((value) => Number.isSafeInteger(value) && value > 0),
+    ),
   });
-  if (matches.length === 0)
+  if (processMatches.length === 1) return agentIdentity(processMatches[0]);
+  if (processMatches.length > 1)
     throw new Error(
-      `Claude session ${sessionId} is not present in the live Herdr agent list.`,
+      `The MCP process matched multiple live Herdr Claude panes by PID.`,
     );
-  if (matches.length > 1)
+
+  const sessionMatches = candidates.filter(
+    (agent) =>
+      isRecord(agent.agent_session) &&
+      nonEmptyString(agent.agent_session.value) === sessionId,
+  );
+  if (sessionMatches.length === 1) return agentIdentity(sessionMatches[0]);
+  if (sessionMatches.length > 1)
     throw new Error(
       `Claude session ${sessionId} matched multiple live Herdr agents.`,
     );
-  return {
-    paneId: nonEmptyString(matches[0].pane_id),
-    workspaceId: nonEmptyString(matches[0].workspace_id),
-  };
+  if (
+    sessionMatches.length === 0 &&
+    typeof allowStaticFallback === "function" &&
+    await allowStaticFallback({ fallback, agents, sessionId })
+  )
+    return fallback;
+  if (sessionMatches.length === 0)
+    throw new Error(
+      `Claude session ${sessionId} is not present in the live Herdr agent list.`,
+    );
+  throw new Error(`Unable to resolve Claude session ${sessionId}.`);
 }

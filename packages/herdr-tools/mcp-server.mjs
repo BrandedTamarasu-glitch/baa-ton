@@ -39,7 +39,10 @@ import {
   clearAppliedHerdrIdentity,
   resolveHerdrIdentity,
 } from "./live-identity.mjs";
-import { liveHerdrAgentList } from "./live-herdr.mjs";
+import {
+  liveHerdrAgentList,
+  liveHerdrPaneProcessInfo,
+} from "./live-herdr.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -145,6 +148,10 @@ async function refreshCurrentHerdrIdentity() {
   const identity = await resolveHerdrIdentity({
     env: process.env,
     listAgents: liveHerdrAgentList,
+    listPaneProcesses: ({ paneId }) => liveHerdrPaneProcessInfo(paneId),
+    currentProcessPids: [process.pid, process.ppid],
+    currentCwd: process.cwd(),
+    allowStaticFallback: staticRootFallbackAllowed,
   });
   applyHerdrIdentity(process.env, identity);
   return identity;
@@ -217,6 +224,30 @@ async function readControllerConfig() {
     if (error?.code === "ENOENT") return undefined;
     throw error;
   }
+}
+
+function agentAtIdentity(agent, identity) {
+  const kind = agent?.agent ?? agent?.agent_session?.agent;
+  return (
+    kind === "claude" &&
+    agent?.pane_id === identity.paneId &&
+    agent?.workspace_id === identity.workspaceId
+  );
+}
+
+async function staticRootFallbackAllowed({ fallback, agents }) {
+  if (!fallback.paneId || !fallback.workspaceId) return false;
+  const config = await readControllerConfig();
+  const roots =
+    config?.version === 1
+      ? [config.root]
+      : config?.orchestrators?.map((orchestrator) => orchestrator.root) ?? [];
+  const registered = roots.some(
+    (root) =>
+      root?.pane_id === fallback.paneId &&
+      root?.workspace_id === fallback.workspaceId,
+  );
+  return registered && agents.some((agent) => agentAtIdentity(agent, fallback));
 }
 
 function endpointFromEnvironment() {
