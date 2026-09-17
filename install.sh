@@ -79,21 +79,20 @@ Set up Baa-ton as the root for this Herdr pane.
 The Baa-ton checkout is at:
 $BAA_TON_DIR
 
-First run the guided setup from the target project root. It detects installed
-harnesses, lets me confirm them with checkboxes, records the task profiles, and
-updates an existing project instruction file or the explicit --instructions-path I provide:
-  node "$BAA_TON_DIR/packages/herdr-tools/setup.mjs" --project-root "<project-root>"
+Do this in order:
+1. Confirm this is a Herdr pane and identify the current harness: Pi, Claude Code, Codex, or OpenCode.
+2. Run the matching command from this pane:
+     node "$BAA_TON_DIR/packages/herdr-tools/root-setup.mjs" --harness claude
+   Use codex, opencode, or pi for the other harnesses.
+3. Follow the helper's one-time integration instructions. If it asks for a
+   restart, restart the harness in this same Herdr pane and continue.
+4. Call herdr_bootstrap_root and verify the returned root identity and briefing.
+5. Report exactly: "Baa-ton root ready: <harness>, <workspace>, <pane>." Then
+   wait for my task. Do not initialize a parent goal or ask for an objective yet.
 
-I am using one of the supported harnesses: Pi, Claude Code, Codex, or OpenCode.
-From the target Herdr pane, run the matching root setup command:
-  node "$BAA_TON_DIR/packages/herdr-tools/root-setup.mjs" --harness claude
-  (use codex, opencode, or pi as appropriate)
-
-Follow the helper's harness-specific instructions to load or register the Herdr
-bridge, keeping the harness in this same Herdr pane so its identity is preserved.
-Then call herdr_bootstrap_root once, verify the root briefing, and initialize the
-parent goal before using herdr_plan and herdr_dispatch. Do not reset an existing
-root unless the pane and checkout are intentionally being replaced.
+Read BAA.md in the checkout for the operating contract. Keep the harness in this
+pane so its Herdr identity is preserved. Never reset an existing root unless the
+pane and checkout are intentionally being replaced.
 EOF
 )
 

@@ -12,18 +12,6 @@ const toolsDirectory = dirname(fileURLToPath(import.meta.url));
 const bridge = resolve(join(toolsDirectory, "mcp-server.mjs"));
 const extension = resolve(join(toolsDirectory, "index.ts"));
 const harnesses = new Set(["claude", "codex", "opencode", "pi"]);
-// Keep this text aligned with the non-Pi bridge bootstrap response. It is
-// duplicated rather than importing mcp-server.mjs because importing the bridge
-// starts its stdio server and loads the Pi extension.
-const ROOT_BRIEFING = [
-  "ROOT BRIEFING",
-  "You are the sole Baa-ton parent executor. The durable manifest is authoritative; inspect it before making workflow decisions.",
-  "Delegate only with herdr_plan, then herdr_dispatch. Every child is a new Herdr-created session; never create Pi subagents, background jobs, or detached work.",
-  "Treat child lifecycle, parent-question-required, parent-approval-required, and blocker records as durable signals. Children persist requests and Herdr wakes the root; do not poll or ask the user to operate a child pane or Pi goal UI. Persist a truthful goal state when waiting, blocked, paused, or complete.",
-  "Push, merge, PR, deploy, production mutation, and Herdr resource closure require explicit user approval. Close only extension-owned resources with evidence.",
-  "herdr_sweep is dry-run by default and execute=true requires native TUI confirmation. A headless Codex/MCP root must show the exact dry-run inventory and ask the user directly; chat approval does not bypass the guard, so use a TUI-capable root or only the exact approved manual cleanup and never claim cleanup completed when confirmation is unavailable.",
-].join("\n");
-
 function usage() {
   return `Usage: node ${join(toolsDirectory, "root-setup.mjs")} --harness claude|codex|opencode|pi [--write]\n\nDefault behavior prints commands and configuration only. --write writes only the selected harness' normal local configuration: .mcp.json for Claude, ~/.codex/config.toml for Codex (when it does not already exist), or opencode.json for OpenCode. Pi has no file write path; load the extension when starting Pi.`;
 }
@@ -90,42 +78,43 @@ function opencodeConfig(identity) {
 }
 
 function printInstructions(harness, identity) {
-  console.log(ROOT_BRIEFING);
-  console.log("");
-  console.log(`Current pane identity used by this setup: ${JSON.stringify(identity)}`);
+  const harnessLabel = {
+    claude: "Claude Code",
+    codex: "Codex",
+    opencode: "OpenCode",
+    pi: "Pi",
+  }[harness] ?? harness;
+  console.log("Baa-ton root setup");
+  console.log(`Current Herdr pane: workspace=${identity.HERDR_WORKSPACE_ID}, pane=${identity.HERDR_PANE_ID}`);
   for (const warning of identityWarnings(identity)) console.log(`WARNING: ${warning}`);
   console.log("");
-  console.log(`Harness setup (${harness}):`);
+  console.log(`Harness: ${harnessLabel}`);
+  console.log("1. Apply this one-time integration:");
   console.log(`  ${exportCommand(identity)}`);
   if (harness === "claude") {
-    console.log("  # Claude's MCP child inherits the environment of this pane.");
     console.log(
       `  claude mcp add --transport stdio herdr-orchestrator -- node ${shellQuote(bridge)}`,
     );
-    console.log("  claude");
   } else if (harness === "codex") {
-    console.log("  # Codex MCP children do not inherit pane identity; persist every key explicitly.");
-    console.log(`  codex mcp add herdr-orchestrator \\\n  ${explicitEnv(identity)} \\\n  -- node ${shellQuote(bridge)}`);
-    console.log("  codex");
+    console.log([
+      `  codex mcp add herdr-orchestrator \\`,
+      `  ${explicitEnv(identity)} \\`,
+      `  -- node ${shellQuote(bridge)}`,
+    ].join("\n"));
   } else if (harness === "opencode") {
-    console.log("  # Merge this project-local snippet into opencode.json, then restart OpenCode:");
-    console.log("  ");
+    console.log("Merge this project-local MCP entry into opencode.json, then restart OpenCode:");
     console.log(opencodeConfig(identity));
-    console.log("  opencode");
   } else {
-    console.log("  # Pi uses the extension directly; no MCP registration is needed:");
-    console.log(`  pi --extension ${shellQuote(extension)}`);
-    console.log("  # In Pi, call herdr_bootstrap_root, then initialize the parent goal.");
+    console.log(`Pi is already wired through the installed extension: ${shellQuote(extension)}`);
   }
   console.log("");
-  console.log("Environment flow:");
-  console.log(
-    harness === "codex"
-      ? "  Codex receives HERDR_ENV, HERDR_WORKSPACE_ID, HERDR_PANE_ID, and HERDR_PLUGIN_CONFIG_DIR in its MCP server configuration."
-      : "  The harness and its MCP/extension process inherit the current pane's Herdr identity; keep the harness in this pane.",
-  );
-  console.log("");
-  console.log("After starting the harness, explicitly call herdr_bootstrap_root before herdr_goal or herdr_plan.");
+  if (harness === "pi")
+    console.log("2. Call herdr_bootstrap_root in this session.");
+  else {
+    console.log(`2. Restart ${harnessLabel} in this same Herdr pane so the connection loads.`);
+    console.log("3. Call herdr_bootstrap_root in the restarted session.");
+  }
+  console.log("After bootstrap succeeds, report the root identity and wait for the user's task. Do not initialize a goal during setup.");
 }
 
 async function ensureRegularFile(path) {
