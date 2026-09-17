@@ -19,7 +19,6 @@ import {
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { spawn } from "node:child_process";
 import { Value } from "typebox/value";
 import { Type } from "typebox";
 import {
@@ -36,6 +35,7 @@ import {
   updateMessage,
 } from "./inbox/index.mjs";
 import { resolveHerdrIdentity } from "./live-identity.mjs";
+import { liveHerdrAgentList } from "./live-herdr.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -82,7 +82,6 @@ const modelRegistry = new ModelRegistry(modelRuntime);
 const tools = new Map();
 const lifecycleHandlers = new Map();
 const activeRequests = new Map();
-const HERDR_IDENTITY_TIMEOUT_MS = 35_000;
 extension.default({
   on(event, handler) {
     if (typeof event !== "string" || typeof handler !== "function") return;
@@ -137,56 +136,6 @@ extension.default({
   },
   sendMessage() {},
 });
-
-async function liveHerdrAgentList() {
-  const command = process.platform === "win32" ? "herdr.cmd" : "herdr";
-  const result = await new Promise((resolveResult, reject) => {
-    const child = spawn(command, ["agent", "list"], {
-      cwd: process.cwd(),
-      env: process.env,
-      shell: process.platform === "win32",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      child.kill("SIGTERM");
-      reject(new Error("Timed out resolving the live Herdr agent identity."));
-    }, HERDR_IDENTITY_TIMEOUT_MS);
-    const finish = (callback) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      callback();
-    };
-    child.stdout.on("data", (chunk) => (stdout += chunk));
-    child.stderr.on("data", (chunk) => (stderr += chunk));
-    child.on("error", (error) =>
-      finish(() => reject(new Error(`Unable to list live Herdr agents: ${error.message}`))),
-    );
-    child.on("close", (code) =>
-      finish(() =>
-        code === 0
-          ? resolveResult(stdout)
-          : reject(
-              new Error(
-                `herdr agent list failed: ${(stderr || stdout).trim().slice(0, 2000)}`,
-              ),
-            ),
-      ),
-    );
-  });
-  try {
-    return JSON.parse(result);
-  } catch (error) {
-    throw new Error(
-      `herdr agent list returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-}
 
 async function refreshCurrentHerdrIdentity() {
   const identity = await resolveHerdrIdentity({

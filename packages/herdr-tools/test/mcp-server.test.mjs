@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, dirname, delimiter } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { HERDR_COMMAND, liveHerdrAgentList } from "../live-herdr.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const serverPath = join(here, "..", "mcp-server.mjs");
@@ -150,6 +151,32 @@ if (args[0] === "plugin" && args[1] === "config-dir") {
     },
   };
 }
+
+test("Windows live identity lookup uses an unqualified Herdr command for native and npm installs", async () => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = () => undefined;
+  let invocation;
+  const result = await liveHerdrAgentList({
+    platform: "win32",
+    spawnProcess: (command, args, options) => {
+      invocation = { command, args, options };
+      queueMicrotask(() => {
+        child.stdout.emit("data", JSON.stringify({ result: { agents: [] } }));
+        child.emit("close", 0);
+      });
+      return child;
+    },
+  });
+
+  assert.deepEqual(result, { result: { agents: [] } });
+  assert.equal(invocation.command, HERDR_COMMAND);
+  assert.equal(invocation.command, "herdr");
+  assert.deepEqual(invocation.args, ["agent", "list"]);
+  assert.equal(invocation.options.shell, true);
+  assert.equal(invocation.command.endsWith(".cmd"), false);
+});
 
 // Converts the audit's "MCP argument validation" fault probe (an action
 // outside the advertised herdr_goal enum was accepted rather than rejected)
