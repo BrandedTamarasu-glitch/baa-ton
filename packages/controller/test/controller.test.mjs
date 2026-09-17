@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import test from "node:test";
 import {
   ControllerError,
@@ -192,7 +192,10 @@ async function createFixture({
 
 async function startHerdrMock(respond) {
   const directory = await mkdtemp(join(tmpdir(), "herdr-controller-socket-"));
-  const socketPath = join(directory, "api.sock");
+  const socketPath =
+    process.platform === "win32"
+      ? `\\\\.\\pipe\\herdr-controller-test-${basename(directory)}`
+      : join(directory, "api.sock");
   const requests = [];
   const server = net.createServer((socket) => {
     let input = "";
@@ -414,7 +417,9 @@ test("manifest has the required ID, compatible version floor, and supported even
 });
 
 test("legacy v1 config migrates to one isolated orchestrator record", () => {
-  const manifestPath = "/tmp/shared/.pi/herdr-orchestrator/manifest.json";
+  const manifestPath = resolve(
+    "/tmp/shared/.pi/herdr-orchestrator/manifest.json",
+  );
   const secondChild = {
     lane_id: "lane-child-2",
     target: "bb029-reviewer",
@@ -1657,7 +1662,10 @@ async function startAmbiguousPromptMock() {
   const directory = await mkdtemp(
     join(tmpdir(), "herdr-controller-ambiguous-"),
   );
-  const socketPath = join(directory, "api.sock");
+  const socketPath =
+    process.platform === "win32"
+      ? `\\\\.\\pipe\\herdr-controller-ambiguous-${basename(directory)}`
+      : join(directory, "api.sock");
   let prompts = 0;
   const server = net.createServer((socket) => {
     let input = "";
