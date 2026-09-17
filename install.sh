@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Baa-ton installer — macOS, Linux, WSL.
 # Clones the repo, installs dependencies, links the Pi extension and the
-# Herdr controller plugin. Idempotent: safe to re-run to update.
+# Herdr controller plugin. Any qualified harness can host the root; non-Pi
+# harnesses use root-setup.mjs for MCP configuration.
 set -euo pipefail
 
 BAA_TON_DIR="${BAA_TON_DIR:-$HOME/.baa-ton}"
@@ -10,6 +11,26 @@ REPO="https://github.com/zachristmas/baa-ton"
 
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+copy_to_clipboard() {
+  local value="$1"
+  if command -v pbcopy >/dev/null 2>&1; then
+    printf '%s' "$value" | pbcopy && return 0
+  fi
+  if command -v wl-copy >/dev/null 2>&1; then
+    printf '%s' "$value" | wl-copy && return 0
+  fi
+  if command -v xclip >/dev/null 2>&1; then
+    printf '%s' "$value" | xclip -selection clipboard && return 0
+  fi
+  if command -v xsel >/dev/null 2>&1; then
+    printf '%s' "$value" | xsel --clipboard --input && return 0
+  fi
+  if command -v clip.exe >/dev/null 2>&1; then
+    printf '%s' "$value" | clip.exe && return 0
+  fi
+  return 1
+}
 
 command -v git >/dev/null 2>&1 || die "git is required (https://git-scm.com)"
 command -v node >/dev/null 2>&1 || die "Node.js 20+ is required (https://nodejs.org)"
@@ -52,5 +73,28 @@ else
   printf '      herdr plugin link "%s/packages/controller"\n' "$BAA_TON_DIR"
 fi
 
-say "Done. Next: run pi inside a Herdr pane, call herdr_bootstrap_root once,"
-say "then herdr_plan -> herdr_dispatch."
+root_prompt=$(cat <<EOF
+Set up Baa-ton as the root for this Herdr pane.
+
+The Baa-ton checkout is at:
+$BAA_TON_DIR
+
+I am using one of the supported harnesses: Pi, Claude Code, Codex, or OpenCode.
+Determine the current harness and run the matching command from this Herdr pane:
+  node "$BAA_TON_DIR/packages/herdr-tools/root-setup.mjs" --harness claude
+  (use codex, opencode, or pi as appropriate)
+
+Follow the helper's harness-specific instructions to load or register the Herdr
+bridge, keeping the harness in this same Herdr pane so its identity is preserved.
+Then call herdr_bootstrap_root once, verify the root briefing, and initialize the
+parent goal before using herdr_plan and herdr_dispatch. Do not reset an existing
+root unless the pane and checkout are intentionally being replaced.
+EOF
+)
+
+if copy_to_clipboard "$root_prompt"; then
+  say "Done. A ready-to-paste root setup instruction was copied to the clipboard."
+else
+  say "Done. No clipboard utility was found; use this root setup instruction:"
+fi
+printf '%s\n' "$root_prompt"

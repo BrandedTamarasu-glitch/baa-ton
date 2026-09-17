@@ -29,7 +29,10 @@ irm https://raw.githubusercontent.com/zachristmas/baa-ton/main/install.ps1 | iex
 curl -fsSL https://raw.githubusercontent.com/zachristmas/baa-ton/main/install.cmd -o install.cmd && install.cmd && del install.cmd
 ```
 
-The script clones to `~/.baa-ton` (override with `BAA_TON_DIR`), installs dependencies, links the Pi extension, and links the Herdr controller plugin when the Herdr CLI is present. Idempotent — re-run to update.
+The script clones to `~/.baa-ton` (override with `BAA_TON_DIR`), installs dependencies,
+links the Pi extension, and links the Herdr controller plugin when the Herdr CLI is
+present. It also prints—and copies when the platform clipboard is available—a ready-to-paste
+root setup instruction. Idempotent — re-run to update.
 
 **Or as a Pi package** (extension only, no controller): `pi install git:github.com/zachristmas/baa-ton`
 
@@ -42,10 +45,13 @@ ln -s "$PWD/packages/herdr-tools" ~/.pi/agent/extensions/herdr-orchestrator
 herdr plugin link "$PWD/packages/controller"
 ```
 
-You'll need [Herdr](https://github.com/herdrdev/herdr) 0.9+, Node.js 20+, and a
-Pi session running inside a Herdr pane (that's the root host). From that pane, call
-`herdr_bootstrap_root` once to claim the root, then `herdr_plan` → `herdr_dispatch` to
-delegate. Full details: [workflow tools](packages/herdr-tools/README.md) ·
+You'll need [Herdr](https://github.com/herdrdev/herdr) 0.9+, Node.js 20+, and one of the
+qualified harnesses—Pi, Claude Code, Codex, or OpenCode—running inside a Herdr pane.
+The installer wires Pi directly; paste its setup instruction into the harness you want
+to host the root, or use the [root setup helper](packages/herdr-tools/README.md#any-harness-as-root)
+for Claude Code, Codex, or OpenCode. From that pane, call `herdr_bootstrap_root` once to
+claim the root, then `herdr_plan` → `herdr_dispatch` to delegate. Full details:
+[workflow tools](packages/herdr-tools/README.md) ·
 [event controller](packages/controller/README.md).
 
 **Run the tests** (harness CLIs on `PATH` required for adapter tests):

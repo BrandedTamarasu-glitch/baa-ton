@@ -1,6 +1,7 @@
 # Baa-ton installer — Windows PowerShell.
 # Clones the repo, installs dependencies, links the Pi extension (junction)
-# and the Herdr controller plugin. Idempotent: safe to re-run to update.
+# and the Herdr controller plugin. Any qualified harness can host the root;
+# non-Pi harnesses use root-setup.mjs for MCP configuration.
 $ErrorActionPreference = "Stop"
 
 $BaaTonDir = if ($env:BAA_TON_DIR) { $env:BAA_TON_DIR } else { Join-Path $HOME ".baa-ton" }
@@ -61,5 +62,35 @@ if (Get-Command herdr -ErrorAction SilentlyContinue) {
   Say "  herdr plugin link `"$(Join-Path $BaaTonDir 'packages\controller')`""
 }
 
-Say "Done. Next: run pi inside a Herdr pane, call herdr_bootstrap_root once,"
-Say "then herdr_plan -> herdr_dispatch."
+$rootPrompt = @"
+Set up Baa-ton as the root for this Herdr pane.
+
+The Baa-ton checkout is at:
+$BaaTonDir
+
+I am using one of the supported harnesses: Pi, Claude Code, Codex, or OpenCode.
+Determine the current harness and run the matching command from this Herdr pane:
+  node "$BaaTonDir\packages\herdr-tools\root-setup.mjs" --harness claude
+  (use codex, opencode, or pi as appropriate)
+
+Follow the helper's harness-specific instructions to load or register the Herdr
+bridge, keeping the harness in this same Herdr pane so its identity is preserved.
+Then call herdr_bootstrap_root once, verify the root briefing, and initialize the
+parent goal before using herdr_plan and herdr_dispatch. Do not reset an existing
+root unless the pane and checkout are intentionally being replaced.
+"@
+
+$clipboardCopied = $false
+try {
+  Set-Clipboard -Value $rootPrompt
+  $clipboardCopied = $true
+} catch {
+  $clipboardCopied = $false
+}
+
+if ($clipboardCopied) {
+  Say "Done. A ready-to-paste root setup instruction was copied to the clipboard."
+} else {
+  Say "Done. Clipboard copy was unavailable; use this root setup instruction:"
+}
+Write-Host $rootPrompt
