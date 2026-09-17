@@ -75,7 +75,7 @@ if ($piItem) {
     }
     if ($targetMatches) {
       Say "Removing the Pi extension junction"
-      Remove-Item -Force -LiteralPath $PiLink
+      $piItem.Delete()
     } else {
       Say "Pi extension link points elsewhere; leaving it alone: $PiLink"
     }
