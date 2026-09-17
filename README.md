@@ -1,7 +1,7 @@
 # Baa-ton
 
 <p align="center">
-  <img src="assets/mascot.png" alt="Nala, the Baa-ton dog" width="320" height="320">
+  <img src="assets/mascot.png?v=3761159" alt="Nala, the Baa-ton dog" width="320" height="320">
 </p>
 
 <pre align="center">───────────────────🐕  🐑  🐑  🐑  🐑  🐑  🐑──────────────────</pre>
