@@ -26,7 +26,7 @@ Windows CMD:
 curl -fsSL https://raw.githubusercontent.com/zachristmas/baa-ton/main/install.cmd -o install.cmd && install.cmd && del install.cmd
 ```
 
-The installer clones to `~/.baa-ton` (override with `BAA_TON_DIR`), installs dependencies, links the Pi extension, and registers the Herdr controller when available. It also copies one ready-to-paste root setup prompt. Re-running it updates the checkout.
+Run the installer from the project directory you want to use. It clones to `~/.baa-ton` (override with `BAA_TON_DIR`), installs dependencies, links the Pi extension, registers the Herdr controller when available, and runs the harness-selection wizard for that project. It also copies one ready-to-paste root setup prompt. Re-running it updates the checkout and reruns the wizard.
 
 Uninstall:
 
@@ -38,7 +38,7 @@ On Windows, run `uninstall.ps1` or `uninstall.cmd`. The uninstaller removes only
 
 ## Set up a root
 
-Paste the installer’s prompt into the harness running in the target Herdr pane. It identifies the current harness, runs the matching root setup, handles the one-time MCP/extension connection, and tells the harness to restart only when needed. After restart, it calls `herdr_bootstrap_root` and waits for your task.
+After the installer finishes, paste its prompt into the harness running in the target Herdr pane. The project wizard has already run; the prompt identifies the current harness, runs the matching root setup, handles the one-time MCP/extension connection, and tells the harness to restart only when needed. After restart, it calls `herdr_bootstrap_root` and waits for your task.
 
 ```sh
 node ~/.baa-ton/packages/herdr-tools/root-setup.mjs --harness claude
@@ -47,9 +47,9 @@ node ~/.baa-ton/packages/herdr-tools/root-setup.mjs --harness claude
 
 The root setup helper prints the exact integration command for the current pane. Keep the harness in that pane so Herdr identity is preserved. The root should report its workspace and pane, then wait; initialize a parent goal only after you provide the actual objective.
 
-## Optional project setup
+## Re-run project setup
 
-Skip this for normal root setup. Use it only for checkbox-selected harness references, `.baa-ton/config.json`, or customized task-profile metadata.
+If you installed from the wrong directory or want to change harness selections, run the same wizard manually from the project root:
 
 macOS, Linux, and WSL:
 

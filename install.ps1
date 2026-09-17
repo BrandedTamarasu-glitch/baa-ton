@@ -62,11 +62,21 @@ if (Get-Command herdr -ErrorAction SilentlyContinue) {
   Say "  herdr plugin link `"$(Join-Path $BaaTonDir 'packages\controller')`""
 }
 
+$ProjectRoot = $PWD.Path
+Say "Running the Baa-ton project wizard in $ProjectRoot"
+& node (Join-Path $BaaTonDir "packages\herdr-tools\setup.mjs") --project-root $ProjectRoot
+if ($LASTEXITCODE -ne 0) {
+  throw "Baa-ton project setup failed with exit code $LASTEXITCODE"
+}
+
 $rootPrompt = @"
 Set up Baa-ton as the root for this Herdr pane.
 
 The Baa-ton checkout is at:
 $BaaTonDir
+
+The installer has already run the harness-selection wizard for the project
+directory where it was launched. Do not ask me to run setup.mjs again.
 
 Do this in order:
 1. Confirm this is a Herdr pane and identify the current harness: Pi, Claude Code, Codex, or OpenCode.

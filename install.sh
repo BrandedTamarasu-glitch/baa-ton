@@ -73,11 +73,21 @@ else
   printf '      herdr plugin link "%s/packages/controller"\n' "$BAA_TON_DIR"
 fi
 
+say "Running the Baa-ton project wizard in $PWD"
+if [ -r /dev/tty ] && [ -t 1 ]; then
+  node "$BAA_TON_DIR/packages/herdr-tools/setup.mjs" --project-root "$PWD" < /dev/tty
+else
+  node "$BAA_TON_DIR/packages/herdr-tools/setup.mjs" --project-root "$PWD" --non-interactive
+fi
+
 root_prompt=$(cat <<EOF
 Set up Baa-ton as the root for this Herdr pane.
 
 The Baa-ton checkout is at:
 $BAA_TON_DIR
+
+The installer has already run the harness-selection wizard for the project
+directory where it was launched. Do not ask me to run setup.mjs again.
 
 Do this in order:
 1. Confirm this is a Herdr pane and identify the current harness: Pi, Claude Code, Codex, or OpenCode.
