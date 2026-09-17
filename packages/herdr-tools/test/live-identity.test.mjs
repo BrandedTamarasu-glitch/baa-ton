@@ -153,9 +153,21 @@ test("a present but unregistered Claude session fails closed instead of using st
         HERDR_WORKSPACE_ID: "w-stale",
         CLAUDE_CODE_SESSION_ID: "missing-session",
       },
+      currentProcessPids: [999999, 77640],
+      currentCwd: "C:\\cic",
       listAgents: async () => ({ result: { agents: [] } }),
     }),
-    /not present in the live Herdr agent list/,
+    (error) => {
+      assert.match(error.message, /not present in the live Herdr agent list/);
+      assert.match(error.message, /mcp_pid=\d+/);
+      assert.match(error.message, /mcp_ppid=\d+/);
+      assert.match(error.message, /lookup_pids=999999,77640/);
+      assert.match(error.message, /cwd=C:\\cic/);
+      assert.match(error.message, /claude_candidates=0/);
+      assert.match(error.message, /pid_matches=0/);
+      assert.match(error.message, /session_matches=0/);
+      return true;
+    },
   );
 });
 

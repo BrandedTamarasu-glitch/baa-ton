@@ -232,7 +232,13 @@ export async function resolveHerdrIdentity({
     return fallback;
   if (sessionMatches.length === 0)
     throw new Error(
-      `Claude session ${sessionId} is not present in the live Herdr agent list.`,
+      `Claude session ${sessionId} is not present in the live Herdr agent list ` +
+        `(mcp_pid=${process.pid}, mcp_ppid=${process.ppid}, ` +
+        `lookup_pids=${currentProcessPids.join(",") || "<none>"}, ` +
+        `cwd=${currentCwd ?? "<unset>"}, ` +
+        `claude_candidates=${candidates.length}, ` +
+        `pid_matches=${processMatches.length}, ` +
+        `session_matches=${sessionMatches.length}).`,
     );
   throw new Error(`Unable to resolve Claude session ${sessionId}.`);
 }
