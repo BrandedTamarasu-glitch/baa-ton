@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { resolveHerdrIdentity } from "../live-identity.mjs";
+import {
+  applyHerdrIdentity,
+  clearAppliedHerdrIdentity,
+  currentAppliedHerdrIdentity,
+  resolveHerdrIdentity,
+} from "../live-identity.mjs";
 
 test("live Claude session identity overrides a stale project-scoped environment snapshot", async () => {
   let listCalls = 0;
@@ -75,4 +80,25 @@ test("a present but unregistered Claude session fails closed instead of using st
     }),
     /not present in the live Herdr agent list/,
   );
+});
+
+test("the bridge-applied identity is reusable only within the matching live session", () => {
+  const env = {
+    CLAUDE_CODE_SESSION_ID: "claude-session-live",
+    HERDR_PANE_ID: "w-stale:old",
+    HERDR_WORKSPACE_ID: "w-stale",
+  };
+  applyHerdrIdentity(env, {
+    paneId: "w-live:current",
+    workspaceId: "w-live",
+  });
+
+  assert.deepEqual(currentAppliedHerdrIdentity(env), {
+    paneId: "w-live:current",
+    workspaceId: "w-live",
+  });
+  env.CLAUDE_CODE_SESSION_ID = "a-different-session";
+  assert.equal(currentAppliedHerdrIdentity(env), undefined);
+  clearAppliedHerdrIdentity(env);
+  assert.equal(currentAppliedHerdrIdentity(env), undefined);
 });

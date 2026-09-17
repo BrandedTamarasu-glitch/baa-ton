@@ -91,7 +91,11 @@ import {
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { acknowledgeActivation } from "./activation-ack.mjs";
 import { resolveTaskProfile } from "./profile-config.mjs";
-import { resolveHerdrIdentity } from "./live-identity.mjs";
+import {
+  applyHerdrIdentity,
+  currentAppliedHerdrIdentity,
+  resolveHerdrIdentity,
+} from "./live-identity.mjs";
 
 // routeChildMessage lives in the controller package, which is a sibling of
 // this package inside the baa-ton checkout. Pi may load this extension
@@ -2980,13 +2984,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   async function refreshHerdrIdentity(
     signal?: AbortSignal,
   ): Promise<{ paneId?: string; workspaceId?: string }> {
-    const identity = await resolveHerdrIdentity({
-      env: process.env,
-      listAgents: () => runHerdr(["agent", "list"], signal),
-    });
-    if (identity.paneId) process.env[HERDR_PANE_ID_ENV] = identity.paneId;
-    if (identity.workspaceId)
-      process.env.HERDR_WORKSPACE_ID = identity.workspaceId;
+    const identity =
+      currentAppliedHerdrIdentity() ??
+      (await resolveHerdrIdentity({
+        env: process.env,
+        listAgents: () => runHerdr(["agent", "list"], signal),
+      }));
+    applyHerdrIdentity(process.env, identity);
     return identity;
   }
 

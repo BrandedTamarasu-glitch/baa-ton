@@ -27,6 +27,45 @@ function staticIdentity(env) {
   };
 }
 
+const LIVE_SESSION_ENV = "BAA_TON_LIVE_IDENTITY_SESSION_ID";
+const LIVE_PANE_ENV = "BAA_TON_LIVE_IDENTITY_PANE_ID";
+const LIVE_WORKSPACE_ENV = "BAA_TON_LIVE_IDENTITY_WORKSPACE_ID";
+
+/**
+ * Publish a live identity for the current MCP request. These private
+ * process-local markers let the MCP bridge and the Jiti-loaded extension use
+ * the same lookup result without making two independent Herdr calls.
+ */
+export function applyHerdrIdentity(env, identity) {
+  if (identity.paneId !== undefined) env.HERDR_PANE_ID = identity.paneId;
+  if (identity.workspaceId !== undefined)
+    env.HERDR_WORKSPACE_ID = identity.workspaceId;
+  const sessionId = nonEmptyString(env.CLAUDE_CODE_SESSION_ID);
+  if (sessionId && identity.paneId && identity.workspaceId) {
+    env[LIVE_SESSION_ENV] = sessionId;
+    env[LIVE_PANE_ENV] = identity.paneId;
+    env[LIVE_WORKSPACE_ENV] = identity.workspaceId;
+  } else {
+    delete env[LIVE_SESSION_ENV];
+    delete env[LIVE_PANE_ENV];
+    delete env[LIVE_WORKSPACE_ENV];
+  }
+}
+
+export function currentAppliedHerdrIdentity(env = process.env) {
+  const sessionId = nonEmptyString(env.CLAUDE_CODE_SESSION_ID);
+  if (!sessionId || env[LIVE_SESSION_ENV] !== sessionId) return undefined;
+  const paneId = nonEmptyString(env[LIVE_PANE_ENV]);
+  const workspaceId = nonEmptyString(env[LIVE_WORKSPACE_ENV]);
+  return paneId && workspaceId ? { paneId, workspaceId } : undefined;
+}
+
+export function clearAppliedHerdrIdentity(env = process.env) {
+  delete env[LIVE_SESSION_ENV];
+  delete env[LIVE_PANE_ENV];
+  delete env[LIVE_WORKSPACE_ENV];
+}
+
 function agentListFromPayload(payload) {
   const result = isRecord(payload?.result) ? payload.result : payload;
   return isRecord(result) && Array.isArray(result.agents) ? result.agents : [];
