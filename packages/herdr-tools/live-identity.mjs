@@ -244,6 +244,8 @@ export async function resolveHerdrIdentity({
     );
 
   const agents = agentListFromPayload(await listAgents());
+  if (process.env.BAA_DEBUG_WINDOWS_MCP)
+    console.error("live-identity agents", agents.length);
   // Do not use cwd as a candidate filter. Claude may launch a project-scoped
   // MCP server from the server package directory instead of the project cwd;
   // the MCP/Claude PID is still an unambiguous pane anchor. Cwd is only a
@@ -261,6 +263,12 @@ export async function resolveHerdrIdentity({
     getParentPid,
     maxProcessAncestorDepth,
   });
+  if (process.env.BAA_DEBUG_WINDOWS_MCP)
+    console.error(
+      "live-identity process lookup",
+      [...processLookup.lookupPids].join(","),
+      processLookup.matches.length,
+    );
   const processMatches = processLookup.matches;
   if (processMatches.length === 1) return agentIdentity(processMatches[0]);
   if (processMatches.length > 1) {
@@ -278,6 +286,8 @@ export async function resolveHerdrIdentity({
       isRecord(agent.agent_session) &&
       nonEmptyString(agent.agent_session.value) === sessionId,
   );
+  if (process.env.BAA_DEBUG_WINDOWS_MCP)
+    console.error("live-identity session matches", sessionMatches.length);
   if (sessionMatches.length === 1) return agentIdentity(sessionMatches[0]);
   if (sessionMatches.length > 1)
     throw new Error(
