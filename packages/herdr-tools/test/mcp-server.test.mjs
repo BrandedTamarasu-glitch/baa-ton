@@ -73,7 +73,13 @@ async function rootBridgeFixture() {
     binDir,
     process.platform === "win32" ? "herdr.cmd" : "herdr",
   );
-  const herdrScript = join(binDir, "herdr.mjs");
+  // The Windows wrapper invokes this fixture with Node directly. Keep the
+  // CommonJS source in a .cjs file there; Node treats .mjs as ESM and would
+  // reject the fixture's require("node:fs") before Herdr can answer.
+  const herdrScript = join(
+    binDir,
+    process.platform === "win32" ? "herdr.cjs" : "herdr.mjs",
+  );
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
   await mkdir(cwd, { recursive: true });
   await mkdir(binDir, { recursive: true, mode: 0o700 });
@@ -146,7 +152,7 @@ if (args[0] === "plugin" && args[1] === "config-dir") {
 `;
   if (process.platform === "win32") {
     await writeFile(herdrScript, script);
-    await writeFile(herdr, `@echo off\r\nnode "%~dp0herdr.mjs" %*\r\n`);
+    await writeFile(herdr, `@echo off\r\nnode "%~dp0herdr.cjs" %*\r\n`);
   } else {
     await writeFile(herdr, `#!/usr/bin/env node\n${script}`, { mode: 0o755 });
   }
