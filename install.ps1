@@ -66,23 +66,19 @@ if (Get-Command herdr -ErrorAction SilentlyContinue) {
 $ProjectRoot = $PWD.Path
 Say "Running the Baa-ton project wizard in $ProjectRoot"
 & node (Join-Path $BaaTonDir "packages\herdr-tools\install-tui.mjs") --project-root $ProjectRoot --prompt-project --quiet
-if ($LASTEXITCODE -ne 0) {
+if ($LASTEXITCODE -eq 130) {
+  Say "Setup cancelled; nothing was written."
+  exit 130
+} elseif ($LASTEXITCODE -ne 0) {
   throw "Baa-ton project setup failed with exit code $LASTEXITCODE"
 }
 
 $rootPrompt = @"
 Finish Baa-ton root setup in this Herdr pane.
 
-The installer already configured the selected project and installed the
-project-local baa-ton-start skill for the selected harnesses. Invoke that skill
-now. It must read BAA.md, complete the harness-specific connection, restart in
-this same Herdr pane only if required, call herdr_bootstrap_root, verify the root
-identity, and wait for my task.
+The installer already configured the selected project and installed the project-local baa-ton-start skill for the selected harnesses. Invoke that skill now. It must read BAA.md, complete the harness-specific connection, restart in this same Herdr pane only if required, call herdr_bootstrap_root, verify the root identity, and wait for my task.
 
-Do not ask me to run setup.mjs, initialize a goal, or provide an objective during
-setup. If the skill is unavailable, use the installed root-setup helper as the
-fallback. Never reset an existing root unless the pane and checkout are
-intentionally being replaced.
+Do not ask me to run setup.mjs, initialize a goal, or provide an objective during setup. If the skill is unavailable, use the installed root-setup helper as the fallback. Never reset an existing root unless the pane and checkout are intentionally being replaced.
 "@
 
 $clipboardCopied = $false

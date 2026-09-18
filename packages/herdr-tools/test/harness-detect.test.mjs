@@ -148,6 +148,27 @@ test("readOpencodeDefaults prefers a declared model over last-used state", async
   }
 });
 
+test("readOpencodeDefaults tolerates a // inside a string value (e.g. a $schema URL) and a real line comment", async () => {
+  const configDir = await mkdtemp(join(tmpdir(), "opencode-config-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "opencode-state-"));
+  try {
+    const fs = await import("node:fs/promises");
+    // Real bug: a naive /\/\/.*$/ regex treats the // in "https://..." as a
+    // comment start and deletes the rest of the line, including the closing
+    // quote, corrupting the JSON. This fixture has both a genuine // line
+    // comment and a $schema URL on the very next line, matching the file
+    // that actually broke this in practice.
+    await fs.copyFile(join(fixtures, "opencode-with-schema.jsonc"), join(configDir, "opencode.jsonc"));
+    const result = readOpencodeDefaults({ configDirectory: configDir, stateDirectory: stateDir, execFileSyncImpl: throwingExec });
+    assert.equal(result.defaultModel, "openai/gpt-5.6-luna");
+    assert.equal(result.source, "file");
+    assert.ok(!result.warnings.some((warning) => warning.includes("Could not read")));
+  } finally {
+    await rm(configDir, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("readOpencodeDefaults falls back to the most-recent openai/* entry in model.json, with a warning", async () => {
   const configDir = await mkdtemp(join(tmpdir(), "opencode-config-"));
   const stateDir = await mkdtemp(join(tmpdir(), "opencode-state-"));

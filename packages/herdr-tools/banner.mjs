@@ -2,17 +2,22 @@
  * Baa-ton ASCII banner, shared between install.sh, install.ps1, and
  * install-tui.mjs so it is defined in exactly one place.
  */
+import { bold, brightCyan, brightMagenta, gray } from "./theme.mjs";
 
-export const BANNER_LINES = [
+const LOGO_LINES = [
   ",-----.    ,---.    ,---.         ,--------. ,-----. ,--.  ,--.",
   "|  |) /_  /  O  \\  /  O  \\ ,-----.'--.  .--''  .-.  '|  ,'.|  |",
   "|  .-.  \\|  .-.  ||  .-.  |'-----'   |  |   |  | |  ||  |' '  |",
   "|  '--' /|  | |  ||  | |  |          |  |   '  '-'  '|  | `   |",
   "`------' `--' `--'`--' `--'          `--'    `-----' `--'  `--'",
+];
+
+export const BANNER_LINES = [
+  ...LOGO_LINES.map((line) => brightCyan(line)),
   "",
-  "───────────────────🐕  🐑  🐑  🐑  🐑  🐑  🐑──────────────────",
+  `${gray("───────────────────")}🐕  🐑  🐑  🐑  🐑  🐑  🐑${gray("──────────────────")}`,
   "",
-  "                 your agent herd is ready",
+  bold(brightMagenta("                 your agent herd is ready")),
 ];
 
 export const BANNER_LINES_ASCII = [

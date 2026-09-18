@@ -26,6 +26,64 @@ function stripTrailingBracket(id) {
   return typeof id === "string" ? id.replace(/\s*\[1m\]\s*$/, "").trim() : id;
 }
 
+/**
+ * Strip // and /* *\/ comments from JSONC text without touching // that
+ * appears inside a string value (e.g. a "https://..." URL). A naive
+ * /\/\/.*$/ regex treats that in-string // as a comment start and deletes
+ * the rest of the line, including the closing quote, corrupting the JSON.
+ */
+function stripJsonComments(text) {
+  let result = "";
+  let inString = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (inLineComment) {
+      if (ch === "\n") {
+        inLineComment = false;
+        result += ch;
+      }
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === "*" && next === "/") {
+        inBlockComment = false;
+        i += 1;
+      }
+      continue;
+    }
+    if (inString) {
+      result += ch;
+      if (ch === "\\") {
+        result += next ?? "";
+        i += 1;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      result += ch;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      inLineComment = true;
+      i += 1;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      inBlockComment = true;
+      i += 1;
+      continue;
+    }
+    result += ch;
+  }
+  return result;
+}
+
 // ---------------------------------------------------------------------------
 // Claude
 // ---------------------------------------------------------------------------
@@ -40,10 +98,15 @@ export function readClaudeDefaults({ settingsPath, catalogPath } = {}) {
     result.warnings.push(`Could not read harness catalog: ${error instanceof Error ? error.message : String(error)}`);
     return result;
   }
-  result.catalog = (catalogEntry.models ?? []).map((id) => ({
-    id,
-    label: id,
+  result.catalog = (catalogEntry.models ?? []).map((entry) => ({
+    id: entry.id,
+    label: entry.id,
     thinkingLevels: catalogEntry.thinkingLevels ?? [],
+    // Explicit, hand-curated (this is a static maintained list, not a live
+    // pull) -- see profile-defaults.mjs's modelForProfile, which prefers
+    // this over its priority-based inference (built for volatile live
+    // catalogs like Codex's, where no one can hand-curate).
+    tier: entry.tier,
   }));
 
   const path = settingsPath ?? join(homedir(), ".claude", "settings.json");
@@ -60,7 +123,7 @@ export function readClaudeDefaults({ settingsPath, catalogPath } = {}) {
   }
   const alias = stripTrailingBracket(settings.model);
   if (alias) {
-    const resolved = catalogEntry.aliases?.[alias] ?? (catalogEntry.models?.includes(alias) ? alias : undefined);
+    const resolved = catalogEntry.aliases?.[alias] ?? (catalogEntry.models?.some((entry) => entry.id === alias) ? alias : undefined);
     if (resolved) {
       result.defaultModel = resolved;
       result.source = "file";
@@ -99,11 +162,27 @@ function readSimpleToml(text) {
 }
 
 function codexCatalogFromModels(models) {
-  return (models ?? []).map((model) => ({
-    id: model.slug,
-    label: model.display_name ?? model.slug,
-    thinkingLevels: (model.supported_reasoning_levels ?? []).map((level) => level.effort),
-  }));
+  return (models ?? []).map((model) => {
+    const entry = {
+      id: model.slug,
+      label: model.display_name ?? model.slug,
+      thinkingLevels: (model.supported_reasoning_levels ?? []).map((level) => level.effort),
+    };
+    // Preserved (only when actually present) so profile-defaults.mjs can
+    // rank models into frontier/build/cheap tiers without hardcoding a
+    // model name; absent for any harness catalog that doesn't carry a live
+    // rank, or a source (e.g. the models_cache.json fallback) that lacks it.
+    if (typeof model.priority === "number") entry.priority = model.priority;
+    if (model.visibility !== undefined) entry.visibility = model.visibility;
+    // `priority` alone is not a reliable tier signal: a live pull can omit
+    // a model entirely between calls and shift another's number (observed
+    // live, same session, 2026-09-18 -- gpt-6-astra vanished and gpt-5.6-sol
+    // moved from priority 1 to 4). description text calling a model out as
+    // legacy is a second, independent signal profile-defaults.mjs uses to
+    // exclude stale fallbacks from tier ranking.
+    if (typeof model.description === "string") entry.description = model.description;
+    return entry;
+  });
 }
 
 export function readCodexDefaults({ codexHome, execFileSyncImpl = execFileSync } = {}) {
@@ -246,7 +325,7 @@ export function readOpencodeDefaults({ configDirectory, stateDirectory, execFile
 
   if (configPath) {
     try {
-      const text = readFileSync(configPath, "utf8").replace(/\/\/.*$/gm, "");
+      const text = stripJsonComments(readFileSync(configPath, "utf8"));
       const config = JSON.parse(text);
       if (config.model) {
         result.defaultModel = config.model;

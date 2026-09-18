@@ -20,11 +20,11 @@ import {
   Input,
   Key,
   matchesKey,
+  SelectList,
   SettingsList,
   Text,
   truncateToWidth,
-  TruncatedText,
-  TuiMainScreen,
+  TuiAltScreen,
   ProcessTerminal,
 } from "@earendil-works/pi-tui";
 
@@ -42,8 +42,9 @@ import {
   checkoutDirectory,
 } from "./setup-core.mjs";
 import { readClaudeDefaults, readCodexDefaults, readPiDefaults, readOpencodeDefaults } from "./harness-detect.mjs";
-import { defaultLaunchProfiles } from "./profile-defaults.mjs";
+import { buildProfileTemplates, defaultLaunchProfiles } from "./profile-defaults.mjs";
 import { bannerLines, bannerText } from "./banner.mjs";
+import { bold, brightCyan, brightGreen, brightMagenta, dim, gray, green, yellow } from "./theme.mjs";
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const STEP_TITLES = [
@@ -53,17 +54,28 @@ const STEP_TITLES = [
   "Profile configuration",
   "Summary and confirm",
 ];
+const DIVIDER = "─".repeat(70);
+// Resolved value for a step's promise when the user asked to go back
+// (PageUp) instead of completing that step normally.
+const BACK = Symbol("wizard-back");
 
-function identity(text) {
-  return text;
-}
+const SETTINGS_THEME = {
+  label: (text, selected) => (selected ? bold(brightCyan(text)) : text),
+  value: (text, selected) => {
+    if (text === "unconfigured") return gray(text);
+    return selected ? bold(green(text)) : green(text);
+  },
+  description: (text) => dim(text),
+  cursor: brightCyan(">"),
+  hint: (text) => dim(text),
+};
 
-const PLAIN_SETTINGS_THEME = {
-  label: (text) => text,
-  value: (text) => text,
-  description: identity,
-  cursor: ">",
-  hint: identity,
+const SELECT_THEME = {
+  selectedPrefix: (text) => brightCyan(text),
+  selectedText: (text) => bold(brightCyan(text)),
+  description: (text) => dim(text),
+  scrollInfo: (text) => dim(text),
+  noMatch: (text) => dim(text),
 };
 
 export function usage() {
@@ -299,13 +311,16 @@ class Checklist {
 
   render(width) {
     const lines = this.items.map((item, index) => {
-      const mark = this.selected.has(item.id) ? "x" : " ";
-      const pointer = index === this.cursor ? ">" : " ";
-      const status = item.detected ? `detected: ${item.detected.version}` : "not detected";
-      return truncateToWidth(`${pointer} [${mark}] ${item.label} (${status})`, width);
+      const checked = this.selected.has(item.id);
+      const isCursor = index === this.cursor;
+      const pointer = isCursor ? brightCyan(">") : " ";
+      const mark = checked ? brightGreen("x") : " ";
+      const label = checked ? bold(item.label) : item.label;
+      const status = item.detected ? green(`detected: ${item.detected.version}`) : gray("not detected");
+      return truncateToWidth(`${pointer} [${mark}] ${label} (${status})`, width);
     });
     lines.push("");
-    lines.push(truncateToWidth("space: toggle   enter: confirm   esc/ctrl+c: quit without writing", width));
+    lines.push(dim(truncateToWidth("space: toggle   enter: confirm   esc/ctrl+c: quit without writing", width)));
     return lines;
   }
 }
@@ -314,20 +329,96 @@ function formatOption(harnessId, entry) {
   return `${harnessId}/${entry.model} (${entry.thinking})`;
 }
 
-function buildProfileOptions(selectedHarnessIds, detectionResults) {
-  const options = [];
-  for (const harnessId of selectedHarnessIds) {
-    const detection = detectionResults[harnessId];
-    if (!detection) continue;
-    const models = detection.catalog.length ? detection.catalog.map((entry) => entry.id) : detection.defaultModel ? [detection.defaultModel] : [];
-    for (const modelId of models) {
-      const catalogEntry = detection.catalog.find((entry) => entry.id === modelId);
-      const levels = catalogEntry?.thinkingLevels?.length ? catalogEntry.thinkingLevels : THINKING_LEVELS;
-      for (const thinking of levels) options.push(formatOption(harnessId, { model: modelId, thinking }));
-    }
+function availableModelsForHarness(detection) {
+  if (!detection) return [];
+  if (detection.catalog?.length) return detection.catalog;
+  if (detection.defaultModel) return [{ id: detection.defaultModel, label: detection.defaultModel, thinkingLevels: undefined }];
+  return [];
+}
+
+/**
+ * A single SettingsList submenu Component that drills down harness -> model
+ * -> thinking level, each stage filtered by the previous choice, instead of
+ * cycling through one flat list of every combination. Escape steps back one
+ * stage; Escape at the harness stage cancels the whole submenu (SettingsList's
+ * own done() semantics: called with no argument, it leaves the row unchanged).
+ */
+class ProfilePicker {
+  constructor({ selectedHarnessIds, detectionResults, harnessToProvider, done }) {
+    this.detectionResults = detectionResults;
+    this.harnessToProvider = harnessToProvider;
+    this.done = done;
+    this.harnessIds = selectedHarnessIds.filter((id) => availableModelsForHarness(detectionResults[id]).length > 0);
+    this.chosenHarness = undefined;
+    this.chosenModel = undefined;
+    this.current = this.buildHarnessStage();
   }
-  options.push("custom...");
-  return options;
+
+  buildHarnessStage() {
+    this.chosenHarness = undefined;
+    this.chosenModel = undefined;
+    const items = [
+      { value: "__unconfigured__", label: "Unconfigured", description: "fails closed at dispatch -- never invents a value" },
+      ...this.harnessIds.map((id) => {
+        const count = availableModelsForHarness(this.detectionResults[id]).length;
+        return { value: id, label: id, description: `${count} model(s) available` };
+      }),
+    ];
+    const list = new SelectList(items, Math.min(items.length, 8), SELECT_THEME);
+    list.onSelect = (item) => {
+      if (item.value === "__unconfigured__") {
+        this.done("unconfigured");
+        return;
+      }
+      this.chosenHarness = item.value;
+      this.current = this.buildModelStage();
+    };
+    list.onCancel = () => this.done();
+    return list;
+  }
+
+  buildModelStage() {
+    this.chosenModel = undefined;
+    const models = availableModelsForHarness(this.detectionResults[this.chosenHarness]);
+    const items = models.map((entry) => ({ value: entry.id, label: entry.label ?? entry.id }));
+    const list = new SelectList(items, Math.min(Math.max(items.length, 1), 8), SELECT_THEME);
+    list.onSelect = (item) => {
+      this.chosenModel = models.find((entry) => entry.id === item.value);
+      this.current = this.buildThinkingStage();
+    };
+    list.onCancel = () => {
+      this.current = this.buildHarnessStage();
+    };
+    return list;
+  }
+
+  buildThinkingStage() {
+    const levels = this.chosenModel.thinkingLevels?.length ? this.chosenModel.thinkingLevels : THINKING_LEVELS;
+    const items = levels.map((level) => ({ value: level, label: level }));
+    const list = new SelectList(items, Math.min(items.length, 8), SELECT_THEME);
+    list.onSelect = (item) => {
+      this.done(formatOption(this.chosenHarness, { model: this.chosenModel.id, thinking: item.value }));
+    };
+    list.onCancel = () => {
+      this.current = this.buildModelStage();
+    };
+    return list;
+  }
+
+  render(width) {
+    const provider = this.chosenHarness ? this.harnessToProvider[this.chosenHarness] : undefined;
+    const breadcrumb = [this.chosenHarness, provider, this.chosenModel?.id].filter(Boolean).join(bold(" -> "));
+    const title = breadcrumb ? `${bold("Choose:")} ${breadcrumb} -> ?` : bold("Choose a harness:");
+    return [title, "", ...this.current.render(width), "", dim("esc: back a step, or cancel from the harness list")];
+  }
+
+  handleInput(data) {
+    this.current.handleInput(data);
+  }
+
+  invalidate() {
+    this.current.invalidate();
+  }
 }
 
 function parseOption(value, harnessToProvider) {
@@ -344,15 +435,23 @@ async function runWizard(options) {
   if (!isRealTty || options.nonInteractive) return runNonInteractive(options);
 
   const terminal = new ProcessTerminal();
-  const tui = new TuiMainScreen(terminal);
+  // Alternate screen: takes over the terminal fully and restores whatever
+  // was on screen before (including scrollback from earlier commands) on
+  // exit, instead of TuiMainScreen's "render inline, keep history" mode.
+  const tui = new TuiAltScreen(terminal);
   const header = new Container();
   const body = new Container();
-  const footer = new TruncatedText("");
+  const footer = new Text("");
   for (const line of bannerLines()) header.addChild(new Text(line, 0, 0));
-  const stepLine = new TruncatedText("");
+  const stepLine = new Text("");
   header.addChild(stepLine);
+  // Plain-text dividers give the header/body/footer regions clear visual
+  // separation without relying on a Box background color (which could
+  // clash with the terminal's own light/dark theme).
+  header.addChild(new Text(gray(DIVIDER), 0, 0));
   tui.addChild(header);
   tui.addChild(body);
+  tui.addChild(new Text(gray(DIVIDER), 0, 0));
   tui.addChild(footer);
 
   let aborted = false;
@@ -360,13 +459,28 @@ async function runWizard(options) {
     aborted = true;
     tui.stop();
   };
+  // Set by whichever step is currently awaiting input, to its own
+  // resolvePromise(BACK); cleared once that step settles. PageUp is
+  // intercepted globally (consume: true) so it works the same regardless of
+  // which component -- Input, Checklist, SelectList, SettingsList,
+  // ProfilePicker -- currently has focus, without teaching each of them
+  // about wizard navigation individually.
+  let requestBack = null;
   tui.addInputListener((data) => {
-    if (matchesKey(data, Key.ctrl("c"))) abort();
+    if (matchesKey(data, Key.ctrl("c"))) {
+      abort();
+      return undefined;
+    }
+    if (matchesKey(data, Key.pageUp) && requestBack) {
+      requestBack();
+      return { consume: true };
+    }
+    return undefined;
   });
 
   function setStep(index, hint) {
-    stepLine.setText(`Step ${index}/5 - ${STEP_TITLES[index - 1]}`);
-    footer.setText(hint ?? "");
+    stepLine.setText(bold(brightMagenta(`Step ${index}/5 - ${STEP_TITLES[index - 1]}`)));
+    footer.setText(hint ? dim(hint) : "");
     tui.requestRender();
   }
 
@@ -386,147 +500,275 @@ async function runWizard(options) {
   let detectionResults = {};
   let resolvedProfiles = {};
   let existingConfig;
+  const harnessToProvider = Object.fromEntries(HARNESSES.map((h) => [h.id, { claude: "claude-code", codex: "codex", pi: "pi", opencode: "opencode" }[h.id]]));
 
   try {
     tui.start();
 
-    if (!options.configOnly && options.promptProject) {
-      projectRoot = await new Promise((resolvePromise) => {
-        setStep(1, "Enter to accept, Esc/Ctrl+C to quit without writing");
-        const input = new Input();
-        input.setValue(defaultProjectRoot);
-        input.onSubmit = (value) => {
-          const candidate = resolve(expandHome((value ?? "").trim() || defaultProjectRoot));
-          if (!projectDirectoryIsUsable(candidate)) {
-            footer.setText(`Not a directory: ${candidate}`);
-            tui.requestRender();
-            return;
-          }
-          resolvePromise(candidate);
-        };
-        swapBody(input);
-      });
-    }
-    if (aborted) return { aborted };
+    // PageUp steps back one phase; state from every prior phase (project
+    // root, harness selection, in-progress profile edits) is preserved and
+    // re-shown, not reset, when a phase is re-entered this way.
+    const canGoBackToProject = !options.configOnly && options.promptProject;
+    let phase = options.configOnly ? "load-existing-config" : canGoBackToProject ? "project" : "harness";
+    let workingProfiles;
 
-    if (options.configOnly) {
-      const configPath = join(projectRoot, ".baa-ton", "config.json");
-      existingConfig = readJson(configPath, undefined);
-      if (!existingConfig) throw new Error(`--config-only requires an existing ${configPath}; run the full wizard first.`);
-      selected = existingConfig.selectedHarnesses ?? [];
-    } else {
-      const detected = detectHarnesses();
-      selected = await new Promise((resolvePromise) => {
-        setStep(2, "space: toggle   enter: confirm   esc/ctrl+c: quit without writing");
-        const items = detected.map((harness) => ({
-          id: harness.id,
-          label: harness.label,
-          detected: harness.detected,
-          checked: Boolean(harness.detected),
-        }));
-        const checklist = new Checklist(tui, items);
-        checklist.onDone = (ids) => resolvePromise(ids);
-        checklist.onCancel = () => { abort(); resolvePromise([]); };
-        swapBody(checklist);
-      });
-    }
-    if (aborted) return { aborted };
+    while (phase !== "done") {
+      if (phase === "load-existing-config") {
+        const configPath = join(projectRoot, ".baa-ton", "config.json");
+        existingConfig = readJson(configPath, undefined);
+        if (!existingConfig) throw new Error(`--config-only requires an existing ${configPath}; run the full wizard first.`);
+        selected = existingConfig.selectedHarnesses ?? [];
+        phase = "detection-results";
+        continue;
+      }
 
-    detectionResults = await detectSelectedHarnesses(selected, projectRoot);
-
-    if (!options.configOnly) {
-      await new Promise((resolvePromise) => {
-        setStep(3, "Enter to continue, esc/ctrl+c to quit without writing");
-        const summary = new Container();
-        for (const harnessId of selected) {
-          const detection = detectionResults[harnessId];
-          const lines = [
-            `${harnessId}: source=${detection?.source ?? "n/a"}, model=${detection?.defaultModel ?? "(none)"}, thinking=${detection?.defaultThinking ?? "(none)"}`,
-            ...((detection?.warnings ?? []).map((warning) => `  warning: ${warning}`)),
-          ];
-          summary.addChild(new Text(lines.join("\n"), 0, 0));
-        }
-        const proceed = new Input();
-        proceed.onSubmit = () => resolvePromise();
-        summary.addChild(proceed);
-        swapBody(summary);
-        tui.setFocus(proceed);
-      });
-    }
-    if (aborted) return { aborted };
-
-    const computedDefaults = defaultLaunchProfiles(selected, detectionResults, defaults.profiles);
-    resolvedProfiles = computedDefaults;
-
-    if (!options.acceptDefaults) {
-      resolvedProfiles = await new Promise((resolvePromise) => {
-        setStep(4, "Enter/Space to cycle, Esc to finish, Ctrl+C to quit without writing");
-        const harnessToProvider = Object.fromEntries(HARNESSES.map((h) => [h.id, { claude: "claude-code", codex: "codex", pi: "pi", opencode: "opencode" }[h.id]]));
-        const working = { ...computedDefaults };
-        const items = Object.entries(defaults.profiles).map(([name, profile]) => {
-          const current = working[name];
-          const currentValue = current ? formatOption(current.agentKind, current.launchProfile) : "unconfigured";
-          return {
-            id: name,
-            label: `${name} (${profile.description})`,
-            currentValue,
-            values: [...buildProfileOptions(selected, detectionResults), "unconfigured"],
-          };
-        });
-        // Escape is SettingsList's documented "cancel" key; here it means
-        // "finish editing this step" (proceed to the summary), not abort.
-        // A full abort is still available globally via the Ctrl+C listener.
-        const settings = new SettingsList(
-          items,
-          items.length,
-          PLAIN_SETTINGS_THEME,
-          (id, newValue) => {
-            if (newValue === "unconfigured") {
-              delete working[id];
+      if (phase === "project") {
+        const result = await new Promise((resolvePromise) => {
+          setStep(1, "Enter to accept, Esc/Ctrl+C to quit without writing");
+          const input = new Input();
+          input.setValue(projectRoot);
+          // setValue clamps the cursor to the new value's length rather than
+          // moving it there; on a fresh Input the cursor starts at 0, so a
+          // prefilled value would otherwise leave the cursor stuck at the
+          // beginning. Match the library's own Home/End convention.
+          input.cursor = projectRoot.length;
+          input.onSubmit = (value) => {
+            const candidate = resolve(expandHome((value ?? "").trim() || defaultProjectRoot));
+            if (!projectDirectoryIsUsable(candidate)) {
+              footer.setText(yellow(`Not a directory: ${candidate}`));
+              tui.requestRender();
               return;
             }
-            if (newValue === "custom...") return; // free-text override left to manual config.json edit
-            const parsed = parseOption(newValue, harnessToProvider);
-            if (parsed) working[id] = parsed;
-          },
-          () => resolvePromise(working),
-        );
-        swapBody(settings);
-      });
-    }
-    if (aborted) return { aborted };
+            resolvePromise(candidate);
+          };
+          swapBody(input);
+        });
+        if (aborted) return { aborted };
+        projectRoot = result;
+        phase = "harness";
+        continue;
+      }
 
-    const summaryLines = Object.entries(resolvedProfiles).map(
-      ([name, resolved]) => `${name}: ${resolved.agentKind}/${resolved.launchProfile.model} (${resolved.launchProfile.thinking})`,
-    );
-    const missing = unconfiguredProfiles(defaults, resolvedProfiles);
-    const confirmed = await new Promise((resolvePromise) => {
-      setStep(5, "Type 'write' to save, 'quit' to exit without writing");
-      const text = new Text(
-        [
-          `Project: ${projectRoot}`,
-          `Selected harnesses: ${selected.join(", ") || "none"}`,
-          "",
-          "Profiles:",
-          ...summaryLines,
-          missing.length ? `Unconfigured (fails closed at dispatch): ${missing.join(", ")}` : "All profiles configured.",
-        ].join("\n"),
-        0,
-        0,
+      if (phase === "harness") {
+        const detected = detectHarnesses();
+        const result = await new Promise((resolvePromise) => {
+          // Checklist renders its own "space: toggle ... quit without
+          // writing" hint at the bottom of its own body; no footer hint
+          // here or it's shown twice. PageUp back only offered once
+          // there's actually an earlier phase to return to.
+          setStep(2, canGoBackToProject ? "PageUp: back to project directory" : undefined);
+          const items = detected.map((harness) => ({
+            id: harness.id,
+            label: harness.label,
+            detected: harness.detected,
+            checked: selected ? selected.includes(harness.id) : Boolean(harness.detected),
+          }));
+          const checklist = new Checklist(tui, items);
+          checklist.onDone = (ids) => resolvePromise(ids);
+          checklist.onCancel = () => { abort(); resolvePromise([]); };
+          swapBody(checklist);
+          if (canGoBackToProject) requestBack = () => resolvePromise(BACK);
+        });
+        requestBack = null;
+        if (aborted) return { aborted };
+        if (result === BACK) { phase = "project"; continue; }
+        selected = result;
+        phase = "detection-results";
+        continue;
+      }
+
+      if (phase === "detection-results") {
+        // detectSelectedHarnesses shells out synchronously (execFileSync)
+        // per harness -- it genuinely blocks the event loop, so a spinner
+        // couldn't animate here even if we tried. Force an immediate paint
+        // of a loading message *before* that blocking work starts, or the
+        // last-drawn frame (the harness checklist) just sits there looking
+        // hung until it's done.
+        setStep(3, "Detecting each selected harness's configured model...");
+        swapBody(new Text(dim("Running codex debug models, reading harness config files, etc. -- this can take a few seconds.")));
+        tui.renderNow(true);
+        detectionResults = await detectSelectedHarnesses(selected, projectRoot);
+
+        if (options.configOnly) { phase = "profile-edit"; continue; }
+
+        const result = await new Promise((resolvePromise) => {
+          setStep(3, "Enter to continue, PageUp: back to harness selection, esc/ctrl+c to quit without writing");
+          const summary = new Container();
+          summary.addChild(new Text(bold("What Baa-ton found for each selected harness:"), 0, 0));
+          for (const harnessId of selected) {
+            const detection = detectionResults[harnessId];
+            const catalogIds = detection?.catalog?.map((entry) => entry.id) ?? [];
+            const lines = [
+              `${bold(brightCyan(harnessId))}: source=${detection?.source ?? "n/a"}, default=${green(detection?.defaultModel ?? "(none)")}, thinking=${green(detection?.defaultThinking ?? "(none)")}`,
+              catalogIds.length
+                ? dim(`  ${catalogIds.length} model(s) available: ${catalogIds.join(", ")}`)
+                : gray("  no model catalog detected; only the default above will be offered"),
+              ...((detection?.warnings ?? []).map((warning) => yellow(`  note: ${warning}`))),
+            ];
+            summary.addChild(new Text(lines.join("\n"), 0, 0));
+          }
+          const proceed = new Input({ placeholder: "Press Enter to continue", placeholderStyle: dim });
+          proceed.onSubmit = () => resolvePromise();
+          summary.addChild(proceed);
+          swapBody(summary);
+          tui.setFocus(proceed);
+          requestBack = () => resolvePromise(BACK);
+        });
+        requestBack = null;
+        if (aborted) return { aborted };
+        if (result === BACK) { phase = "harness"; continue; }
+        if (options.acceptDefaults) {
+          resolvedProfiles = defaultLaunchProfiles(selected, detectionResults, defaults.profiles);
+          workingProfiles = resolvedProfiles;
+          phase = "confirm";
+          continue;
+        }
+        phase = "template";
+        continue;
+      }
+
+      const computedDefaults = defaultLaunchProfiles(selected, detectionResults, defaults.profiles);
+      if (!workingProfiles) workingProfiles = computedDefaults;
+
+      if (phase === "template") {
+        const templates = buildProfileTemplates(selected, detectionResults, defaults.profiles);
+        const profileCount = Object.keys(defaults.profiles).length;
+        if (templates.length === 0) { phase = "profile-edit"; continue; }
+
+        const result = await new Promise((resolvePromise) => {
+          setStep(4, "Pick a starting point -- PageUp: back to detection results");
+          const items = templates.map((template) => ({
+            value: template.id,
+            label: template.label,
+            description: `${Object.keys(template.profiles).length}/${profileCount} profile(s) configured`,
+          }));
+          items.push({ value: "__custom__", label: "Start from current defaults", description: "configure every profile individually, no template applied" });
+          const list = new SelectList(items, Math.min(items.length, 8), SELECT_THEME);
+          list.onSelect = (item) => {
+            const chosen = templates.find((template) => template.id === item.value);
+            resolvePromise(chosen ? chosen.profiles : computedDefaults);
+          };
+          list.onCancel = () => { abort(); resolvePromise(computedDefaults); };
+          swapBody(list);
+          tui.setFocus(list);
+          requestBack = () => resolvePromise(BACK);
+        });
+        requestBack = null;
+        if (aborted) return { aborted };
+        if (result === BACK) { phase = "detection-results"; continue; }
+        workingProfiles = result;
+        phase = "profile-edit";
+        continue;
+      }
+
+      if (phase === "profile-edit") {
+        const result = await new Promise((resolvePromise) => {
+          // SettingsList renders its own "Enter/Space to change · Esc to
+          // cancel" hint at the bottom of its own body; no footer hint here
+          // or it's shown twice, but PageUp back still needs its own hint
+          // since SettingsList doesn't know about it.
+          setStep(4, options.configOnly ? undefined : "PageUp: back to starting-point templates");
+          const working = { ...workingProfiles };
+          const items = Object.entries(defaults.profiles).map(([name, profile]) => {
+            const current = working[name];
+            const currentValue = current ? formatOption(current.agentKind, current.launchProfile) : "unconfigured";
+            return {
+              id: name,
+              label: name,
+              // SettingsList shows this only for the currently-highlighted
+              // row -- what the profile is for, and that Enter opens the
+              // picker to change it. The current value already has its own
+              // column; repeating it here would go stale the moment it
+              // changes, since this string isn't rebuilt on every edit.
+              description: `${profile.description} Press Enter to change harness, model, or thinking level.`,
+              currentValue,
+              submenu: (_currentValue, done) =>
+                new ProfilePicker({
+                  selectedHarnessIds: selected,
+                  detectionResults,
+                  harnessToProvider,
+                  done,
+                }),
+            };
+          });
+          // Escape is SettingsList's documented "cancel" key; here it means
+          // "finish editing this step" (proceed to the summary), not abort.
+          // A full abort is still available globally via the Ctrl+C listener.
+          const settings = new SettingsList(
+            items,
+            items.length,
+            SETTINGS_THEME,
+            (id, newValue) => {
+              if (newValue === "unconfigured") {
+                delete working[id];
+                return;
+              }
+              const parsed = parseOption(newValue, harnessToProvider);
+              if (parsed) working[id] = parsed;
+            },
+            () => resolvePromise(working),
+          );
+          swapBody(settings);
+          if (!options.configOnly) requestBack = () => resolvePromise(BACK);
+        });
+        requestBack = null;
+        if (aborted) return { aborted };
+        if (result === BACK) { phase = "template"; continue; }
+        workingProfiles = result;
+        resolvedProfiles = result;
+        phase = "confirm";
+        continue;
+      }
+
+      // phase === "confirm"
+      const summaryLines = Object.entries(resolvedProfiles).map(
+        ([name, resolved]) => `  ${bold(name)}: ${brightCyan(resolved.agentKind)}/${green(resolved.launchProfile.model)} (${yellow(resolved.launchProfile.thinking)})`,
       );
-      const confirmInput = new Input();
-      confirmInput.onSubmit = (value) => {
-        const answer = (value ?? "").trim().toLowerCase();
-        if (answer === "write" || answer === "w") resolvePromise(true);
-        else if (answer === "quit" || answer === "q") { abort(); resolvePromise(false); }
-      };
-      const container = new Container();
-      container.addChild(text);
-      container.addChild(confirmInput);
-      swapBody(container);
-      tui.setFocus(confirmInput);
-    });
-    if (aborted || !confirmed) return { aborted: true };
+      const missing = unconfiguredProfiles(defaults, resolvedProfiles);
+      const canGoBackToProfileEdit = !options.configOnly && !options.acceptDefaults;
+      const confirmResult = await new Promise((resolvePromise) => {
+        setStep(5, canGoBackToProfileEdit ? "PageUp: back to profile configuration" : undefined);
+        const text = new Text(
+          [
+            `${bold("Project:")} ${projectRoot}`,
+            `${bold("Selected harnesses:")} ${selected.join(", ") || "none"}`,
+            "",
+            bold("Profiles:"),
+            ...summaryLines,
+            missing.length
+              ? yellow(`Unconfigured (fails closed at dispatch): ${missing.join(", ")}`)
+              : brightGreen("All profiles configured."),
+            "",
+          ].join("\n"),
+          0,
+          0,
+        );
+        const choices = new SelectList(
+          [
+            { value: "write", label: "Write configuration" },
+            { value: "quit", label: "Quit without writing" },
+          ],
+          2,
+          SELECT_THEME,
+        );
+        choices.onSelect = (item) => {
+          if (item.value === "write") resolvePromise(true);
+          else { abort(); resolvePromise(false); }
+        };
+        choices.onCancel = () => { abort(); resolvePromise(false); };
+        const container = new Container();
+        container.addChild(text);
+        container.addChild(choices);
+        swapBody(container);
+        tui.setFocus(choices);
+        if (canGoBackToProfileEdit) requestBack = () => resolvePromise(BACK);
+      });
+      requestBack = null;
+      if (aborted) return { aborted };
+      if (confirmResult === BACK) { phase = "profile-edit"; continue; }
+      if (!confirmResult) return { aborted: true };
+      phase = "done";
+    }
 
     let writeResult;
     if (options.configOnly) {
@@ -556,7 +798,12 @@ export async function runInstallTui(argv) {
     return;
   }
   const result = await runWizard(options);
-  if (result?.aborted) process.exitCode = 1;
+  if (result?.aborted) {
+    // 130 (128 + SIGINT) so the wrapper scripts can tell "user cancelled,
+    // nothing was written" apart from a real failure and not throw on it.
+    if (!options.quiet) console.log("Setup cancelled; nothing was written.");
+    process.exitCode = 130;
+  }
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
