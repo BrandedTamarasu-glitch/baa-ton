@@ -49,12 +49,15 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
   let nextId = 0;
   const pending = new Map();
   lines.on("line", (line) => {
+    if (process.env.BAA_DEBUG_WINDOWS_MCP) console.error("mcp line", line);
     const message = JSON.parse(line);
     pending.get(message.id)?.(message);
     pending.delete(message.id);
   });
   const rpcWithId = (id, method, params = {}) =>
     new Promise((resolve) => {
+      if (process.env.BAA_DEBUG_WINDOWS_MCP)
+        console.error("mcp request", id, method, params.name ?? "");
       pending.set(id, resolve);
       child.stdin.write(
         `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`,
@@ -460,6 +463,7 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
       TEST_ROOT_WORKSPACE: "w-live-b",
     };
     await withMcpServer(first, async (rpc) => {
+      if (process.env.BAA_DEBUG_WINDOWS_MCP) console.error("first server start");
       const bootstrap = await rpc("tools/call", {
         name: "herdr_bootstrap_root",
         arguments: { add: true },
@@ -467,6 +471,7 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
       assert.equal(bootstrap.result.isError, undefined);
       assert.equal(bootstrap.result.structuredContent.root.pane_id, "w-live-b:second");
       assert.equal(bootstrap.result.structuredContent.root.workspace_id, "w-live-b");
+      if (process.env.BAA_DEBUG_WINDOWS_MCP) console.error("first bootstrap done");
     }, { cwd: fixture.cwd });
 
     const second = {
@@ -479,6 +484,7 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
       TEST_AGENT_LIST_LOG: join(fixture.directory, "agent-list.log"),
     };
     await withMcpServer(second, async (rpc) => {
+      if (process.env.BAA_DEBUG_WINDOWS_MCP) console.error("second server start");
       const bootstrap = await rpc("tools/call", {
         name: "herdr_bootstrap_root",
         arguments: { add: true },
@@ -486,12 +492,14 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
       assert.equal(bootstrap.result.isError, undefined);
       assert.equal(bootstrap.result.structuredContent.root.pane_id, "w-live-c:third");
       assert.equal(bootstrap.result.structuredContent.root.workspace_id, "w-live-c");
+      if (process.env.BAA_DEBUG_WINDOWS_MCP) console.error("second bootstrap done");
 
       const doctor = await rpc("tools/call", {
         name: "herdr_doctor",
         arguments: {},
       });
       assert.equal(doctor.result.isError, undefined);
+      if (process.env.BAA_DEBUG_WINDOWS_MCP) console.error("second doctor done");
       const routing = doctor.result.structuredContent.checks.find(
         (check) => check.id === "plugin-enablement-and-routing",
       );
