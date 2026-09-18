@@ -70,16 +70,16 @@ If you installed from the wrong directory or want to change harness selections, 
 macOS, Linux, and WSL:
 
 ```sh
-node ~/.baa-ton/packages/herdr-tools/setup.mjs --project-root "$PWD"
+node ~/.baa-ton/packages/herdr-tools/install-tui.mjs --project-root "$PWD"
 ```
 
 Windows PowerShell:
 
 ```powershell
-node "$HOME\.baa-ton\packages\herdr-tools\setup.mjs" --project-root "$PWD"
+node "$HOME\.baa-ton\packages\herdr-tools\install-tui.mjs" --project-root "$PWD"
 ```
 
-The wizard updates a managed `BAA.md` reference in existing `AGENTS.md` or `CLAUDE.md` files; use `--instructions-path <file>` to choose another instruction file.
+The wizard updates a managed `BAA.md` reference in existing `AGENTS.md` or `CLAUDE.md` files; use `--instructions-path <file>` to choose another instruction file. `setup.mjs` remains the CLI-compatible entry point for scripts and automation (it delegates to `install-tui.mjs` under the hood) and accepts the same flags non-interactively.
 
 For manual/source setup, see [workflow tools](packages/herdr-tools/README.md#any-harness-as-root).
 

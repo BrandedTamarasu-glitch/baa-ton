@@ -10,28 +10,15 @@ $Repo = "https://github.com/zachristmas/baa-ton"
 
 function Say($msg) { Write-Host "==>" $msg -ForegroundColor Blue }
 function Die($msg) { Write-Host "error: $msg" -ForegroundColor Red; exit 1 }
-function Welcome() {
-  Write-Host ""
-  @'
-,-----.    ,---.    ,---.         ,--------. ,-----. ,--.  ,--.
-|  |) /_  /  O  \  /  O  \ ,-----.'--.  .--''  .-.  '|  ,'.|  |
-|  .-.  \|  .-.  ||  .-.  |'-----'   |  |   |  | |  ||  |' '  |
-|  '--' /|  | |  ||  | |  |          |  |   '  '-'  '|  | `   |
-`------' `--' `--'`--' `--'          `--'    `-----' `--'  `--'
-
-───────────────────🐕  🐑  🐑  🐑  🐑  🐑  🐑──────────────────
-
-                 your agent herd is ready
-'@ | Write-Host
-}
 
 foreach ($tool in @("git", "node")) {
   if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
     Die "$tool is required"
   }
 }
-$nodeMajor = [int]((node -p "process.versions.node.split('.')[0]").Trim())
-if ($nodeMajor -lt 20) { Die "Node.js 20+ required, found $(node --version)" }
+$nodeVersionParts = (node -p "process.versions.node").Trim().Split(".") | ForEach-Object { [int]$_ }
+$nodeOk = ($nodeVersionParts[0] -gt 22) -or (($nodeVersionParts[0] -eq 22) -and ($nodeVersionParts[1] -ge 19))
+if (-not $nodeOk) { Die "Node.js 22.19+ required, found $(node --version)" }
 
 if (-not (Test-Path (Join-Path $BaaTonDir ".git"))) {
   Say "Cloning Baa-ton to $BaaTonDir"
@@ -78,7 +65,7 @@ if (Get-Command herdr -ErrorAction SilentlyContinue) {
 
 $ProjectRoot = $PWD.Path
 Say "Running the Baa-ton project wizard in $ProjectRoot"
-& node (Join-Path $BaaTonDir "packages\herdr-tools\setup.mjs") --project-root $ProjectRoot --prompt-project --quiet
+& node (Join-Path $BaaTonDir "packages\herdr-tools\install-tui.mjs") --project-root $ProjectRoot --prompt-project --quiet
 if ($LASTEXITCODE -ne 0) {
   throw "Baa-ton project setup failed with exit code $LASTEXITCODE"
 }
@@ -111,7 +98,6 @@ if ($clipboardCopied) {
 } else {
   Say "The setup skill was installed, but the optional fallback prompt could not be copied."
 }
-Welcome
 Say "Install complete."
 Say "To get started, start your harness in that project and invoke the Baa-ton skill: baa-ton-start."
 Say "Later: use baa-ton-configure for worker/model choices or baa-ton-update for updates."

@@ -12,21 +12,6 @@ REPO="https://github.com/zachristmas/baa-ton"
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-welcome() {
-  printf '\n'
-  cat <<'EOF'
-,-----.    ,---.    ,---.         ,--------. ,-----. ,--.  ,--.
-|  |) /_  /  O  \  /  O  \ ,-----.'--.  .--''  .-.  '|  ,'.|  |
-|  .-.  \|  .-.  ||  .-.  |'-----'   |  |   |  | |  ||  |' '  |
-|  '--' /|  | |  ||  | |  |          |  |   '  '-'  '|  | `   |
-`------' `--' `--'`--' `--'          `--'    `-----' `--'  `--'
-
-───────────────────🐕  🐑  🐑  🐑  🐑  🐑  🐑──────────────────
-
-                 your agent herd is ready
-EOF
-}
-
 copy_to_clipboard() {
   local value="$1"
   if command -v pbcopy >/dev/null 2>&1; then
@@ -48,9 +33,10 @@ copy_to_clipboard() {
 }
 
 command -v git >/dev/null 2>&1 || die "git is required (https://git-scm.com)"
-command -v node >/dev/null 2>&1 || die "Node.js 20+ is required (https://nodejs.org)"
-node_major="$(node -p 'process.versions.node.split(".")[0]')"
-[ "$node_major" -ge 20 ] || die "Node.js 20+ required, found $(node --version)"
+command -v node >/dev/null 2>&1 || die "Node.js 22.19+ is required (https://nodejs.org)"
+node_version="$(node -p 'process.versions.node')"
+node_ok="$(node -p 'const [maj,min]="'"$node_version"'".split(".").map(Number); maj>22 || (maj===22 && min>=19) ? 1 : 0')"
+[ "$node_ok" -eq 1 ] || die "Node.js 22.19+ required, found $(node --version)"
 
 if [ ! -d "$BAA_TON_DIR/.git" ]; then
   say "Cloning Baa-ton to $BAA_TON_DIR"
@@ -90,9 +76,9 @@ fi
 
 say "Running the Baa-ton project wizard in $PWD"
 if [ -r /dev/tty ] && [ -t 1 ]; then
-  node "$BAA_TON_DIR/packages/herdr-tools/setup.mjs" --project-root "$PWD" --prompt-project --quiet < /dev/tty
+  node "$BAA_TON_DIR/packages/herdr-tools/install-tui.mjs" --project-root "$PWD" --prompt-project --quiet < /dev/tty
 else
-  node "$BAA_TON_DIR/packages/herdr-tools/setup.mjs" --project-root "$PWD" --non-interactive --quiet
+  node "$BAA_TON_DIR/packages/herdr-tools/install-tui.mjs" --project-root "$PWD" --non-interactive --quiet
 fi
 
 root_prompt=$(cat <<EOF
@@ -116,7 +102,6 @@ if copy_to_clipboard "$root_prompt"; then
 else
   say "The setup skill was installed, but the optional fallback prompt could not be copied."
 fi
-welcome
 say "Install complete."
 say "To get started, start your harness in that project and invoke the Baa-ton skill: baa-ton-start."
 say "Later: use baa-ton-configure for worker/model choices or baa-ton-update for updates."
