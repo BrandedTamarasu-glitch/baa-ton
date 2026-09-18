@@ -6,6 +6,7 @@ import type { PersistenceHandle } from "./contract.js";
 import {
   PROTOCOL_OPERATIONS,
   type HarnessLaunchAdapter,
+  type LaunchContext,
   type ProtocolOperation,
   type StartupProof,
 } from "./harness-adapter.js";
@@ -136,7 +137,11 @@ const LANE_PERMISSIONS = {
 function buildClaudeLaunchArguments(
   paths: ClaudeAdapterPaths,
   profile: LaunchProfile,
+  context?: LaunchContext,
 ): string[] {
+  const intentPath = context?.startupIntentPath;
+  if (!intentPath)
+    throw new Error("Claude launch requires the startup intent path.");
   mkdirSync(paths.scratchDirectory, { recursive: true, mode: 0o700 });
   const tag = randomUUID().slice(0, 8);
   const settingsPath = join(
@@ -167,6 +172,14 @@ function buildClaudeLaunchArguments(
       "herdr-orchestrator": {
         command: "node",
         args: [paths.bridge],
+        // Claude Code does not reliably inherit the Herdr pane environment
+        // into stdio MCP children. Pass the startup contract explicitly so
+        // mcp-server.mjs can publish the bridge's protocol operations before
+        // the SessionStart identity attestation is verified.
+        env: {
+          BAA_STARTUP_INTENT: intentPath,
+          HERDR_ENV: "1",
+        },
       },
     },
   };
@@ -239,12 +252,13 @@ export function claudeLaunchAdapter(
       // claude exit before its SessionStart hook writes the handshake, so
       // dispatch fails closed rather than silently substituting a model.
     },
-    launchArguments: (profile) => buildClaudeLaunchArguments(paths, profile),
+    launchArguments: (profile, _source, context) =>
+      buildClaudeLaunchArguments(paths, profile, context),
     resumeSessionId: claudeResumeSessionId,
-    resumeArguments: (profile, session) => [
+    resumeArguments: (profile, session, _source, context) => [
       "--resume",
       claudeResumeSessionId(session),
-      ...buildClaudeLaunchArguments(paths, profile),
+      ...buildClaudeLaunchArguments(paths, profile, context),
     ],
     verifyStartup(nativeAgent: unknown, attestation: unknown): StartupProof {
       const agent = nativeAgent as {
