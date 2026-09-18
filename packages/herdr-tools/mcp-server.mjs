@@ -7,7 +7,7 @@
  * process is not a dispatcher or background worker.
  */
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   lstat,
@@ -78,7 +78,6 @@ if (!packageRoot)
   throw new Error(
     "pi-coding-agent package not found for the MCP bridge model registry.",
   );
-const { pathToFileURL } = await import("node:url");
 const importDist = (name) =>
   import(pathToFileURL(join(packageRoot, "dist", name)).href);
 const { ModelRuntime } = await importDist("core/model-runtime.js");
@@ -655,7 +654,14 @@ const ctx = {
  * SessionStart hook merges session identity into the same file; both merge
  * atomically, so write order does not matter. */
 if (process.env.BAA_STARTUP_INTENT && process.env.HERDR_ENV === "1") {
-  const { mergeAttestation } = await import(join(root, "attest-merge.mjs"));
+  // node:module's native ESM loader rejects a raw Windows path ("C:\...") as
+  // an import specifier -- it must be a file:// URL. jiti.import() below
+  // tolerates raw paths (its own loader), but this native dynamic import
+  // does not, and previously crashed every dispatched lane's MCP server at
+  // startup on Windows before it could complete its protocol handshake.
+  const { mergeAttestation } = await import(
+    pathToFileURL(join(root, "attest-merge.mjs")).href
+  );
   const { mapPiToolNamesToProtocolOperations } = await jiti.import(
     join(root, "pi-launch-adapter.ts"),
   );
