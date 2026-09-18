@@ -8,7 +8,15 @@
  */
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import {
+  basename,
+  delimiter,
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  resolve,
+} from "node:path";
 import {
   lstat,
   mkdir,
@@ -55,6 +63,23 @@ const jiti = createJiti(fileURLToPath(import.meta.url), {
   alias: { typebox: require.resolve("typebox") },
 });
 const extension = await jiti.import(join(root, "index.ts"));
+
+function resolveWindowsCommand(command) {
+  if (process.platform !== "win32" || isAbsolute(command) || extname(command))
+    return command;
+  const pathValue = process.env.PATH ?? process.env.Path ?? "";
+  const extensions = (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((extension) => extension.trim())
+    .filter(Boolean);
+  for (const directory of pathValue.split(delimiter)) {
+    for (const extension of extensions) {
+      const candidate = join(directory, `${command}${extension}`);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return command;
+}
 
 // The bridge must expose the same installed model registry the interactive
 // runtime uses. Discovery refreshes the requested provider immediately before
@@ -105,15 +130,15 @@ extension.default({
   registerCommand() {},
   async exec(command, args, options = {}) {
     const result = await new Promise((resolveResult) => {
-      const child = require("node:child_process").spawn(command, args, {
+      const child = require("node:child_process").spawn(
+        resolveWindowsCommand(command),
+        args,
+        {
         cwd: process.cwd(),
         env: process.env,
-        // Windows harness installs may expose Herdr through a .cmd shim;
-        // match live-herdr.mjs so the bridge resolves both shims and native
-        // executables through PATHEXT.
-        shell: process.platform === "win32",
         stdio: ["ignore", "pipe", "pipe"],
-      });
+        },
+      );
       let stdout = "";
       let stderr = "";
       let settled = false;
