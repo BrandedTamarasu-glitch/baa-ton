@@ -24,7 +24,7 @@ Every harness integrates through one versioned `HarnessLaunchAdapter` contract:
 
 ## Transports and tiers
 
-- **The MCP bridge is the single tool transport.** All ten `herdr_*` operations are
+- **The MCP bridge is the single tool transport.** All `herdr_*` operations are
   served to any MCP-capable harness through one bridge; schema validation,
   lifecycle parity, and timeouts are tested against the extension's behavior.
 - **ACP is a tier, not the contract.** Any harness speaking the Agent Client

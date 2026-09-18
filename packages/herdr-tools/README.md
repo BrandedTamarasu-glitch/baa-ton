@@ -6,6 +6,7 @@ Harness-neutral local workflow operations for Herdr. The local MCP bridge expose
 
 | Tool | Purpose |
 | --- | --- |
+| `herdr_reconcile_root` | Repair the current root pane's stale live harness identity without resetting controller state. |
 | `herdr_goal` | Manage the root-only durable parent goal. |
 | `herdr_reparent` | Preview or root-confirm a controller-root handoff. |
 | `herdr_plan` | Create a durable workflow and its lanes. |
@@ -97,7 +98,8 @@ The bridge exposes tools only when `HERDR_ENV=1` is present. It has no platform-
 
 ## Any harness as root
 
-The bridge preserves root-role parity for `herdr_bootstrap_root`, `herdr_goal`,
+The bridge preserves root-role parity for `herdr_bootstrap_root`,
+`herdr_reconcile_root`, `herdr_goal`,
 `herdr_plan`, `herdr_dispatch`, `herdr_observe`, `herdr_resume`,
 `herdr_close`, `herdr_operator_close`, `herdr_reparent`,
 `herdr_question_answer`, and `herdr_doctor`. A non-Pi root receives a concise
@@ -137,6 +139,12 @@ parent goal, workflow/lanes, and wake/approval state. The controller keeps all
 orchestrator records in one config but routes lifecycle events and wakes by the
 registered pane/workspace mapping, so Pi, Claude Code, and other harness roots
 can run side by side without sharing parent state.
+
+If a pane's harness changes in place, `herdr_doctor` reports the stale root
+identity as a blocking finding. From that same live pane, call
+`herdr_reconcile_root`; it updates only the matching pane/workspace's recorded
+harness and durable session identity. It refuses foreign, ambiguous, missing,
+or child-lane mappings and never resets or replaces another root.
 
 ## The queue
 

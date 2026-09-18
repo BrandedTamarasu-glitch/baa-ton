@@ -259,6 +259,7 @@ test("mapped root bridge exposes root-role parity and returns non-Pi root ground
       const names = new Set(listed.result.tools.map((tool) => tool.name));
       for (const name of [
         "herdr_bootstrap_root",
+        "herdr_reconcile_root",
         "herdr_goal",
         "herdr_plan",
         "herdr_dispatch",

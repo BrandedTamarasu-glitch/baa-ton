@@ -114,6 +114,10 @@ Pass a profile name to `herdr_plan` with `taskProfile`. Configure exact launch p
 
 Support is qualification-by-profile, not a promise that every model or configuration works. Unqualified harnesses and launch profiles fail before topology is created.
 
+If a registered root pane changes harness, run `herdr_doctor` from that pane and
+then `herdr_reconcile_root` when it reports identity drift. This repairs only
+the current pane's root mapping; it does not reset concurrent roots.
+
 ## Operating guarantees
 
 - Herdr owns terminal topology; Baa-ton does not spawn detached processes.

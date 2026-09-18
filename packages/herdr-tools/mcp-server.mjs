@@ -210,6 +210,7 @@ const ROOT_EXECUTOR_TOOLS = new Set([
   "herdr_question_answer",
   "herdr_operator_close",
   "herdr_plan",
+  "herdr_reconcile_root",
 ]);
 
 function isRecord(value) {
