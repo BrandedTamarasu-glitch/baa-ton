@@ -44,17 +44,17 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
     pending.get(message.id)?.(message);
     pending.delete(message.id);
   });
-  const rpc = (method, params = {}) =>
+  const rpcWithId = (id, method, params = {}) =>
     new Promise((resolve) => {
-      const id = ++nextId;
       pending.set(id, resolve);
       child.stdin.write(
         `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`,
       );
     });
+  const rpc = (method, params = {}) => rpcWithId(++nextId, method, params);
   const timeout = setTimeout(() => child.kill(), 15000);
   try {
-    return await run(rpc);
+    return await run(rpc, rpcWithId);
   } finally {
     clearTimeout(timeout);
     child.stdin.end();
@@ -348,6 +348,71 @@ test("mapped root bridge exposes root-role parity and returns non-Pi root ground
       assert.equal(childGoal.result.isError, true);
       assert.match(childGoal.result.content[0].text, /verified controller-mapped root/);
     }, { cwd: fixture.cwd });
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("MCP message occurrences remain distinct when a harness reuses a request id", async () => {
+  const fixture = await rootBridgeFixture();
+  const env = {
+    HERDR_ENV: "1",
+    HERDR_PANE_ID: fixture.root.pane_id,
+    HERDR_WORKSPACE_ID: fixture.root.workspace_id,
+    HERDR_PLUGIN_CONFIG_DIR: fixture.stateDir,
+    TEST_CONFIG_DIR: fixture.stateDir,
+    TEST_ROOT_WORKSPACE: fixture.root.workspace_id,
+    PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
+  };
+  try {
+    await withMcpServer(env, async (rpc, rpcWithId) => {
+      const bootstrap = await rpc("tools/call", {
+        name: "herdr_bootstrap_root",
+        arguments: {},
+      });
+      assert.equal(bootstrap.result.isError, undefined);
+
+      const first = await rpc("tools/call", {
+        name: "herdr_plan",
+        arguments: {
+          objective: "Plan the first unrelated workflow",
+          lanes: ["first lane"],
+        },
+      });
+      assert.equal(first.result.isError, undefined);
+
+      const second = await rpcWithId(2, "tools/call", {
+        name: "herdr_plan",
+        arguments: {
+          objective: "Plan the second unrelated workflow",
+          lanes: ["second lane"],
+        },
+      });
+      assert.equal(second.result.isError, undefined);
+      assert.notEqual(
+        first.result.structuredContent.workflow.id,
+        second.result.structuredContent.workflow.id,
+      );
+    }, { cwd: fixture.cwd });
+
+    const manifest = JSON.parse(
+      await readFile(
+        join(fixture.cwd, ".pi", "herdr-orchestrator", "manifest.json"),
+        "utf8",
+      ),
+    );
+    assert.equal(manifest.workflows.length, 2);
+    const inbox = JSON.parse(
+      await readFile(join(fixture.stateDir, "inbox.json"), "utf8"),
+    );
+    const lifecycleMessages = inbox.messages.filter(
+      (message) => message.envelope.message.type === "lifecycle",
+    );
+    assert.equal(lifecycleMessages.length, 2);
+    assert.notEqual(
+      lifecycleMessages[0].occurrence_id,
+      lifecycleMessages[1].occurrence_id,
+    );
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });
   }
