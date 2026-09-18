@@ -5970,6 +5970,28 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     };
   }
 
+  // A dry-run/result payload previously embedded the entire workflow record
+  // verbatim. Each lane's full objective text is duplicated across the lane
+  // itself and its mirrored goal record, so a handful of lanes with a normal
+  // multi-hundred-character objective routinely produced tens of thousands
+  // of characters, well past what any caller reading this result needs.
+  // Every other field (laneRetirement, evidence, ownership, status, ...)
+  // stays exactly as-is; callers rely on those.
+  function workflowRetirementSummary(workflow: Workflow): Record<string, unknown> {
+    return {
+      ...workflow,
+      objective: clip(workflow.objective, 200),
+      lanes: workflow.lanes.map((lane) => ({
+        ...lane,
+        objective: clip(lane.objective, 200),
+      })),
+      goals: (workflow.goals ?? []).map((goal) => ({
+        ...goal,
+        objective: clip(goal.objective, 200),
+      })),
+    };
+  }
+
   async function retireTaskLaneTabs(
     cwd: string,
     id: string,
@@ -6035,7 +6057,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         laneRetired: true,
         retired: true,
         alreadyRetired: true,
-        workflow,
+        workflow: workflowRetirementSummary(workflow),
         tabIds: storedRetirement.tabIds,
         closedTabIds: storedRetirement.closedTabIds,
         failedTabIds: [],
@@ -6106,7 +6128,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         dryRun: true,
         laneRetirement: true,
         retired: false,
-        workflow,
+        workflow: workflowRetirementSummary(workflow),
         tabIds: pendingTabIds,
         commands,
         workspaceRetained: true,
@@ -6319,7 +6341,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       retired: finalRetirement.status === "retired",
       routesRetired,
       partialFailure: closeErrors.length > 0,
-      workflow: currentWorkflow,
+      workflow: workflowRetirementSummary(currentWorkflow),
       tabIds: finalRetirement.tabIds,
       closedTabIds: finalRetirement.closedTabIds,
       failedTabIds: finalRetirement.failedTabIds,
@@ -6948,7 +6970,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     if (!execute)
       return {
         dryRun: true,
-        workflow,
+        workflow: workflowRetirementSummary(workflow),
         commands:
           workflow.ownership.workspaceId && !sharedWorkspace
             ? [`herdr workspace close ${workflow.ownership.workspaceId}`]
