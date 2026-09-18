@@ -317,6 +317,25 @@ test("doctor makes stale and missing root panes blocking findings", async () => 
   }
 });
 
+test("doctor warns without blocking the current root when only another root is stale", async () => {
+  const f = await fixture();
+  try {
+    const config = await f.config();
+    config.orchestrators[0].root.agent_kind = "pi";
+    await writeFile(join(f.configDir, "config.json"), `${JSON.stringify(config, null, 2)}\n`);
+    f.missing.add(f.otherRoot.pane_id);
+    const report = await f.tools
+      .get("herdr_doctor")
+      .execute("doctor", {}, undefined, undefined, f.context);
+    const check = report.details.checks.find((entry) => entry.id === "root-identity");
+    assert.equal(check.status, "warn");
+    assert.match(check.detail, /Current root identity matches/);
+    assert.match(check.detail, /root-b/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("root reconciliation refuses foreign and child-conflicting mappings", async () => {
   const foreign = await fixture({ foreign: true });
   try {

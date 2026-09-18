@@ -7215,12 +7215,21 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           detail: "No controller config is available; no registered root identity can be checked.",
         };
       const findings: string[] = [];
+      const warnings: string[] = [];
+      const currentPaneId = process.env.HERDR_PANE_ID;
+      const currentWorkspaceId = process.env.HERDR_WORKSPACE_ID;
+      const isCurrentRoot = (root: ControllerRootMapping) =>
+        root.pane_id === currentPaneId && root.workspace_id === currentWorkspaceId;
+      const recordFinding = (root: ControllerRootMapping, detail: string) => {
+        (isCurrentRoot(root) ? findings : warnings).push(detail);
+      };
       const seen = new Set<string>();
       for (const orchestrator of controllerConfig.orchestrators) {
         const root = orchestrator.root;
         const identityKey = `${root.workspace_id}:${root.pane_id}`;
         if (seen.has(identityKey)) {
-          findings.push(
+          recordFinding(
+            root,
             `${orchestrator.id} duplicates root identity ${identityKey}`,
           );
           continue;
@@ -7249,9 +7258,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               `target stored=${root.target} live=${live.name ?? "<unnamed>"}`,
             );
           if (mismatches.length > 0)
-            findings.push(`${orchestrator.id}: ${mismatches.join(", ")}`);
+            recordFinding(root, `${orchestrator.id}: ${mismatches.join(", ")}`);
         } catch (error) {
-          findings.push(
+          recordFinding(
+            root,
             `${orchestrator.id} (${root.workspace_id}:${root.pane_id}): ${error instanceof Error ? error.message : String(error)}`,
           );
         }
@@ -7259,7 +7269,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       if (findings.length > 0)
         return {
           status: "fail",
-          detail: `Root identity drift blocks safe root operations: ${findings.join("; ")} Run herdr_reconcile_root from the affected live root pane.`,
+          detail: `Current root identity drift blocks safe root operations: ${findings.join("; ")} Run herdr_reconcile_root from the affected live root pane.${warnings.length ? ` Other roots need separate attention: ${warnings.join("; ")}` : ""}`,
+        };
+      if (warnings.length > 0)
+        return {
+          status: "warn",
+          detail: `Current root identity matches. Other registered roots need separate attention: ${warnings.join("; ")}`,
         };
       return {
         status: "ok",
