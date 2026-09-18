@@ -11,6 +11,8 @@ import {
   managedReferenceBlock,
   startSkillContent,
   startSkillPath,
+  uninstallSkillContent,
+  uninstallSkillPath,
   updateSkillContent,
   updateSkillPath,
   updateManagedReference,
@@ -77,13 +79,14 @@ test("selected harnesses receive idempotent project-local start skills", async (
       selected,
       baaPath: join(directory, "BAA.md"),
     });
-    assert.equal(first.length, selected.length * 3);
-    assert.deepEqual(first.map((skill) => skill.skipped), Array(selected.length * 3).fill(false));
+    assert.equal(first.length, selected.length * 4);
+    assert.deepEqual(first.map((skill) => skill.skipped), Array(selected.length * 4).fill(false));
     for (const harness of selected) {
       const skills = [
         [startSkillPath(directory, harness), startSkillContent({ harness, baaPath: join(directory, "BAA.md"), projectRoot: directory }), "baa-ton-start"],
         [configureSkillPath(directory, harness), configureSkillContent({ baaPath: join(directory, "BAA.md"), projectRoot: directory }), "baa-ton-configure"],
         [updateSkillPath(directory, harness), updateSkillContent({ projectRoot: directory }), "baa-ton-update"],
+        [uninstallSkillPath(directory, harness), uninstallSkillContent(), "baa-ton-uninstall"],
       ];
       for (const [path, expected, name] of skills) {
         const content = await readFile(path, "utf8");
@@ -96,7 +99,7 @@ test("selected harnesses receive idempotent project-local start skills", async (
       selected,
       baaPath: join(directory, "BAA.md"),
     });
-    assert.deepEqual(second.map((skill) => skill.changed), Array(selected.length * 3).fill(false));
+    assert.deepEqual(second.map((skill) => skill.changed), Array(selected.length * 4).fill(false));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

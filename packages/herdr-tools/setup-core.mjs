@@ -22,7 +22,7 @@ const START_SKILL_START = "<!-- baa-ton:start-skill:start -->";
 const START_SKILL_END = "<!-- baa-ton:start-skill:end -->";
 const LEGACY_SETUP_SKILL_START = "<!-- baa-ton:setup-skill:start -->";
 const LEGACY_SETUP_SKILL_END = "<!-- baa-ton:setup-skill:end -->";
-const PROJECT_SKILLS = ["baa-ton-start", "baa-ton-configure", "baa-ton-update"];
+const PROJECT_SKILLS = ["baa-ton-start", "baa-ton-configure", "baa-ton-update", "baa-ton-uninstall"];
 
 const START_SKILL_DIRECTORIES = {
   pi: [".pi", "skills"],
@@ -128,6 +128,10 @@ export function updateSkillPath(projectRoot, harnessId) {
   return projectSkillPath(projectRoot, harnessId, "baa-ton-update");
 }
 
+export function uninstallSkillPath(projectRoot, harnessId) {
+  return projectSkillPath(projectRoot, harnessId, "baa-ton-uninstall");
+}
+
 export function startSkillContent({ harness, baaPath, projectRoot }) {
   const rootSetupPath = join(checkoutDirectory, "packages", "herdr-tools", "root-setup.mjs");
   const setupPath = join(checkoutDirectory, "packages", "herdr-tools", "setup.mjs");
@@ -156,6 +160,7 @@ export function startSkillContent({ harness, baaPath, projectRoot }) {
 
 export function configureSkillContent({ baaPath, projectRoot }) {
   const installTuiPath = join(checkoutDirectory, "packages", "herdr-tools", "install-tui.mjs");
+  const wizardCommand = `node \\"${installTuiPath}\\" --project-root \\"${projectRoot}\\" --config-only`;
   return [
     "---",
     "name: baa-ton-configure",
@@ -167,13 +172,43 @@ export function configureSkillContent({ baaPath, projectRoot }) {
     "",
     `Use this skill when the user wants to change which harness, model, thinking level, or authentication choice Baa-ton uses for a worker type. Read \`${baaPath}\` and \`${join(projectRoot, ".baa-ton", "config.json")}\` first.`,
     "",
-    "1. Review the existing task profiles and preserve any user customizations.",
-    "2. Ask for exact provider, model, thinking, and auth values when they are not already known. Never invent a model ID or silently substitute one.",
-    "3. Update the matching profile's `agentKind` and exact `launchProfile` (`provider`, `model`, `thinking`, `auth`) in `.baa-ton/config.json`.",
-    "4. Show the resulting worker/profile mapping and explain that Baa-ton will live-qualify it before dispatch.",
-    "5. Do not bootstrap a root, initialize a goal, plan work, or dispatch a lane as part of configuration.",
+    "1. Ask the user which they want: (a) a quick tweak made directly in this conversation, or (b) the full profile picker (harness -> model -> thinking, with live per-template previews) in its own terminal.",
+    "2. For (a): ask for exact provider, model, thinking, and auth values when they are not already known -- never invent a model ID or silently substitute one -- then update the matching profile's `agentKind` and exact `launchProfile` (`provider`, `model`, `thinking`, `auth`) in `.baa-ton/config.json` and show the resulting mapping.",
+    `3. For (b): check \`test "\${HERDR_ENV:-}" = 1\`. If that fails (not running inside Herdr), tell the user to run \`node "${installTuiPath}" --project-root "${projectRoot}" --config-only\` themselves in a terminal -- do not run a full-screen interactive wizard in this pane.`,
+    "4. If inside Herdr, open it in a fresh tab (the wizard's banner and dividers need full width, not a cramped split):",
+    `   \`herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "${projectRoot}" --label "Baa-ton configure" --focus\`, read the new pane id from \`.result.root_pane.pane_id\`, then \`herdr pane run <pane_id> "${wizardCommand}"\`.`,
+    "5. Tell the user the picker opened in a new tab and to close it (or say so here) when done. Do not read its output back into this conversation or assume it finished -- it is a separate interactive session.",
+    "6. Do not bootstrap a root, initialize a goal, plan work, or dispatch a lane as part of configuration.",
+    START_SKILL_END,
     "",
-    `If harness selection or model detection also needs changing, rerun \`node "${installTuiPath}" --project-root "${projectRoot}" --config-only\`.`,
+  ].join("\n");
+}
+
+export function uninstallSkillContent() {
+  const isWindows = process.platform === "win32";
+  const uninstallScriptPath = join(checkoutDirectory, isWindows ? "uninstall.ps1" : "uninstall.sh");
+  const uninstallCommand = isWindows
+    ? `powershell -NoProfile -ExecutionPolicy Bypass -File "${uninstallScriptPath}"`
+    : `bash "${uninstallScriptPath}"`;
+  const uninstallCommandEscaped = isWindows
+    ? `powershell -NoProfile -ExecutionPolicy Bypass -File \\"${uninstallScriptPath}\\"`
+    : `bash \\"${uninstallScriptPath}\\"`;
+  return [
+    "---",
+    "name: baa-ton-uninstall",
+    "description: Uninstall Baa-ton from this machine.",
+    "---",
+    START_SKILL_START,
+    "",
+    "# Uninstall Baa-ton",
+    "",
+    "Use this skill only when the user explicitly asks to uninstall or remove Baa-ton. This removes the shared Baa-ton checkout, Pi extension link, and Herdr controller registration for the whole machine, not just this project -- project files (`BAA.md`, `.baa-ton/config.json`, project-local skills) are untouched. For \"stop using this harness/model here\" instead of a full removal, use `baa-ton-configure`.",
+    "",
+    "1. Confirm with the user that they want to remove Baa-ton from this machine entirely, not just reconfigure this project.",
+    `2. Check \`test "\${HERDR_ENV:-}" = 1\`. If that fails (not running inside Herdr), tell the user to run this themselves in a terminal: \`${uninstallCommand}\`.`,
+    "3. If inside Herdr, open it in a fresh tab (the uninstaller prompts its own y/N confirmation):",
+    `   \`herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "${checkoutDirectory}" --label "Baa-ton uninstall" --focus\`, read the new pane id from \`.result.root_pane.pane_id\`, then \`herdr pane run <pane_id> "${uninstallCommandEscaped}"\`.`,
+    "4. Tell the user the uninstaller opened in a new tab and to confirm there. Never pass -Force/--force on the user's behalf -- let the script's own confirmation stand.",
     START_SKILL_END,
     "",
   ].join("\n");
@@ -231,6 +266,7 @@ export function installProjectSkills({ projectRoot, selected, baaPath }) {
     "baa-ton-start": (harness) => startSkillContent({ harness, baaPath, projectRoot }),
     "baa-ton-configure": () => configureSkillContent({ baaPath, projectRoot }),
     "baa-ton-update": () => updateSkillContent({ projectRoot }),
+    "baa-ton-uninstall": () => uninstallSkillContent(),
   };
   return selected.flatMap((harness) => PROJECT_SKILLS.map((skillName) => installStartSkill(
     projectSkillPath(projectRoot, harness, skillName),
