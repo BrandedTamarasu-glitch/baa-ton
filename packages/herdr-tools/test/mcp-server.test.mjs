@@ -162,7 +162,10 @@ if (args[0] === "plugin" && args[1] === "config-dir") {
 `;
   if (process.platform === "win32") {
     await writeFile(herdrScript, script);
-    await writeFile(herdr, `@echo off\r\nnode "%~dp0herdr.cjs" %*\r\n`);
+    await writeFile(
+      herdr,
+      `@echo off\r\nnode "%~dp0herdr.cjs" %*\r\nexit /b %errorlevel%\r\n`,
+    );
   } else {
     await writeFile(herdr, `#!/usr/bin/env node\n${script}`, { mode: 0o755 });
   }
