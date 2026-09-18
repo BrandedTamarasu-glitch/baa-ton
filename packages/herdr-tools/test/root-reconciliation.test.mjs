@@ -32,7 +32,7 @@ async function fixture({ foreign = false, childConflict = false } = {}) {
   const cwd = join(directory, "project");
   const otherCwd = join(directory, "other-project");
   const configDir = join(directory, "config");
-  const manifestDir = join(cwd, ".pi", "herdr-orchestrator");
+  const manifestDir = join(cwd, ".baa-ton", "herdr-orchestrator");
   const manifestPath = join(manifestDir, "manifest.json");
   const currentRoot = root("w-a:root", "w-a", "claude");
   const otherRoot = root("w-b:root", "w-b", "pi");
@@ -66,7 +66,7 @@ async function fixture({ foreign = false, childConflict = false } = {}) {
     id: foreign ? otherCwd : cwd,
     workspace_id: currentRoot.workspace_id,
     parent_manifest_path: foreign
-      ? join(otherCwd, ".pi", "herdr-orchestrator", "manifest.json")
+      ? join(otherCwd, ".baa-ton", "herdr-orchestrator", "manifest.json")
       : manifestPath,
   };
   const config = {

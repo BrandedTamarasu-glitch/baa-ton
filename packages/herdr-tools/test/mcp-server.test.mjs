@@ -337,7 +337,7 @@ test("mapped root bridge exposes root-role parity and returns non-Pi root ground
 
     const configPath = join(fixture.stateDir, "config.json");
     const config = JSON.parse(await readFile(configPath, "utf8"));
-    const manifestPath = join(fixture.cwd, ".pi", "herdr-orchestrator", "manifest.json");
+    const manifestPath = join(fixture.cwd, ".baa-ton", "herdr-orchestrator", "manifest.json");
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
     const lane = manifest.workflows[0].lanes[0];
     config.orchestrators[0].workflows.push({
@@ -424,7 +424,7 @@ test("MCP message occurrences remain distinct when a harness reuses a request id
 
     const manifest = JSON.parse(
       await readFile(
-        join(fixture.cwd, ".pi", "herdr-orchestrator", "manifest.json"),
+        join(fixture.cwd, ".baa-ton", "herdr-orchestrator", "manifest.json"),
         "utf8",
       ),
     );
@@ -717,7 +717,7 @@ test("MCP calls run registered lifecycle handlers and settle the bridge root tur
   const directory = await mkdtemp(join(tmpdir(), "baa-mcp-lifecycle-"));
   const stateDir = join(directory, "config");
   const cwd = join(directory, "workspace");
-  const manifestPath = join(cwd, ".pi", "herdr-orchestrator", "manifest.json");
+  const manifestPath = join(cwd, ".baa-ton", "herdr-orchestrator", "manifest.json");
   const root = {
     target: "herdr-root",
     target_kind: "name",
@@ -817,7 +817,7 @@ test("MCP permission broker dedupes a request and releases a parent answer once"
   const directory = await mkdtemp(join(tmpdir(), "baa-mcp-permission-"));
   const stateDir = join(directory, "config");
   const cwd = join(directory, "workspace");
-  const manifestPath = join(cwd, ".pi", "herdr-orchestrator", "manifest.json");
+  const manifestPath = join(cwd, ".baa-ton", "herdr-orchestrator", "manifest.json");
   const root = {
     target: "herdr-root",
     target_kind: "name",

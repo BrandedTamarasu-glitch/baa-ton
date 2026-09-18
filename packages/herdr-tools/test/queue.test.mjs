@@ -13,7 +13,7 @@ async function fixture({ queue = [], workflows = [] } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "baa-queue-"));
   const cwd = join(directory, "task");
   const configDir = join(directory, "config");
-  const manifestDir = join(cwd, ".pi", "herdr-orchestrator");
+  const manifestDir = join(cwd, ".baa-ton", "herdr-orchestrator");
   const manifestPath = join(manifestDir, "manifest.json");
   const root = {
     target: "w1:p1",

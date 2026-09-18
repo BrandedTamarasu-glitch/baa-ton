@@ -21,7 +21,7 @@ async function fixture() {
   const directory = await mkdtemp(join(tmpdir(), "baa-session-log-"));
   const cwd = join(directory, "parent");
   const worktree = join(directory, "lane-worktree");
-  const manifestPath = join(cwd, ".pi", "herdr-orchestrator", "manifest.json");
+  const manifestPath = join(cwd, ".baa-ton", "herdr-orchestrator", "manifest.json");
   const configDir = join(directory, "config");
   const first = "2026-09-15T00:00:01.000Z";
   const second = "2026-09-15T00:00:02.000Z";
@@ -95,7 +95,7 @@ async function fixture() {
     },
     workflows: [workflow],
   };
-  await mkdir(join(cwd, ".pi", "herdr-orchestrator"), { recursive: true });
+  await mkdir(join(cwd, ".baa-ton", "herdr-orchestrator"), { recursive: true });
   await mkdir(configDir, { recursive: true });
   await mkdir(worktree);
   await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);

@@ -28,7 +28,7 @@ async function fixture({ dirty = false, failTab = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "baa-cleanup-sweep-"));
   const cwd = join(directory, "checkout");
   const worktree = join(directory, "orphan-worktree");
-  const manifestPath = join(cwd, ".pi", "herdr-orchestrator", "manifest.json");
+  const manifestPath = join(cwd, ".baa-ton", "herdr-orchestrator", "manifest.json");
   const configDir = join(directory, "config");
   await mkdir(cwd, { recursive: true });
   await git(cwd, "init", "-b", "main");
@@ -165,7 +165,7 @@ async function fixture({ dirty = false, failTab = false } = {}) {
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
   };
-  await mkdir(join(cwd, ".pi", "herdr-orchestrator"), { recursive: true });
+  await mkdir(join(cwd, ".baa-ton", "herdr-orchestrator"), { recursive: true });
   await mkdir(configDir, { recursive: true });
   await writeFile(
     manifestPath,

@@ -13,7 +13,7 @@ async function parentGoalFixture({ workflowStatus = "completed", workflowOutcome
   const directory = await mkdtemp(join(tmpdir(), "baa-parent-goal-"));
   const cwd = join(directory, "task");
   const configDir = join(directory, "config");
-  const manifestDir = join(cwd, ".pi", "herdr-orchestrator");
+  const manifestDir = join(cwd, ".baa-ton", "herdr-orchestrator");
   const manifestPath = join(manifestDir, "manifest.json");
   const root = {
     target: "w1:p1",
@@ -202,7 +202,7 @@ test("planning records a versioned scoped goal graph and per-lane profile", asyn
   const directory = await mkdtemp(join(tmpdir(), "baa-goals-"));
   const cwd = join(directory, "task");
   const configDir = join(directory, "config");
-  const manifestDir = join(cwd, ".pi", "herdr-orchestrator");
+  const manifestDir = join(cwd, ".baa-ton", "herdr-orchestrator");
   const manifestPath = join(manifestDir, "manifest.json");
   const saved = Object.fromEntries(
     [

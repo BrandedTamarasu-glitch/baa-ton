@@ -123,7 +123,7 @@ async function importRouteChildMessage() {
 
 const { routeChildMessage } = await importRouteChildMessage();
 
-const MANIFEST_DIR = ".pi/herdr-orchestrator";
+const MANIFEST_DIR = ".baa-ton/herdr-orchestrator";
 const MANIFEST_NAME = "manifest.json";
 const OWNER = "herdr-orchestrator";
 const BB029_AUTHORIZATION_SCOPE = "BB-029";

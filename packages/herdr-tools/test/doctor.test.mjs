@@ -25,8 +25,8 @@ test("herdr_doctor reports a healthy installation and never mutates the manifest
     ),
   );
   try {
-    const manifestPath = join(cwd, ".pi", "herdr-orchestrator", "manifest.json");
-    await mkdir(join(cwd, ".pi", "herdr-orchestrator"), { recursive: true });
+    const manifestPath = join(cwd, ".baa-ton", "herdr-orchestrator", "manifest.json");
+    await mkdir(join(cwd, ".baa-ton", "herdr-orchestrator"), { recursive: true });
     const manifest = { version: 2, workflows: [] };
     await writeFile(manifestPath, JSON.stringify(manifest));
     const before = await readFile(manifestPath, "utf8");
@@ -100,7 +100,7 @@ test("doctor refreshes a stale config-dir snapshot before synchronous root routi
     ),
   );
   try {
-    const manifestDir = join(cwd, ".pi", "herdr-orchestrator");
+    const manifestDir = join(cwd, ".baa-ton", "herdr-orchestrator");
     await mkdir(manifestDir, { recursive: true });
     const manifestPath = join(manifestDir, "manifest.json");
     await writeFile(manifestPath, JSON.stringify({ version: 2, workflows: [] }));
@@ -183,7 +183,7 @@ test("herdr_doctor fails closed when native Herdr connectivity is unavailable", 
     ),
   );
   try {
-    const manifestDir = join(cwd, ".pi", "herdr-orchestrator");
+    const manifestDir = join(cwd, ".baa-ton", "herdr-orchestrator");
     await mkdir(manifestDir, { recursive: true });
     // loadManifest() falls back to {version:2, workflows:[]} for any version
     // other than 1 or 2, so a legacy/future version is invisible today.
@@ -242,7 +242,7 @@ test("doctor reads the routed manifest and normalizes identity-bound Pi tool att
   const saved = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
   try {
     Object.assign(process.env, env);
-    const manifestDir = join(cwd, ".pi", "herdr-orchestrator");
+    const manifestDir = join(cwd, ".baa-ton", "herdr-orchestrator");
     await mkdir(manifestDir, { recursive: true });
     const manifestPath = join(manifestDir, "manifest.json");
     const startup = join(manifestDir, "startup.json");
@@ -285,7 +285,7 @@ test("lane-bridge-liveness tolerates gone panes only with durable completion rec
   const saved = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
   try {
     Object.assign(process.env, env);
-    const manifestDir = join(cwd, ".pi", "herdr-orchestrator");
+    const manifestDir = join(cwd, ".baa-ton", "herdr-orchestrator");
     await mkdir(manifestDir, { recursive: true });
     const manifestPath = join(manifestDir, "manifest.json");
     const startup = join(manifestDir, "startup.json");

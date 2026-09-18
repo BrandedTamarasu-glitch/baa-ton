@@ -469,7 +469,7 @@ try {
   await chmod(controllerConfigDir, 0o755);
   const legacyManifestPath = join(
     testCwd,
-    ".pi",
+    ".baa-ton",
     "herdr-orchestrator",
     "manifest.json",
   );
@@ -706,7 +706,7 @@ try {
 
   const manifestPath = join(
     testCwd,
-    ".pi",
+    ".baa-ton",
     "herdr-orchestrator",
     "manifest.json",
   );
