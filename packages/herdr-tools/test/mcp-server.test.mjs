@@ -107,7 +107,7 @@ async function rootBridgeFixture() {
 const args = process.argv.slice(2);
 const result = (value) => process.stdout.write(JSON.stringify({ result: value }) + "\\n");
 if (process.env.TEST_COMMAND_LOG)
-  appendFileSync(process.env.TEST_COMMAND_LOG, `${process.pid} ${args.join(" ")}\\n`);
+  appendFileSync(process.env.TEST_COMMAND_LOG, process.pid + " " + args.join(" ") + "\\n");
 if (args[0] === "plugin" && args[1] === "config-dir") {
   result({ config_dir: process.env.TEST_CONFIG_DIR });
 } else if (args[0] === "agent" && args[1] === "list") {
