@@ -126,6 +126,13 @@ const LANE_PERMISSIONS = {
     "Bash(rg:*)",
     "Bash(grep:*)",
     "Bash(sed:*)",
+    // Without these, a dispatched lane's own contract (report via
+    // herdr_message, file the one lane receipt via herdr_complete) is
+    // impossible to fulfil unattended: Claude Code prompts for permission
+    // on every MCP tool call not in this allow-list, and nobody is present
+    // to answer it for a headless dispatched lane.
+    "mcp__herdr-orchestrator__herdr_message",
+    "mcp__herdr-orchestrator__herdr_complete",
   ],
   deny: [
     "Bash(git push:*)",
