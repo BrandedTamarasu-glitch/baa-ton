@@ -49,6 +49,7 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
   let nextId = 0;
   const pending = new Map();
   lines.on("line", (line) => {
+    console.error("mcp line:", line);
     const message = JSON.parse(line);
     pending.get(message.id)?.(message);
     pending.delete(message.id);
