@@ -49,7 +49,6 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
   let nextId = 0;
   const pending = new Map();
   lines.on("line", (line) => {
-    console.error("mcp line:", line);
     const message = JSON.parse(line);
     pending.get(message.id)?.(message);
     pending.delete(message.id);
@@ -206,7 +205,7 @@ test("Windows live identity lookup uses an unqualified Herdr command for native 
   assert.equal(invocation.command, HERDR_COMMAND);
   assert.equal(invocation.command, "herdr");
   assert.deepEqual(invocation.args, ["agent", "list"]);
-  assert.equal(invocation.options.shell, true);
+  assert.notEqual(invocation.options.shell, true);
   assert.equal(invocation.command.endsWith(".cmd"), false);
 });
 
@@ -451,7 +450,6 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
     PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
   };
   try {
-    console.error("mcp concurrent: before first server");
     const first = {
       ...baseEnv,
       CLAUDE_CODE_SESSION_ID: "claude-session-second",
@@ -461,7 +459,6 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
       TEST_ROOT_WORKSPACE: "w-live-b",
     };
     await withMcpServer(first, async (rpc) => {
-      console.error("mcp concurrent: first server started");
       const bootstrap = await rpc("tools/call", {
         name: "herdr_bootstrap_root",
         arguments: { add: true },
@@ -469,9 +466,7 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
       assert.equal(bootstrap.result.isError, undefined);
       assert.equal(bootstrap.result.structuredContent.root.pane_id, "w-live-b:second");
       assert.equal(bootstrap.result.structuredContent.root.workspace_id, "w-live-b");
-      console.error("mcp concurrent: first bootstrap complete");
     }, { cwd: fixture.cwd });
-    console.error("mcp concurrent: first server closed");
 
     const second = {
       ...baseEnv,
@@ -483,7 +478,6 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
       TEST_AGENT_LIST_LOG: join(fixture.directory, "agent-list.log"),
     };
     await withMcpServer(second, async (rpc) => {
-      console.error("mcp concurrent: second server started");
       const bootstrap = await rpc("tools/call", {
         name: "herdr_bootstrap_root",
         arguments: { add: true },
@@ -491,7 +485,6 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
       assert.equal(bootstrap.result.isError, undefined);
       assert.equal(bootstrap.result.structuredContent.root.pane_id, "w-live-c:third");
       assert.equal(bootstrap.result.structuredContent.root.workspace_id, "w-live-c");
-      console.error("mcp concurrent: second bootstrap complete");
 
       const doctor = await rpc("tools/call", {
         name: "herdr_doctor",
@@ -506,7 +499,6 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
         routing.detail,
         /resolved pane_id=w-live-c:third, workspace_id=w-live-c/,
       );
-      console.error("mcp concurrent: second doctor complete");
 
       const plan = await rpc("tools/call", {
         name: "herdr_plan",
@@ -517,9 +509,7 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
       });
       assert.equal(plan.result.isError, undefined);
       assert.match(plan.result.content[0].text, /Planned herdr-/);
-      console.error("mcp concurrent: second plan complete");
     }, { cwd: fixture.cwd });
-    console.error("mcp concurrent: second server closed");
 
     const agentListCalls = (await readFile(join(fixture.directory, "agent-list.log"), "utf8"))
       .trim()

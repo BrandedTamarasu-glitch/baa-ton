@@ -10,9 +10,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   basename,
-  delimiter,
   dirname,
-  extname,
   isAbsolute,
   join,
   resolve,
@@ -53,6 +51,7 @@ import {
   liveHerdrAgentList,
   liveHerdrConfigDirectory,
   liveHerdrPaneProcessInfo,
+  spawnHerdrProcess,
 } from "./live-herdr.mjs";
 import { liveProcessParentPid } from "./live-process.mjs";
 
@@ -63,40 +62,6 @@ const jiti = createJiti(fileURLToPath(import.meta.url), {
   alias: { typebox: require.resolve("typebox") },
 });
 const extension = await jiti.import(join(root, "index.ts"));
-
-function resolveWindowsCommand(command) {
-  if (process.platform !== "win32" || isAbsolute(command) || extname(command))
-    return command;
-  const pathValue = process.env.PATH ?? process.env.Path ?? "";
-  const extensions = (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
-    .split(";")
-    .map((extension) => extension.trim())
-    .filter(Boolean);
-  for (const directory of pathValue.split(delimiter)) {
-    for (const extension of extensions) {
-      const candidate = join(directory, `${command}${extension}`);
-      if (existsSync(candidate)) return candidate;
-    }
-  }
-  return command;
-}
-
-function needsWindowsShell(command) {
-  if (process.platform !== "win32") return false;
-  const extension = extname(command).toLowerCase();
-  return extension === ".bat" || extension === ".cmd";
-}
-
-function spawnBridgeCommand(command, args, options) {
-  const resolvedCommand = resolveWindowsCommand(command);
-  if (!needsWindowsShell(resolvedCommand))
-    return require("node:child_process").spawn(resolvedCommand, args, options);
-  return require("node:child_process").spawn(
-    process.env.ComSpec ?? "cmd.exe",
-    ["/d", "/s", "/c", resolvedCommand, ...args],
-    options,
-  );
-}
 
 // The bridge must expose the same installed model registry the interactive
 // runtime uses. Discovery refreshes the requested provider immediately before
@@ -147,11 +112,19 @@ extension.default({
   registerCommand() {},
   async exec(command, args, options = {}) {
     const result = await new Promise((resolveResult) => {
-      const child = spawnBridgeCommand(command, args, {
-        cwd: process.cwd(),
-        env: process.env,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      const child =
+        command === "herdr"
+          ? spawnHerdrProcess(command, args, {
+              cwd: process.cwd(),
+              env: process.env,
+              spawnProcess: require("node:child_process").spawn,
+              stdio: ["ignore", "pipe", "pipe"],
+            })
+          : require("node:child_process").spawn(command, args, {
+              cwd: process.cwd(),
+              env: process.env,
+              stdio: ["ignore", "pipe", "pipe"],
+            });
       let stdout = "";
       let stderr = "";
       let settled = false;
