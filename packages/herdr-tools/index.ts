@@ -24,6 +24,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { blocksUnmanagedAgentCommand } from "./command-policy.js";
+import { resolvePiSessionIdentity, registerPiIdentityBridge } from "./pi-session-identity.mjs";
 import {
   AUTHORIZATION_CAPABILITIES,
   SUPPORTED_AGENT_KINDS,
@@ -3098,6 +3099,41 @@ async function confirmExecution(
 }
 
 export default function herdrOrchestrator(pi: ExtensionAPI) {
+  registerPiIdentityBridge(pi, (ctx) => inspectPiRootIdentity(ctx, ctx.signal));
+
+  async function inspectPiRootIdentity(ctx: ExtensionContext, signal?: AbortSignal) {
+    requireHerdr();
+    await refreshHerdrIdentity(signal);
+    const scope = requireRootManifestExecutor(ctx.cwd);
+    const root = scope.root;
+    const registrations = readControllerConfigForCurrentPane()?.orchestrators.filter(
+      (item) => item.id === scope.rootId || item.root.pane_id === root.pane_id || item.root.workspace_id === root.workspace_id,
+    );
+    if (registrations?.length !== 1)
+      throw new Error("Native Pi root registration is ambiguous; no identity proof issued.");
+    const raw = await runHerdr(["agent", "get", root.pane_id], signal);
+    const live = liveAgentIdentity(raw, "Pi root identity");
+    if (root.agent_kind !== "pi" || live.kind !== "pi" ||
+        live.paneId !== root.pane_id || live.workspaceId !== root.workspace_id ||
+        (root.target_kind === "name" && live.name !== root.target))
+      throw new Error("Registered root differs from the live Pi pane/workspace/harness.");
+    const proof = await resolvePiSessionIdentity({
+      agent: responseRecord(raw, "Pi root identity").agent, runtime: ctx.sessionManager,
+      paneId: root.pane_id, workspaceId: root.workspace_id, cwd: ctx.cwd,
+    });
+    return { ...proof, registrationId: scope.rootId };
+  }
+
+  async function rootSessionMatches(native: unknown, stored: string | undefined, ctx: ExtensionContext, signal?: AbortSignal) {
+    if (!isRecord(native) || !isRecord(native.agent_session)) return false;
+    if (native.agent !== "pi") return native.agent_session.value === stored;
+    const proof = await inspectPiRootIdentity(ctx, signal);
+    // Historical UUID bindings remain immutable and require the same fresh proof.
+    if (stored === proof.sessionId || stored === proof.sessionPath) return true;
+    if (!stored || !isAbsolute(stored) || /[\u0000-\u001f\u007f]/.test(stored)) return false;
+    try { return await realpath(stored) === proof.sessionPath; } catch { return false; }
+  }
+
   async function runHerdrRaw(
     args: string[],
     signal?: AbortSignal,
@@ -4765,6 +4801,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     launchProfileInput?: unknown,
     queueItemId?: string,
     taskProfileInput?: unknown,
+    ctx?: ExtensionContext,
   ): Promise<Workflow> {
     let objective = objectiveInput?.trim() ?? "";
     let linkedQueueItem: QueueItem | undefined;
@@ -4869,7 +4906,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       throw new Error(
         "Task planning requires a verified native root session path or id.",
       );
-    const rootSessionPath = rootAgent.agent_session.value;
+    if (rootAgent.agent === "pi" && !ctx) throw new Error("Native Pi context is required for planning.");
+    const rootSessionPath = rootAgent.agent === "pi"
+      ? (await inspectPiRootIdentity(ctx!)).sessionPath
+      : rootAgent.agent_session.value;
     const launchProfile =
       configuredProfile?.launchProfile ??
       (launchProfileInput === undefined
@@ -5065,11 +5105,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             await runHerdr(["agent", "get", root.pane_id], signal),
             "task root",
           ).agent;
-          if (
-            !isRecord(native) ||
-            !isRecord(native.agent_session) ||
-            native.agent_session.value !== w.taskBinding.rootSessionPath
-          )
+          if (!(await rootSessionMatches(native, w.taskBinding.rootSessionPath, ctx, signal)))
             throw new Error(
               "Root incarnation changed; authorized task recovery is required before dispatch.",
             );
@@ -5461,11 +5497,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             await runHerdr(["agent", "get", root.pane_id], signal),
             "task root",
           ).agent;
-          if (
-            !isRecord(native) ||
-            !isRecord(native.agent_session) ||
-            native.agent_session.value !== w.taskBinding.rootSessionPath
-          )
+          if (!(await rootSessionMatches(native, w.taskBinding.rootSessionPath, ctx, signal)))
             throw new Error(
               "Root incarnation changed; authorized task recovery is required before native resume.",
             );
@@ -7220,6 +7252,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             );
           if (mismatches.length > 0)
             findings.push(`${orchestrator.id}: ${mismatches.join(", ")}`);
+          else if (live.kind === "pi" && root.pane_id === process.env.HERDR_PANE_ID &&
+              root.workspace_id === process.env.HERDR_WORKSPACE_ID && ctx.sessionManager?.getSessionId) {
+            await inspectPiRootIdentity(ctx, signal);
+          }
         } catch (error) {
           findings.push(
             `${orchestrator.id} (${root.workspace_id}:${root.pane_id}): ${error instanceof Error ? error.message : String(error)}`,
@@ -7229,7 +7265,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       if (findings.length > 0)
         return {
           status: "fail",
-          detail: `Root identity drift blocks safe root operations: ${findings.join("; ")} Run herdr_reconcile_root from the affected live root pane.`,
+          detail: `Root identity drift blocks safe root operations: ${findings.join("; ")} Inspect the named root and live metadata. Use herdr_reconcile_root only for proven registration drift; session proof failures require native identity repair, not a reset.`,
         };
       return {
         status: "ok",
@@ -7749,6 +7785,16 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     },
   });
   pi.registerTool({
+    name: "herdr_root_identity",
+    label: "Inspect Native Pi Root Identity",
+    description: "Read-only proof of the current registered Pi root: native pane/workspace, runtime session UUID, session header and canonical path. Does not register, reconcile, plan or dispatch.",
+    parameters: Type.Object({}, { additionalProperties: false }),
+    async execute(_id, _params, signal, _update, ctx) {
+      const proof = await inspectPiRootIdentity(ctx, signal);
+      return { content: [{ type: "text", text: jsonText(proof) }], details: proof };
+    },
+  });
+  pi.registerTool({
     name: "herdr_reconcile_root",
     label: "Reconcile Herdr Root",
     description:
@@ -8203,6 +8249,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         params.launchProfile,
         params.queueItemId,
         params.taskProfile,
+        ctx,
       );
       return {
         content: [
@@ -8455,7 +8502,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     description: "Create a Herdr workflow plan: /herdr-plan <objective>",
     handler: async (args, ctx) => {
       if (!args.trim()) throw new Error("Usage: /herdr-plan <objective>");
-      const workflow = await plan(ctx.cwd, args.trim(), []);
+      const workflow = await plan(ctx.cwd, args.trim(), [], undefined, undefined, undefined, undefined, undefined, undefined, ctx);
       ctx.ui.notify(`Planned ${workflow.id}`, "info");
     },
   });

@@ -18,6 +18,38 @@ Harness-neutral local workflow operations for Herdr. The local MCP bridge expose
 
 All operations fail closed outside a Herdr session. Dispatch, resume, and close are previews by default. Non-root callers persist a parent-approval request rather than presenting approval UI.
 
+### Native Pi session identity
+
+`herdr_root_identity` is a read-only inspection of the current registered Pi root.
+It checks native pane/workspace/harness and registration, then correlates Herdr's
+`agent_session` (`kind: "id"` or `"path"`) with Pi's live session manager and the
+JSONL session header. Its result includes `version: 1`,
+`source: "baa-ton-native-pi"`, `registrationId`, `paneId`, `workspaceId`,
+`checkout`, `sessionId`, `sessionPath` (canonical), and `nativeSession`.
+An absent `PI_SESSION_FILE` is allowed; a conflicting one is rejected. UUIDs are
+never inferred from filenames. Missing files, mismatching headers, another
+checkout, or stale native identity fail closed.
+
+Trusted Pi extensions can request the same fresh proof by synchronously emitting
+`baa-ton:pi-root-identity:v1` on `pi.events` with `{ respond(promise) { ... } }`.
+The native handler calls `respond` synchronously with a promise for the result;
+consumers must require exactly one responder, handle rejection/timeouts, and
+compare the result with their own current runtime/native observation. A request
+does not supply a runtime context or identity. Baa-ton captures context from Pi
+lifecycle events and inspects Herdr on every request. Missing lifecycle context
+or shutdown prevents proof. This is a trusted in-process extension interface,
+not a signed credential or an authorization grant. It does not modify Herdr's
+separately distributed CLI or `agent get` wire response.
+
+New Pi plans bind the canonical session path. Dispatch/resume check the same
+proof; historical UUID bindings are accepted only for the exact live runtime
+UUID and are not rewritten. Doctor checks this proof for the current Pi root;
+other registered roots still receive their existing native identity checks.
+Doctor's root drift findings identify the affected root; a session proof failure
+is not an instruction to reset registration. This interface addresses
+[Baa-ton #9](https://github.com/zachristmas/baa-ton/issues/9) and the downstream
+[Forge Windows report](https://github.com/BrandedTamarasu-glitch/baa-ton-forge/issues/5).
+
 ## Messaging the parent
 
 A registered child uses `herdr_message` for durable informational context the root should review, including late facts after `herdr_complete`; use the question flow when Zach must decide something, and use `herdr_complete` for the lane's one completion receipt. Messages are not approval requests and are controller-routed to wake the mapped root.

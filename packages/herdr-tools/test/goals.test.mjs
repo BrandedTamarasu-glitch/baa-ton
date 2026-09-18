@@ -262,7 +262,7 @@ test("planning records a versioned scoped goal graph and per-lane profile", asyn
                   agent: "pi",
                   pane_id: "w1:p1",
                   workspace_id: "w1",
-                  agent_session: { kind: "path", value: "/sessions/root" },
+                  agent_session: { kind: "path", value: join(cwd, "root-session.jsonl") },
                 },
               },
             }),
@@ -270,6 +270,7 @@ test("planning records a versioned scoped goal graph and per-lane profile", asyn
         throw new Error(`unexpected herdr ${args.join(" ")}`);
       },
     });
+    await writeFile(join(cwd, "root-session.jsonl"), JSON.stringify({ type: "session", id: "01a0b04d-0bef-7207-b486-d51d62f0e3dc", cwd }) + "\n");
     const fallback = {
       provider: "openai-codex",
       model: "gpt-5.6-luna",
@@ -289,7 +290,7 @@ test("planning records a versioned scoped goal graph and per-lane profile", asyn
       },
       undefined,
       undefined,
-      { cwd, hasUI: false, mode: "json" },
+      { cwd, hasUI: false, mode: "json", sessionManager: { getSessionId: () => "01a0b04d-0bef-7207-b486-d51d62f0e3dc", getSessionFile: () => join(cwd, "root-session.jsonl") } },
     );
     const workflow = result.details.workflow;
     assert.equal(workflow.goalSchemaVersion, 1);
