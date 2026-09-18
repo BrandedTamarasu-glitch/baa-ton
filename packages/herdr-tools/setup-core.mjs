@@ -229,7 +229,12 @@ export function updateSkillContent({ projectRoot }) {
     "",
     "1. Preserve the project's `BAA.md`, `.baa-ton/config.json`, instruction files, and user-authored skills.",
     `2. Update the checkout with \`git -C "${checkoutDirectory}" pull --ff-only\`. If the checkout has local changes or the fast-forward fails, stop and report it.`,
-    `3. Install dependency changes with \`npm --prefix "${checkoutDirectory}" install --no-audit --no-fund\`.`,
+    // npm's --prefix only changes where node_modules/package-lock end up; it
+    // does not redirect which package.json npm reads dependencies from --
+    // that still comes from the shell's cwd, so `npm --prefix "<dir>"
+    // install` run from an unrelated directory fails looking for a
+    // package.json that isn't there. cd into the checkout first instead.
+    `3. Install dependency changes: \`cd "${checkoutDirectory}" && npm install --no-audit --no-fund\`.`,
     `4. Refresh the project integrations with \`node "${setupPath}" --project-root "${projectRoot}" --non-interactive\`.`,
     "5. Report the new checkout commit and any preserved or changed project configuration. Restart the harness only if its integration requires it.",
     "6. Do not reset active Herdr roots, retire resources, initialize goals, plan work, or dispatch lanes as part of an update.",
