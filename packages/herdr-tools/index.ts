@@ -5056,7 +5056,19 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       }
       const explicitlyCompleted = workflowHasExplicitSuccess(stored);
       if (observations.length > 0) {
-        stored.status = explicitlyCompleted ? "completed" : observedStatus;
+        const retryableDispatchFailure =
+          !explicitlyCompleted &&
+          stored.retry?.state === "retryable" &&
+          (stored.status === "dispatch-failed" || stored.status === "unknown") &&
+          observedStatus === "unknown";
+        // Herdr's idle/unknown snapshot is telemetry, not a replacement for a
+        // durable dispatch failure. Preserve the retryable state so the
+        // manifest's own retryCommand remains executable after observe().
+        stored.status = explicitlyCompleted
+          ? "completed"
+          : retryableDispatchFailure
+            ? "dispatch-failed"
+            : observedStatus;
         stored.outcome = explicitlyCompleted ? "completed" : "unknown";
       }
       stored.observedAt = now();
