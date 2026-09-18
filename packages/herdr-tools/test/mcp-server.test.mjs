@@ -100,6 +100,8 @@ async function rootBridgeFixture() {
   const script = `const { appendFileSync } = require("node:fs");
 const args = process.argv.slice(2);
 const result = (value) => process.stdout.write(JSON.stringify({ result: value }) + "\\n");
+if (process.env.TEST_COMMAND_LOG)
+  appendFileSync(process.env.TEST_COMMAND_LOG, `${process.pid} ${args.join(" ")}\\n`);
 if (args[0] === "plugin" && args[1] === "config-dir") {
   result({ config_dir: process.env.TEST_CONFIG_DIR });
 } else if (args[0] === "agent" && args[1] === "list") {
@@ -482,6 +484,7 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
       TEST_LIVE_WORKSPACE: "w-live-c",
       TEST_ROOT_WORKSPACE: "w-live-c",
       TEST_AGENT_LIST_LOG: join(fixture.directory, "agent-list.log"),
+      TEST_COMMAND_LOG: join(fixture.directory, "command.log"),
     };
     await withMcpServer(second, async (rpc) => {
       if (process.env.BAA_DEBUG_WINDOWS_MCP) console.error("second server start");
