@@ -13,27 +13,38 @@ const here = dirname(fileURLToPath(import.meta.url));
 const serverPath = join(here, "..", "mcp-server.mjs");
 
 async function withMcpServer(env, run, { cwd = here } = {}) {
+  const childEnv = {
+    ...process.env,
+    // A lane shell exports its startup intent for the harness bridge. The
+    // test bridge must never merge into that live intent while test files
+    // execute concurrently; fixtures below provide their own config when
+    // they need one.
+    BAA_STARTUP_INTENT: undefined,
+    CLAUDE_CODE_SESSION_ID: undefined,
+    HERDR_PLUGIN_CONFIG_DIR: undefined,
+    HERDR_PLUGIN_STATE_DIR: undefined,
+    HERDR_PANE_ID: "w-test:p1",
+    HERDR_WORKSPACE_ID: "w-test",
+    ...env,
+  };
+  // Windows environment keys are case-insensitive, but Node inherits the
+  // spelling `Path`. Supplying a test-only `PATH` alongside it can leave the
+  // inherited search path active, causing the real Herdr binary to win over
+  // the fixture at the front of the intended path.
+  if (process.platform === "win32" && (env.PATH ?? env.Path)) {
+    childEnv.Path = env.PATH ?? env.Path;
+    delete childEnv.PATH;
+  }
   const child = spawn(process.execPath, [serverPath], {
     cwd,
     // Pin a neutral Herdr identity so behavior is identical whether the
     // suite runs from a lane pane or from the registered root pane; callers
     // may still override via `env`.
-    env: {
-      ...process.env,
-      // A lane shell exports its startup intent for the harness bridge. The
-      // test bridge must never merge into that live intent while test files
-      // execute concurrently; fixtures below provide their own config when
-      // they need one.
-      BAA_STARTUP_INTENT: undefined,
-      CLAUDE_CODE_SESSION_ID: undefined,
-      HERDR_PLUGIN_CONFIG_DIR: undefined,
-      HERDR_PLUGIN_STATE_DIR: undefined,
-      HERDR_PANE_ID: "w-test:p1",
-      HERDR_WORKSPACE_ID: "w-test",
-      ...env,
-    },
+    env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
   });
+  if (env.TEST_MCP_PID_FILE)
+    await writeFile(env.TEST_MCP_PID_FILE, String(child.pid));
   let stderr = "";
   child.stderr.on("data", (chunk) => (stderr += chunk));
   const lines = createInterface({ input: child.stdout });
@@ -69,17 +80,24 @@ async function rootBridgeFixture() {
   const stateDir = join(directory, "config");
   const cwd = join(directory, "workspace");
   const binDir = join(directory, "bin");
+  const mcpPidFile = join(directory, "mcp.pid");
   const herdr = join(
     binDir,
     process.platform === "win32" ? "herdr.cmd" : "herdr",
   );
-  const herdrScript = join(binDir, "herdr.mjs");
+  // The Windows wrapper invokes this fixture with Node directly. Keep the
+  // CommonJS source in a .cjs file there; Node treats .mjs as ESM and would
+  // reject the fixture's require("node:fs") before Herdr can answer.
+  const herdrScript = join(
+    binDir,
+    process.platform === "win32" ? "herdr.cjs" : "herdr.mjs",
+  );
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
   await mkdir(cwd, { recursive: true });
   await mkdir(binDir, { recursive: true, mode: 0o700 });
   // This read-only native stub proves the bridge uses the live pane identity
   // while keeping the test independent of a focused Herdr client.
-  const script = `const { appendFileSync } = require("node:fs");
+  const script = `const { appendFileSync, readFileSync } = require("node:fs");
 const args = process.argv.slice(2);
 const result = (value) => process.stdout.write(JSON.stringify({ result: value }) + "\\n");
 if (args[0] === "plugin" && args[1] === "config-dir") {
@@ -122,10 +140,13 @@ if (args[0] === "plugin" && args[1] === "config-dir") {
 } else if (args[0] === "pane" && args[1] === "process-info") {
   const pane = args[3];
   const matches = pane === process.env.TEST_PROCESS_MATCH_PANE;
+  const matchedPid = process.env.TEST_MCP_PID_FILE
+    ? Number(readFileSync(process.env.TEST_MCP_PID_FILE, "utf8"))
+    : process.ppid;
   result({
     type: "pane_process_info",
     process_info: {
-      foreground_processes: matches ? [{ pid: process.ppid }] : [],
+      foreground_processes: matches ? [{ pid: matchedPid }] : [],
     },
   });
 } else if (args[0] === "pane" && args[1] === "get") {
@@ -146,7 +167,10 @@ if (args[0] === "plugin" && args[1] === "config-dir") {
 `;
   if (process.platform === "win32") {
     await writeFile(herdrScript, script);
-    await writeFile(herdr, `@echo off\r\nnode "%~dp0herdr.mjs" %*\r\n`);
+    await writeFile(
+      herdr,
+      `@echo off\r\nnode "%~dp0herdr.cjs" %*\r\nexit /b %errorlevel%\r\n`,
+    );
   } else {
     await writeFile(herdr, `#!/usr/bin/env node\n${script}`, { mode: 0o755 });
   }
@@ -155,6 +179,7 @@ if (args[0] === "plugin" && args[1] === "config-dir") {
     stateDir,
     cwd,
     binDir,
+    mcpPidFile,
     root: {
       target: "w-root:root",
       target_kind: "pane_id",
@@ -173,6 +198,7 @@ test("Windows live identity lookup uses an unqualified Herdr command for native 
   let invocation;
   const result = await liveHerdrAgentList({
     platform: "win32",
+    env: { PATH: "", Path: "" },
     spawnProcess: (command, args, options) => {
       invocation = { command, args, options };
       queueMicrotask(() => {
@@ -187,7 +213,7 @@ test("Windows live identity lookup uses an unqualified Herdr command for native 
   assert.equal(invocation.command, HERDR_COMMAND);
   assert.equal(invocation.command, "herdr");
   assert.deepEqual(invocation.args, ["agent", "list"]);
-  assert.equal(invocation.options.shell, true);
+  assert.notEqual(invocation.options.shell, true);
   assert.equal(invocation.command.endsWith(".cmd"), false);
 });
 
@@ -532,6 +558,7 @@ test("MCP pane process correlation survives a regenerated Claude session id", as
         TEST_LIVE_WORKSPACE: "w-process",
         TEST_LIVE_CWD: "C:\\cic",
         TEST_PROCESS_MATCH_PANE: "w-process:current",
+        TEST_MCP_PID_FILE: fixture.mcpPidFile,
         TEST_ROOT_WORKSPACE: "w-process",
         PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
       },

@@ -3804,6 +3804,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       );
     const current = rootForPaneAndCwd(config);
     const conflictingPaneRoot = rootForPane(config);
+    const existingStateMessage = (
+      candidate: ControllerConfig | undefined,
+    ): string =>
+      rootForWorkspace(candidate)
+        ? "Controller config or parent manifest has existing state, including a root already registered in this pane's workspace. Review it, then call herdr_bootstrap_root with reset=true to retire it before claiming this manually started root."
+        : "Controller config or parent manifest has existing state from a different pane/workspace. This pane's workspace has no existing root, so add=true registers a concurrent root without touching any existing root or manifest state; use reset=true only if you intend to retire every existing root and wipe the shared parent manifest for this cwd.";
     const labelEvidence: string[] = [];
     let rootTabId: string | undefined;
     // Best-effort sync read for display labels only; authoritative manifest
@@ -3937,10 +3943,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       !add &&
       ((config && config.orchestrators.length > 0) || manifestHasLegacyState)
     ) {
-      if (!reset)
-        throw new Error(
-          "Controller config or parent manifest has existing state. Review it, then call herdr_bootstrap_root with reset=true to retire it before claiming this manually started root.",
-        );
+      if (!reset) throw new Error(existingStateMessage(config));
     }
     const label = add
       ? "Add this manually started Baa-ton root"
@@ -3996,9 +3999,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               manifestHasState(latestManifest)) &&
             !reset
           )
-            throw new Error(
-              "Controller config or parent manifest has existing state. Review it, then call herdr_bootstrap_root with reset=true to retire it before claiming this manually started root.",
-            );
+            throw new Error(existingStateMessage(latestConfig));
           const bootstrapStamp = now();
           const rootScope: CurrentRootScope = {
             rootId: next.id,

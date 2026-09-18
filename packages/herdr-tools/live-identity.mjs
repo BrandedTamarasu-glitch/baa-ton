@@ -249,6 +249,11 @@ export async function resolveHerdrIdentity({
   // the MCP/Claude PID is still an unambiguous pane anchor. Cwd is only a
   // tiebreaker if Herdr reports the same PID in multiple panes.
   const candidates = liveClaudeAgents(agents);
+  const sessionMatches = candidates.filter(
+    (agent) =>
+      isRecord(agent.agent_session) &&
+      nonEmptyString(agent.agent_session.value) === sessionId,
+  );
   const processLookup = await resolveProcessMatches({
     agents: candidates,
     listPaneProcesses,
@@ -259,7 +264,10 @@ export async function resolveHerdrIdentity({
     ),
     currentProcessPid,
     getParentPid,
-    maxProcessAncestorDepth,
+    // A unique live session match is already sufficient after direct process
+    // evidence. Avoid an expensive Windows ancestor walk in the common case;
+    // reserve wrapper traversal for regenerated/missing session ids.
+    maxProcessAncestorDepth: sessionMatches.length === 1 ? 0 : maxProcessAncestorDepth,
   });
   const processMatches = processLookup.matches;
   if (processMatches.length === 1) return agentIdentity(processMatches[0]);
@@ -273,11 +281,6 @@ export async function resolveHerdrIdentity({
     );
   }
 
-  const sessionMatches = candidates.filter(
-    (agent) =>
-      isRecord(agent.agent_session) &&
-      nonEmptyString(agent.agent_session.value) === sessionId,
-  );
   if (sessionMatches.length === 1) return agentIdentity(sessionMatches[0]);
   if (sessionMatches.length > 1)
     throw new Error(

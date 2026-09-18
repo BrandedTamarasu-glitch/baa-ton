@@ -141,6 +141,47 @@ test("the live pane process match walks through wrapper ancestors", async () => 
   assert.deepEqual(visited, [4440, 66308, 79844]);
 });
 
+test("a unique live session skips ancestor lookup after direct process miss", async () => {
+  let parentLookups = 0;
+  const identity = await resolveHerdrIdentity({
+    env: {
+      HERDR_PANE_ID: "w-frozen:old",
+      HERDR_WORKSPACE_ID: "w-frozen",
+      CLAUDE_CODE_SESSION_ID: "stable-live-session",
+    },
+    currentProcessPids: [4242],
+    listAgents: async () => ({
+      result: {
+        agents: [
+          {
+            agent: "claude",
+            pane_id: "w-live:current",
+            workspace_id: "w-live",
+            agent_session: {
+              agent: "claude",
+              kind: "id",
+              value: "stable-live-session",
+            },
+          },
+        ],
+      },
+    }),
+    listPaneProcesses: async () => ({
+      result: { process_info: { foreground_processes: [] } },
+    }),
+    getParentPid: async () => {
+      parentLookups += 1;
+      throw new Error("ancestor lookup should be skipped");
+    },
+  });
+
+  assert.deepEqual(identity, {
+    paneId: "w-live:current",
+    workspaceId: "w-live",
+  });
+  assert.equal(parentLookups, 0);
+});
+
 test("a registered live static root remains usable when Claude's session id is absent from Herdr", async () => {
   const identity = await resolveHerdrIdentity({
     env: {

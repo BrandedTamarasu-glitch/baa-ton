@@ -8,7 +8,13 @@
  */
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  resolve,
+} from "node:path";
 import {
   lstat,
   mkdir,
@@ -45,6 +51,7 @@ import {
   liveHerdrAgentList,
   liveHerdrConfigDirectory,
   liveHerdrPaneProcessInfo,
+  spawnHerdrProcess,
 } from "./live-herdr.mjs";
 import { liveProcessParentPid } from "./live-process.mjs";
 
@@ -105,11 +112,19 @@ extension.default({
   registerCommand() {},
   async exec(command, args, options = {}) {
     const result = await new Promise((resolveResult) => {
-      const child = require("node:child_process").spawn(command, args, {
-        cwd: process.cwd(),
-        env: process.env,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      const child =
+        command === "herdr"
+          ? spawnHerdrProcess(command, args, {
+              cwd: process.cwd(),
+              env: process.env,
+              spawnProcess: require("node:child_process").spawn,
+              stdio: ["ignore", "pipe", "pipe"],
+            })
+          : require("node:child_process").spawn(command, args, {
+              cwd: process.cwd(),
+              env: process.env,
+              stdio: ["ignore", "pipe", "pipe"],
+            });
       let stdout = "";
       let stderr = "";
       let settled = false;

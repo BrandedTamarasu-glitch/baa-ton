@@ -1,8 +1,58 @@
 import { spawn as defaultSpawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import {
+  delimiter,
+  extname,
+  isAbsolute,
+  join,
+} from "node:path";
 
 export const HERDR_COMMAND = "herdr";
 export const CONTROLLER_PLUGIN_ID = "herdr-orchestrator-controller";
 const DEFAULT_TIMEOUT_MS = 35_000;
+
+function resolveWindowsCommand(command, platform, env) {
+  if (platform !== "win32" || isAbsolute(command) || extname(command))
+    return command;
+  const pathValue = env.PATH ?? env.Path ?? "";
+  const extensions = (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((extension) => extension.trim())
+    .filter(Boolean);
+  for (const directory of pathValue.split(delimiter)) {
+    for (const extension of extensions) {
+      const candidate = join(directory, `${command}${extension}`);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return command;
+}
+
+function needsWindowsShell(command, platform) {
+  if (platform !== "win32") return false;
+  const extension = extname(command).toLowerCase();
+  return extension === ".bat" || extension === ".cmd";
+}
+
+export function spawnHerdrProcess(
+  command,
+  args,
+  {
+    platform = process.platform,
+    env = process.env,
+    spawnProcess = defaultSpawn,
+    ...options
+  } = {},
+) {
+  const resolvedCommand = resolveWindowsCommand(command, platform, env);
+  if (!needsWindowsShell(resolvedCommand, platform))
+    return spawnProcess(resolvedCommand, args, options);
+  return spawnProcess(
+    env.ComSpec ?? "cmd.exe",
+    ["/d", "/s", "/c", resolvedCommand, ...args],
+    options,
+  );
+}
 
 async function runHerdrCommand(args, {
   spawnProcess = defaultSpawn,
@@ -14,10 +64,11 @@ async function runHerdrCommand(args, {
   const output = await new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawnProcess(HERDR_COMMAND, args, {
+      child = spawnHerdrProcess(HERDR_COMMAND, args, {
         cwd,
         env,
-        shell: platform === "win32",
+        platform,
+        spawnProcess,
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (error) {
