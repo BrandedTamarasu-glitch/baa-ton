@@ -758,6 +758,10 @@ function requestKey(id) {
 }
 
 async function callTool(id, params) {
+  const debug = (...values) => {
+    if (process.env.BAA_DEBUG_WINDOWS_MCP)
+      console.error("mcp-server", id, params?.name ?? "", ...values);
+  };
   if (!isHerdrSession())
     return toolError(
       "Herdr Orchestrator tools are available only inside a HERDR_ENV=1 session.",
@@ -784,7 +788,9 @@ async function callTool(id, params) {
     // Claude's project-scoped MCP registration may contain a stale pane
     // snapshot. Refresh the process environment from Claude's live session
     // id before any route, lifecycle, inbox, or extension root check runs.
+    debug("before identity");
     await refreshCurrentHerdrIdentity();
+    debug("after identity");
   } catch (error) {
     return toolError(
       `Unable to resolve the current Herdr identity: ${error instanceof Error ? error.message : String(error)}`,
@@ -818,7 +824,9 @@ async function callTool(id, params) {
         timedOut = true;
         controller.abort();
       }, timeout);
+    debug("before begin");
     turn = await beginMcpTurn(id, controller);
+    debug("after begin");
 
     // A parent answer to a brokered permission request is already durable in
     // the inbox. It must not be routed through the legacy question ledger.
@@ -827,7 +835,9 @@ async function callTool(id, params) {
       if (permissionAnswer) return outputResult(permissionAnswer);
     }
 
+    debug("before persist");
     entry = await persistBridgeMessage(params.name, args, id);
+    debug("after persist");
     if (entry && !entry.created) {
       if (entry.message.result !== undefined)
         return outputResult(entry.message.result);
@@ -837,6 +847,7 @@ async function callTool(id, params) {
           `Tool call ${params.name} is pending review because its previous delivery was uncertain.`,
         );
     }
+    debug("before execute");
     let output = await definition.execute(
       "mcp",
       args,
@@ -853,7 +864,9 @@ async function callTool(id, params) {
     ) {
       output = withRootBriefing(output);
     }
+    debug("after execute");
     await finishBridgeMessage(entry, output);
+    debug("after finish");
     return outputResult(output);
   } catch (caught) {
     const cause = caught instanceof Error ? caught : new Error(String(caught));
@@ -875,7 +888,9 @@ async function callTool(id, params) {
     if (key) activeRequests.delete(key);
     if (turn) {
       try {
+        debug("before end");
         await endMcpTurn(turn, controller);
+        debug("after end");
       } catch (lifecycleError) {
         // Tool results are already durable; lifecycle failure invalidates the
         // root idle proof and is intentionally visible in the server log.
