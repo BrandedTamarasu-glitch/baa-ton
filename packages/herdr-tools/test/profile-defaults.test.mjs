@@ -170,14 +170,14 @@ test("modelForProfile falls back to the harness's single default model when its 
   for (const profile of Object.values(result)) assert.equal(profile.launchProfile.model, "claude-sonnet-5");
 });
 
-test("modelForProfile sticks to Pi's gpt-5.6+/gpt-6+ generation, ranked by cost within that set, and reserves the pre-5.6 codex-spark for the cheap tier only", () => {
+test("modelForProfile uses the hand-curated Codex-family map for Pi: gpt-5.6-luna for cheap, gpt-5.3-codex-spark for quick specifically", () => {
   // Real shape from @earendil-works/pi-coding-agent's ModelRuntime.getAvailable():
-  // no priority/tier field anywhere. Cost alone is unreliable across Pi's full
-  // catalog (verified live: gpt-5.4 and gpt-5.3-codex-spark are priced ABOVE
-  // gpt-5.6-luna despite being older/subscription models, not better ones) --
-  // so older generations are excluded from ranking entirely, except spark,
-  // which Zach's own usage confirms as the intended cheap pick specifically
-  // because it runs on a flat subscription rather than its sticker price.
+  // no priority/tier field anywhere, and cost is unusable as a stand-in
+  // (verified live: gpt-5.3-codex-spark priced ABOVE gpt-5.6-luna despite
+  // being the intended quick/subscription pick, not a pricier one) -- so this
+  // is a plain hand-curated map instead of any ranking, verified against
+  // actual usage. "quick" gets spark specifically; "sustained" is also tier
+  // "cheap" but stays on the generic luna pick.
   const detectionResults = {
     pi: {
       defaultModel: "gpt-5.6-terra",
@@ -196,31 +196,58 @@ test("modelForProfile sticks to Pi's gpt-5.6+/gpt-6+ generation, ranked by cost 
   };
   const result = defaultLaunchProfiles(["pi"], detectionResults, TASK_PROFILES);
   assert.equal(result.quick.launchProfile.model, "gpt-5.3-codex-spark");
-  assert.equal(result.sustained.launchProfile.model, "gpt-5.3-codex-spark");
-  assert.equal(result["deep-review"].launchProfile.model, "gpt-6-astra");
+  assert.equal(result.sustained.launchProfile.model, "gpt-5.6-luna");
+  assert.equal(result.balanced.launchProfile.model, "gpt-5.6-terra");
   assert.equal(result.planning.launchProfile.model, "gpt-5.6-sol");
+  assert.equal(result["deep-review"].launchProfile.model, "gpt-6-astra");
   assert.notEqual(result.planning.launchProfile.model, "gpt-5.4");
 });
 
-test("modelForProfile falls back to OpenCode's single default for every profile: its catalog has no priority signal, and its resold per-model pricing doesn't track capability either", () => {
+test("modelForProfile applies the same hand-curated Codex-family map to OpenCode's openai-routed models, id prefix and all", () => {
   const detectionResults = {
     opencode: {
-      defaultModel: "github-copilot/gpt-5.6-luna",
+      defaultModel: "openai/gpt-5.6-terra",
       defaultThinking: "medium",
       source: "file",
       warnings: [],
       catalog: [
-        // Real-world shape: OpenCode's github-copilot resale pricing put the
-        // OLDER gpt-5.4 above gpt-5.6-terra -- cost tracks reseller billing
-        // here, not capability, so it must not be used to pick a "flagship".
-        { id: "github-copilot/gpt-5.4", label: "GPT 5.4", provider: "github-copilot", cost: { output: 15 }, thinkingLevels: [] },
-        { id: "github-copilot/gpt-5.6-terra", label: "Terra", provider: "github-copilot", cost: { output: 12 }, thinkingLevels: [] },
-        { id: "github-copilot/gpt-5.6-luna", label: "Luna", provider: "github-copilot", cost: { output: 1.2 }, thinkingLevels: [] },
+        // OpenCode's ids are provider-prefixed ("openai/gpt-5.6-sol"), unlike
+        // Pi's bare ids -- the lookup has to strip that prefix to match the
+        // same CODEX_FAMILY_TIER map. Cost is included to prove it's ignored:
+        // OpenCode reports flat $0 for all of these (subscription access, no
+        // metering), which is exactly why this is a plain hardcoded map.
+        { id: "openai/gpt-5.3-codex-spark", label: "Spark", provider: "openai", cost: { output: 0 }, thinkingLevels: [] },
+        { id: "openai/gpt-5.6-luna", label: "Luna", provider: "openai", cost: { output: 0 }, thinkingLevels: [] },
+        { id: "openai/gpt-5.6-terra", label: "Terra", provider: "openai", cost: { output: 0 }, thinkingLevels: [] },
+        { id: "openai/gpt-5.6-sol", label: "Sol", provider: "openai", cost: { output: 0 }, thinkingLevels: [] },
+        // A github-copilot resale of the same model family, priced above
+        // Sol despite being the identical underlying model -- must be
+        // ignored since it's a different provider than CODEX_FAMILY_PROVIDER.opencode.
+        { id: "github-copilot/gpt-5.6-sol", label: "Sol (Copilot)", provider: "github-copilot", cost: { output: 90 }, thinkingLevels: [] },
       ],
     },
   };
   const result = defaultLaunchProfiles(["opencode"], detectionResults, TASK_PROFILES);
-  for (const profile of Object.values(result)) assert.equal(profile.launchProfile.model, "github-copilot/gpt-5.6-luna");
+  assert.equal(result.quick.launchProfile.model, "openai/gpt-5.3-codex-spark");
+  assert.equal(result.sustained.launchProfile.model, "openai/gpt-5.6-luna");
+  assert.equal(result.planning.launchProfile.model, "openai/gpt-5.6-sol");
+  assert.notEqual(result.planning.launchProfile.model, "github-copilot/gpt-5.6-sol");
+});
+
+test("modelForProfile falls back to the single default when neither harness catalog data nor the Codex-family map applies", () => {
+  const detectionResults = {
+    opencode: {
+      defaultModel: "github-copilot/claude-sonnet-5",
+      defaultThinking: "medium",
+      source: "file",
+      warnings: [],
+      // Only a github-copilot catalog -- no "openai"-provider entries at all,
+      // so the Codex-family map has nothing to match against.
+      catalog: [{ id: "github-copilot/claude-sonnet-5", label: "Sonnet", provider: "github-copilot", cost: { output: 10 }, thinkingLevels: [] }],
+    },
+  };
+  const result = defaultLaunchProfiles(["opencode"], detectionResults, TASK_PROFILES);
+  for (const profile of Object.values(result)) assert.equal(profile.launchProfile.model, "github-copilot/claude-sonnet-5");
 });
 
 test("buildProfileTemplates adds the cross-vendor review template only when claude and codex are both selected and usable", () => {

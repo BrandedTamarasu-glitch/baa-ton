@@ -12,41 +12,50 @@ const HARNESS_TO_PROVIDER = {
   opencode: "opencode",
 };
 
-// Pi's SDK catalog carries no priority/description signal at all, only
-// cost -- and cost turned out to reflect reseller/subscription billing,
-// not capability (verified wrong twice: gpt-5.3-codex-spark priced above
-// gpt-5.6-luna despite being the cheap/subscription pick in practice, and
-// OpenCode's github-copilot resale pricing put the older gpt-5.4 above
-// gpt-5.6-terra). Cost-based ranking was dropped entirely for OpenCode as
-// a result -- no reliable tier signal exists there, so it falls back to
-// the single detected default like any other unranked catalog.
+// Neither Pi's SDK catalog nor OpenCode's CLI catalog carries a priority
+// signal, and both harnesses' cost data turned out to be unusable as a
+// stand-in: Pi's cost reflects reseller billing, not capability
+// (gpt-5.3-codex-spark priced above gpt-5.6-luna despite being the
+// intended cheap/subscription pick), and OpenCode reports flat $0 for
+// every one of its openai-routed entries (subscription access, no
+// metering exposed at all -- there's no numeric signal there whatsoever).
 //
-// For Pi specifically, Zach's own usage is the actual signal: stick to
-// the gpt-5.6+/gpt-6+ generation for real work, except the cheap tier,
-// which should get gpt-5.3-codex-spark precisely because it runs on a
-// flat subscription rather than being billed at its sticker price. This
-// is hand-curated the same way Claude's static catalog is (see
-// harness-catalog.json) -- verified, not inferred -- not the live-ranking
-// approach Codex's genuinely volatile catalog needs.
-const PI_MODERN_GENERATION = /^gpt-(?:5\.6|6)(?:[.-]|$)/;
-const PI_CHEAP_MODEL_ID = "gpt-5.3-codex-spark";
+// Both harnesses can route through the same underlying OpenAI/Codex model
+// family though (Pi via its "openai-codex" provider, OpenCode via its
+// "openai" provider), so it gets ONE hand-curated tier map, verified
+// against Zach's actual usage the same way Claude's static catalog is
+// (see harness-catalog.json) -- not inferred from either harness's live
+// data. Deliberately small: only the models actually worth auto-picking
+// get a tier; anything else (older generations, other providers/models)
+// stays reachable only via the manual per-profile picker.
+//
+// This needs re-verifying whenever the model lineup moves -- see
+// github.com/zachristmas/baa-ton#7 for the planned scheduled job to catch
+// that drift instead of relying on someone noticing a bad pick.
+const CODEX_FAMILY_PROVIDER = { pi: "openai-codex", opencode: "openai" };
+const CODEX_FAMILY_TIER = {
+  "gpt-5.6-luna": "cheap",
+  "gpt-5.6-terra": "build",
+  "gpt-5.6-sol": "frontier",
+  "gpt-6-astra": "flagship",
+};
+// "quick" specifically gets the pre-5.6 gpt-5.3-codex-spark instead of the
+// generic "cheap" tier's gpt-5.6-luna -- it runs on a flat subscription
+// rather than being billed at its sticker price, so it's cheaper in
+// practice despite being an older generation. "sustained" is also tier
+// "cheap" but stays on the generic luna pick; this is a profile-specific
+// override, not a tier-wide one.
+const CODEX_FAMILY_PROFILE_OVERRIDE = {
+  quick: "gpt-5.3-codex-spark",
+};
 
-/** Cost-rank Pi's gpt-5.6+/gpt-6+ models only (see comment above) -- cost is a coherent signal within that single-vendor, single-generation set, unlike across Pi's full mixed-generation, mixed-reseller catalog. */
-function pickPiModelForTier(detection, tier) {
-  if (tier === "cheap") {
-    const spark = (detection.catalog ?? []).find((entry) => entry.id === PI_CHEAP_MODEL_ID);
-    if (spark) return spark;
-  }
-  const modern = (detection.catalog ?? []).filter(
-    (entry) => PI_MODERN_GENERATION.test(entry.id ?? "") && typeof entry.cost?.output === "number",
+/** Look up a harness's catalog entry for this profile/tier in the hand-curated Codex-family map (see above), matching on the id with any "provider/" prefix stripped (OpenCode's ids are "openai/gpt-5.6-sol"; Pi's are bare). */
+function pickCodexFamilyModel(detection, profileName, tier, provider) {
+  const targetId = CODEX_FAMILY_PROFILE_OVERRIDE[profileName] ?? Object.keys(CODEX_FAMILY_TIER).find((id) => CODEX_FAMILY_TIER[id] === tier);
+  if (!targetId) return undefined;
+  return (detection.catalog ?? []).find(
+    (entry) => entry.provider === provider && (entry.id ?? "").replace(/^[^/]+\//, "") === targetId,
   );
-  if (modern.length === 0) return undefined;
-  const ranked = [...modern].sort((a, b) => b.cost.output - a.cost.output).map((entry, index) => ({ ...entry, priority: index }));
-  if (tier === "flagship") return ranked[0];
-  if (tier === "frontier") return ranked[1] ?? ranked[0];
-  if (tier === "cheap") return ranked[ranked.length - 1];
-  const midIndex = ranked.length === 2 ? 1 : Math.floor(ranked.length / 2);
-  return ranked[midIndex];
 }
 
 const EFFORT_LADDER = ["low", "medium", "high", "xhigh", "max"];
@@ -146,12 +155,10 @@ function pickCatalogEntryForTier(ranked, tier) {
  * (in order): an explicit hand-curated `tier` on a catalog entry (safe for
  * a static, maintained list like Claude's -- no live volatility to guard
  * against); tier-based inference from a live catalog's own priority
- * ranking (Codex's case, where no one can hand-curate); Pi's own
- * hand-curated generation/cheap-tier rule (see PI_MODERN_GENERATION above
- * -- Pi's SDK has no priority signal, and its cost data turned out to
- * reflect billing, not capability); the harness's single detected default
- * when none of the above apply. Never a hardcoded model name outside of
- * Pi's verified exception above.
+ * ranking (Codex's case, where no one can hand-curate); the hand-curated
+ * Codex-family tier map (see CODEX_FAMILY_TIER above -- Pi and OpenCode's
+ * catalogs carry no usable signal of their own); the harness's single
+ * detected default when none of the above apply.
  */
 function modelForProfile(profileName, detection, harnessId, tierOverride) {
   const tier = tierOverride ?? PROFILE_MODEL_TIER[profileName];
@@ -160,9 +167,10 @@ function modelForProfile(profileName, detection, harnessId, tierOverride) {
     if (explicit) return { modelId: explicit.id, thinkingLevels: explicit.thinkingLevels };
     const picked = pickCatalogEntryForTier(rankedCatalog(detection), tier);
     if (picked) return { modelId: picked.id, thinkingLevels: picked.thinkingLevels };
-    if (harnessId === "pi") {
-      const pickedForPi = pickPiModelForTier(detection, tier);
-      if (pickedForPi) return { modelId: pickedForPi.id, thinkingLevels: pickedForPi.thinkingLevels };
+    const familyProvider = CODEX_FAMILY_PROVIDER[harnessId];
+    if (familyProvider) {
+      const pickedFromFamily = pickCodexFamilyModel(detection, profileName, tier, familyProvider);
+      if (pickedFromFamily) return { modelId: pickedFromFamily.id, thinkingLevels: pickedFromFamily.thinkingLevels };
     }
   }
   return { modelId: detection.defaultModel, thinkingLevels: catalogThinkingLevels(detection, detection.defaultModel) };
