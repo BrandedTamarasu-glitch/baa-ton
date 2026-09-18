@@ -87,6 +87,17 @@ function needsWindowsShell(command) {
   return extension === ".bat" || extension === ".cmd";
 }
 
+function spawnBridgeCommand(command, args, options) {
+  const resolvedCommand = resolveWindowsCommand(command);
+  if (!needsWindowsShell(resolvedCommand))
+    return require("node:child_process").spawn(resolvedCommand, args, options);
+  return require("node:child_process").spawn(
+    process.env.ComSpec ?? "cmd.exe",
+    ["/d", "/s", "/c", resolvedCommand, ...args],
+    options,
+  );
+}
+
 // The bridge must expose the same installed model registry the interactive
 // runtime uses. Discovery refreshes the requested provider immediately before
 // preflight; keeping this bridge-start registry snapshot out of preflight is
@@ -136,17 +147,11 @@ extension.default({
   registerCommand() {},
   async exec(command, args, options = {}) {
     const result = await new Promise((resolveResult) => {
-      const resolvedCommand = resolveWindowsCommand(command);
-      const child = require("node:child_process").spawn(
-        resolvedCommand,
-        args,
-        {
+      const child = spawnBridgeCommand(command, args, {
         cwd: process.cwd(),
         env: process.env,
-        shell: needsWindowsShell(resolvedCommand),
         stdio: ["ignore", "pipe", "pipe"],
-        },
-      );
+      });
       let stdout = "";
       let stderr = "";
       let settled = false;
