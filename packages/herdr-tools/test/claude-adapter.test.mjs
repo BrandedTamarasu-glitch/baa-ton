@@ -100,6 +100,19 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
     assert.ok(
       settings.permissions.deny.some((rule) => /^Bash\(git push/.test(rule)),
     );
+    // Without these, a dispatched lane cannot fulfil its own contract
+    // unattended -- every herdr_message/herdr_complete call would prompt
+    // for permission with nobody present to answer it.
+    assert.ok(
+      settings.permissions.allow.includes(
+        "mcp__herdr-orchestrator__herdr_message",
+      ),
+    );
+    assert.ok(
+      settings.permissions.allow.includes(
+        "mcp__herdr-orchestrator__herdr_complete",
+      ),
+    );
     assert.ok(
       settings.permissions.deny.some((rule) => /^Bash\(git merge/.test(rule)),
     );
