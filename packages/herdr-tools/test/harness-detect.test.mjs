@@ -69,6 +69,17 @@ test("readCodexDefaults uses the live CLI catalog when it succeeds", async () =>
   }
 });
 
+test("readCodexDefaults spawns the CLI with shell:true so a Windows .cmd shim doesn't ENOENT", () => {
+  const calls = [];
+  const recordingExec = (file, args, options) => {
+    calls.push({ file, args, options });
+    return JSON.stringify({ models: [] });
+  };
+  readCodexDefaults({ codexHome: join(fixtures, "does-not-exist-dir"), execFileSyncImpl: recordingExec });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.shell, true);
+});
+
 test("readCodexDefaults never throws when nothing is available", () => {
   const result = readCodexDefaults({ codexHome: join(fixtures, "does-not-exist-dir"), execFileSyncImpl: throwingExec });
   assert.equal(result.defaultModel, undefined);
@@ -119,6 +130,21 @@ test("readPiDefaults warns but still returns the catalog when defaultProvider is
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("readPiDefaults spawns the CLI fallback with shell:true so a Windows .cmd shim doesn't ENOENT", async () => {
+  const calls = [];
+  const recordingExec = (file, args, options) => {
+    calls.push({ file, args, options });
+    return "gpt-5.6-terra  GPT 5.6 Terra\n";
+  };
+  await readPiDefaults({
+    homeDirectory: join(fixtures, "does-not-exist-dir"),
+    execFileSyncImpl: recordingExec,
+    importModelRuntime: async () => { throw new Error("sdk not available in test"); },
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.shell, true);
 });
 
 test("readPiDefaults never throws when nothing is available", async () => {
@@ -183,6 +209,21 @@ test("readOpencodeDefaults falls back to the most-recent openai/* entry in model
     await rm(configDir, { recursive: true, force: true });
     await rm(stateDir, { recursive: true, force: true });
   }
+});
+
+test("readOpencodeDefaults spawns the CLI with shell:true so a Windows .cmd shim (e.g. Volta's opencode.cmd) doesn't ENOENT", () => {
+  const calls = [];
+  const recordingExec = (file, args, options) => {
+    calls.push({ file, args, options });
+    return "opencode/big-pickle\n";
+  };
+  readOpencodeDefaults({
+    configDirectory: join(fixtures, "does-not-exist-dir"),
+    stateDirectory: join(fixtures, "does-not-exist-dir-2"),
+    execFileSyncImpl: recordingExec,
+  });
+  assert.equal(calls.length, 2);
+  for (const call of calls) assert.equal(call.options.shell, true);
 });
 
 test("readOpencodeDefaults never throws when nothing is available", () => {

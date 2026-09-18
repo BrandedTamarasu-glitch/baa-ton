@@ -56,7 +56,8 @@ const STEP_TITLES = [
 ];
 const DIVIDER = "─".repeat(70);
 // Resolved value for a step's promise when the user asked to go back
-// (PageUp) instead of completing that step normally.
+// (Shift+Tab, or PageUp if the terminal sends it) instead of completing
+// that step normally.
 const BACK = Symbol("wizard-back");
 
 const SETTINGS_THEME = {
@@ -460,18 +461,19 @@ async function runWizard(options) {
     tui.stop();
   };
   // Set by whichever step is currently awaiting input, to its own
-  // resolvePromise(BACK); cleared once that step settles. PageUp is
-  // intercepted globally (consume: true) so it works the same regardless of
-  // which component -- Input, Checklist, SelectList, SettingsList,
-  // ProfilePicker -- currently has focus, without teaching each of them
-  // about wizard navigation individually.
+  // resolvePromise(BACK); cleared once that step settles. Shift+Tab (with
+  // PageUp as a fallback for terminals that map it oddly) is intercepted
+  // globally (consume: true) so it works the same regardless of which
+  // component -- Input, Checklist, SelectList, SettingsList, ProfilePicker
+  // -- currently has focus, without teaching each of them about wizard
+  // navigation individually.
   let requestBack = null;
   tui.addInputListener((data) => {
     if (matchesKey(data, Key.ctrl("c"))) {
       abort();
       return undefined;
     }
-    if (matchesKey(data, Key.pageUp) && requestBack) {
+    if ((matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.pageUp)) && requestBack) {
       requestBack();
       return { consume: true };
     }
@@ -505,7 +507,7 @@ async function runWizard(options) {
   try {
     tui.start();
 
-    // PageUp steps back one phase; state from every prior phase (project
+    // Shift+Tab steps back one phase; state from every prior phase (project
     // root, harness selection, in-progress profile edits) is preserved and
     // re-shown, not reset, when a phase is re-entered this way.
     const canGoBackToProject = !options.configOnly && options.promptProject;
@@ -554,9 +556,9 @@ async function runWizard(options) {
         const result = await new Promise((resolvePromise) => {
           // Checklist renders its own "space: toggle ... quit without
           // writing" hint at the bottom of its own body; no footer hint
-          // here or it's shown twice. PageUp back only offered once
+          // here or it's shown twice. Back navigation only offered once
           // there's actually an earlier phase to return to.
-          setStep(2, canGoBackToProject ? "PageUp: back to project directory" : undefined);
+          setStep(2, canGoBackToProject ? "Shift+Tab: back to project directory" : undefined);
           const items = detected.map((harness) => ({
             id: harness.id,
             label: harness.label,
@@ -592,7 +594,7 @@ async function runWizard(options) {
         if (options.configOnly) { phase = "profile-edit"; continue; }
 
         const result = await new Promise((resolvePromise) => {
-          setStep(3, "Enter to continue, PageUp: back to harness selection, esc/ctrl+c to quit without writing");
+          setStep(3, "Enter to continue, Shift+Tab: back to harness selection, esc/ctrl+c to quit without writing");
           const summary = new Container();
           summary.addChild(new Text(bold("What Baa-ton found for each selected harness:"), 0, 0));
           for (const harnessId of selected) {
@@ -636,7 +638,7 @@ async function runWizard(options) {
         if (templates.length === 0) { phase = "profile-edit"; continue; }
 
         const result = await new Promise((resolvePromise) => {
-          setStep(4, "Pick a starting point -- PageUp: back to detection results");
+          setStep(4, "Pick a starting point -- Shift+Tab: back to detection results");
           const items = templates.map((template) => ({
             value: template.id,
             label: template.label,
@@ -665,9 +667,9 @@ async function runWizard(options) {
         const result = await new Promise((resolvePromise) => {
           // SettingsList renders its own "Enter/Space to change · Esc to
           // cancel" hint at the bottom of its own body; no footer hint here
-          // or it's shown twice, but PageUp back still needs its own hint
-          // since SettingsList doesn't know about it.
-          setStep(4, options.configOnly ? undefined : "PageUp: back to starting-point templates");
+          // or it's shown twice, but back navigation still needs its own
+          // hint since SettingsList doesn't know about it.
+          setStep(4, options.configOnly ? undefined : "Shift+Tab: back to starting-point templates");
           const working = { ...workingProfiles };
           const items = Object.entries(defaults.profiles).map(([name, profile]) => {
             const current = working[name];
@@ -727,7 +729,7 @@ async function runWizard(options) {
       const missing = unconfiguredProfiles(defaults, resolvedProfiles);
       const canGoBackToProfileEdit = !options.configOnly && !options.acceptDefaults;
       const confirmResult = await new Promise((resolvePromise) => {
-        setStep(5, canGoBackToProfileEdit ? "PageUp: back to profile configuration" : undefined);
+        setStep(5, canGoBackToProfileEdit ? "Shift+Tab: back to profile configuration" : undefined);
         const text = new Text(
           [
             `${bold("Project:")} ${projectRoot}`,

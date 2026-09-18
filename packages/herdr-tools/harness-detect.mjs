@@ -203,10 +203,17 @@ export function readCodexDefaults({ codexHome, execFileSyncImpl = execFileSync }
   }
 
   try {
+    // shell: true -- on Windows, tools installed via Volta/nvm/etc. resolve
+    // to a .cmd shim, and child_process's default (non-shell) spawn cannot
+    // execute a .cmd directly: it throws ENOENT even though the command
+    // works fine when typed into a real shell. Harmless when the resolved
+    // binary is a native .exe (as codex often is); args here are static
+    // literals, never user input, so there's no injection surface.
     const output = execFileSyncImpl("codex", ["debug", "models"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 5000,
+      shell: true,
     });
     const parsed = JSON.parse(output);
     result.catalog = codexCatalogFromModels(parsed.models);
@@ -299,10 +306,12 @@ export async function readPiDefaults({ homeDirectory, projectRoot, execFileSyncI
   }
 
   try {
+    // shell: true -- see the comment on the codex exec call above.
     const output = execFileSyncImpl("pi", ["--offline", "--list-models"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 5000,
+      shell: true,
     });
     result.catalog = piCatalogFromCliText(output);
     result.source = result.source === "static" ? "cli" : result.source;
@@ -359,10 +368,16 @@ export function readOpencodeDefaults({ configDirectory, stateDirectory, execFile
   }
 
   try {
+    // shell: true -- see the comment on the codex exec call above. Verified
+    // live on Windows: bare execFileSync("opencode", ...) throws ENOENT for
+    // Volta's opencode.cmd shim even though `opencode models` runs fine
+    // typed into a real shell; this was silently emptying the catalog and
+    // making every profile fall back to the single detected default.
     const modelsOutput = execFileSyncImpl("opencode", ["models"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 5000,
+      shell: true,
     });
     result.catalog = modelsOutput
       .split(/\r?\n/)
@@ -378,6 +393,7 @@ export function readOpencodeDefaults({ configDirectory, stateDirectory, execFile
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 5000,
+      shell: true,
     });
   } catch (error) {
     result.warnings.push(`\`opencode providers list\` unavailable: ${error instanceof Error ? error.message : String(error)}`);
