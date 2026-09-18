@@ -836,6 +836,36 @@ async function acquireManifestLock(
   }
 }
 
+async function acquireControllerConfigLock(
+  configPath: string,
+  waitMs = 10_000,
+): Promise<() => Promise<void>> {
+  const lockPath = `${configPath}.lock`;
+  const deadline = Date.now() + waitMs;
+  while (true) {
+    try {
+      await mkdir(lockPath, { mode: 0o700 });
+      await writeFile(
+        join(lockPath, "owner.json"),
+        `${jsonText({ pid: process.pid, createdAt: now(), configPath })}\n`,
+        { mode: 0o600 },
+      );
+      return async () => rm(lockPath, { recursive: true, force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        if (Date.now() < deadline) {
+          await lockRetryDelay(10);
+          continue;
+        }
+        throw new Error(
+          `Herdr controller config is busy: ${configPath}. Wait for the active root operation, then retry.`,
+        );
+      }
+      throw error;
+    }
+  }
+}
+
 // The single transactional state owner for the manifest: every writer that
 // needs to mutate durable state after any await (a terminal/network call,
 // user confirmation, etc.) must reconcile against a freshly reloaded copy
@@ -3493,6 +3523,188 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       pane_id: agent.paneId,
       workspace_id: agent.workspaceId,
     };
+  }
+
+  async function reconcileRootIdentity(
+    cwd: string,
+    signal?: AbortSignal,
+  ): Promise<{
+    reconciled: boolean;
+    root: ControllerRootMapping;
+    previousRoot: ControllerRootMapping;
+    configPath: string;
+    manifestPath: string;
+    evidence: string[];
+  }> {
+    requireHerdr();
+    const root = await currentPaneRoot(signal);
+    const rootAgent = responseRecord(
+      await runHerdr(["agent", "get", root.pane_id], signal),
+      "root identity reconciliation",
+    ).agent;
+    const verifiedAgent = liveAgentIdentity(
+      { result: { type: "agent_info", agent: rootAgent } },
+      "root identity reconciliation",
+    );
+    if (
+      verifiedAgent.paneId !== root.pane_id ||
+      verifiedAgent.workspaceId !== root.workspace_id ||
+      verifiedAgent.kind !== root.agent_kind
+    )
+      throw new Error(
+        "Herdr current pane identity changed during root reconciliation; retry from the verified pane.",
+      );
+
+    const configPath = await controllerConfigPath(signal);
+    const resolvedCwd = resolve(cwd);
+    const manifestFile = resolve(manifestPath(cwd));
+    const findRoot = (config: ControllerConfig): ControllerOrchestrator => {
+      const childMatches = config.orchestrators.flatMap((orchestrator) =>
+        orchestrator.workflows.flatMap((workflow) =>
+          workflow.lanes
+            .filter(
+              (lane) =>
+                lane.pane_id === root.pane_id &&
+                lane.workspace_id === root.workspace_id,
+            )
+            .map((lane) => `${orchestrator.id}/${workflow.workflow_id}/${lane.lane_id}`),
+        ),
+      );
+      if (childMatches.length > 0)
+        throw new Error(
+          `Current pane ${root.pane_id} is registered as a child lane (${childMatches.join(", ")}) and cannot reconcile root authority.`,
+        );
+
+      const sameIdentity = config.orchestrators.filter(
+        (candidate) =>
+          candidate.root.pane_id === root.pane_id &&
+          candidate.root.workspace_id === root.workspace_id,
+      );
+      if (sameIdentity.length > 1)
+        throw new Error(
+          `Current pane ${root.pane_id} has ambiguous root mappings for workspace ${root.workspace_id}; reconciliation is refused.`,
+        );
+      const samePane = config.orchestrators.filter(
+        (candidate) => candidate.root.pane_id === root.pane_id,
+      );
+      if (samePane.some((candidate) => candidate.root.workspace_id !== root.workspace_id))
+        throw new Error(
+          `Current pane ${root.pane_id} has root mappings in multiple workspaces; reconciliation is refused.`,
+        );
+      const current = sameIdentity[0];
+      if (!current)
+        throw new Error(
+          `Current verified pane ${root.pane_id} in workspace ${root.workspace_id} is not a registered root; bootstrap it before reconciling.`,
+        );
+      if (!rootOwnsManifest(current, cwd))
+        throw new Error(
+          `Current root ${current.id} is registered for a different project and cannot be reconciled from ${resolvedCwd}.`,
+        );
+      return current;
+    };
+
+    // Keep lock order identical to bootstrapRoot: manifest first, then the
+    // controller config. This prevents a concurrent bootstrap/reconciliation
+    // pair from waiting on each other indefinitely.
+    const releaseManifest = await acquireManifestLock(cwd, 10_000);
+    try {
+      const releaseConfig = await acquireControllerConfigLock(configPath, 10_000);
+      try {
+        const latestConfig = await loadControllerConfig(configPath);
+        if (!latestConfig)
+          throw new Error("Herdr controller config disappeared during reconciliation.");
+        const current = findRoot(latestConfig);
+        const previousRoot = { ...current.root };
+        const nextRoot: ControllerRootMapping = {
+          ...current.root,
+          agent_kind: root.agent_kind,
+        };
+        const identityChanged = !sameControllerRoot(current.root, nextRoot);
+        const nextOrchestrator: ControllerOrchestrator = {
+          ...current,
+          root: nextRoot,
+        };
+        if (identityChanged)
+          await saveControllerConfig(configPath, {
+            ...latestConfig,
+            orchestrators: latestConfig.orchestrators.map((candidate) =>
+              candidate.id === current.id ? nextOrchestrator : candidate,
+            ),
+          });
+
+        const manifest = await loadManifest(cwd);
+        const scope: CurrentRootScope = {
+          rootId: current.id,
+          root: nextRoot,
+          orchestrator: nextOrchestrator,
+        };
+        const currentSession =
+          manifest.rootSessionLogs?.find((entry) => entry.rootId === current.id) ??
+          (legacyRootIdForManifest(cwd) === current.id
+            ? manifest.sessionLog
+            : undefined);
+        const expectedPersistence = rootSessionPersistence(nextRoot, rootAgent);
+        const sessionNeedsRefresh =
+          !currentSession ||
+          currentSession.paneId !== nextRoot.pane_id ||
+          currentSession.workspaceId !== nextRoot.workspace_id ||
+          JSON.stringify(currentSession.sessionRef) !==
+            JSON.stringify(expectedPersistence);
+        let manifestChanged = false;
+        if (sessionNeedsRefresh) {
+          rootSessionEntryFor(
+            manifest,
+            cwd,
+            scope,
+            rootAgent,
+            currentSession?.startedAt ?? manifest.sessionLog?.startedAt ?? now(),
+            now(),
+          );
+          manifestChanged = true;
+        }
+        const refreshRootSnapshot = (value: unknown): void => {
+          if (!isRecord(value) || !isRecord(value.root)) return;
+          if (sameControllerRoot(value.root as ControllerRootMapping, nextRoot))
+            return;
+          value.root = { ...nextRoot };
+          manifestChanged = true;
+        };
+        refreshRootSnapshot(manifest.parentGoals?.[current.id]);
+        refreshRootSnapshot(
+          manifest.rootSessionLogs?.find((entry) => entry.rootId === current.id),
+        );
+        refreshRootSnapshot(
+          manifest.rootQueues?.roots.find((entry) => entry.rootId === current.id),
+        );
+        for (const history of manifest.goalHistoryByRoot?.[current.id] ?? [])
+          refreshRootSnapshot(history);
+        if (manifestChanged) await saveManifest(cwd, manifest);
+
+        const changes: string[] = [];
+        if (identityChanged)
+          changes.push(
+            `agent_kind ${previousRoot.agent_kind ?? "<unset>"} -> ${nextRoot.agent_kind}`,
+          );
+        if (sessionNeedsRefresh)
+          changes.push("durable root session identity refreshed");
+        if (manifestChanged && !sessionNeedsRefresh)
+          changes.push("root-scoped manifest identity snapshots refreshed");
+        return {
+          reconciled: changes.length > 0,
+          root: nextRoot,
+          previousRoot,
+          configPath,
+          manifestPath: manifestFile,
+          evidence: changes.length
+            ? [`Reconciled current verified root ${current.id}: ${changes.join("; ")}.`]
+            : [`Root ${current.id} identity is already current; no state changed.`],
+        };
+      } finally {
+        await releaseConfig();
+      }
+    } finally {
+      await releaseManifest();
+    }
   }
 
   async function discoverControllerRoot(
@@ -6891,6 +7103,65 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       };
     });
 
+    await check("root-identity", async () => {
+      if (!controllerConfig)
+        return {
+          status: "warn",
+          detail: "No controller config is available; no registered root identity can be checked.",
+        };
+      const findings: string[] = [];
+      const seen = new Set<string>();
+      for (const orchestrator of controllerConfig.orchestrators) {
+        const root = orchestrator.root;
+        const identityKey = `${root.workspace_id}:${root.pane_id}`;
+        if (seen.has(identityKey)) {
+          findings.push(
+            `${orchestrator.id} duplicates root identity ${identityKey}`,
+          );
+          continue;
+        }
+        seen.add(identityKey);
+        try {
+          const live = liveAgentIdentity(
+            await runHerdr(["agent", "get", root.pane_id], signal),
+            `registered root ${orchestrator.id}`,
+          );
+          const mismatches: string[] = [];
+          if (live.paneId !== root.pane_id)
+            mismatches.push(`pane_id stored=${root.pane_id} live=${live.paneId}`);
+          if (live.workspaceId !== root.workspace_id)
+            mismatches.push(
+              `workspace_id stored=${root.workspace_id} live=${live.workspaceId}`,
+            );
+          if (!root.agent_kind)
+            mismatches.push(`agent_kind stored=<unset> live=${live.kind}`);
+          else if (live.kind !== root.agent_kind)
+            mismatches.push(
+              `agent_kind stored=${root.agent_kind} live=${live.kind}`,
+            );
+          if (root.target_kind === "name" && live.name !== root.target)
+            mismatches.push(
+              `target stored=${root.target} live=${live.name ?? "<unnamed>"}`,
+            );
+          if (mismatches.length > 0)
+            findings.push(`${orchestrator.id}: ${mismatches.join(", ")}`);
+        } catch (error) {
+          findings.push(
+            `${orchestrator.id} (${root.workspace_id}:${root.pane_id}): ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      if (findings.length > 0)
+        return {
+          status: "fail",
+          detail: `Root identity drift blocks safe root operations: ${findings.join("; ")} Run herdr_reconcile_root from the affected live root pane.`,
+        };
+      return {
+        status: "ok",
+        detail: `Checked ${controllerConfig.orchestrators.length} registered root identity${controllerConfig.orchestrators.length === 1 ? "" : "ies"}; all live panes and harness identities match.`,
+      };
+    });
+
     await check("manifest-store", async () => {
       const manifest = await loadManifest(cwd);
       if (manifest.version !== 2)
@@ -7396,6 +7667,30 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             text: `${result.alreadyRegistered
               ? `Verified Baa-ton root ${result.root.pane_id} is already registered.`
               : `${result.add ? "Added" : "Registered"} Baa-ton root ${result.root.pane_id}${result.reset ? " after retiring prior mappings" : ""}.`}${result.evidence.length ? ` ${result.evidence.join(" ")}` : ""}`,
+          },
+        ],
+        details: result,
+      };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_reconcile_root",
+    label: "Reconcile Herdr Root",
+    description:
+      "Safely reconcile the current verified root pane's live harness identity in place without resetting or replacing any controller state.",
+    promptSnippet:
+      "Repair a stale root harness identity from the affected live Herdr pane.",
+    promptGuidelines: [
+      "Use herdr_reconcile_root only from the affected live root pane after herdr_doctor reports root identity drift. It updates that exact pane/workspace mapping and durable root session snapshots only; it never resets a root, changes workflows, or repairs a different pane.",
+    ],
+    parameters: Type.Object({}, { additionalProperties: false }),
+    async execute(_id, _params, signal, _update, ctx) {
+      const result = await reconcileRootIdentity(ctx.cwd, signal);
+      return {
+        content: [
+          {
+            type: "text",
+            text: result.evidence.join(" "),
           },
         ],
         details: result,

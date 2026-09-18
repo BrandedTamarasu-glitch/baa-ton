@@ -71,6 +71,7 @@ test("herdr_doctor reports a healthy installation and never mutates the manifest
       "manifest-store",
       "native-herdr-connectivity",
       "plugin-enablement-and-routing",
+      "root-identity",
     ]);
     assert.equal(report.details.ok, true);
     for (const entry of report.details.checks)
