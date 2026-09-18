@@ -8,8 +8,12 @@ import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const jiti = require("jiti")(import.meta.url);
-const { claudeLaunchAdapter, CLAUDE_PERMISSION_PROMPT_TOOL, CLAUDE_PROVIDER } =
-  await jiti.import("../claude-launch-adapter.ts");
+const {
+  claudeBinaryAvailable,
+  claudeLaunchAdapter,
+  CLAUDE_PERMISSION_PROMPT_TOOL,
+  CLAUDE_PROVIDER,
+} = await jiti.import("../claude-launch-adapter.ts");
 const { mergeAttestation } = await import("../attest-merge.mjs");
 const here = dirname(fileURLToPath(import.meta.url));
 const helperPath = join(here, "..", "claude-startup-attest.mjs");
@@ -19,6 +23,41 @@ const profile = {
   thinking: "high",
   auth: "subscription",
 };
+
+test("Claude binary detection honors Windows executable extensions and PATHEXT", () => {
+  const checked = [];
+  assert.equal(
+    claudeBinaryAvailable({
+      platform: "win32",
+      pathValue: "C:\\Users\\zchri\\.local\\bin",
+      pathExt: ".COM;.EXE;.BAT;.CMD",
+      fileExists: (path) => {
+        checked.push(path);
+        return path.endsWith("claude.exe");
+      },
+    }),
+    true,
+  );
+  assert.ok(checked.some((path) => path.endsWith("claude.exe")));
+
+  assert.equal(
+    claudeBinaryAvailable({
+      platform: "win32",
+      pathValue: "/tmp/baa-claude-bin",
+      pathExt: ".EXE;.CMD",
+      fileExists: (path) => path.endsWith("claude.cmd"),
+    }),
+    true,
+  );
+  assert.equal(
+    claudeBinaryAvailable({
+      platform: "linux",
+      pathValue: "/tmp/baa-claude-bin",
+      fileExists: (path) => path.endsWith("claude.exe"),
+    }),
+    false,
+  );
+});
 
 test("launchArguments emits exact model/effort and generated settings/mcp config", async () => {
   const scratch = await mkdtemp(join(tmpdir(), "baa-claude-adapter-"));

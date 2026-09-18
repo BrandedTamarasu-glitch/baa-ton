@@ -28,9 +28,42 @@ export type ClaudeAdapterPaths = {
   permissionPromptTool?: string | false;
 };
 
-function claudeBinaryAvailable(): boolean {
-  for (const entry of (process.env.PATH ?? "").split(delimiter)) {
-    if (entry && existsSync(join(resolve(entry), "claude"))) return true;
+function claudeBinaryCandidates(
+  platform: NodeJS.Platform | string,
+  pathExt = process.env.PATHEXT,
+): string[] {
+  if (platform !== "win32") return ["claude"];
+  const extensions = (pathExt ?? ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((extension) => extension.trim().toLowerCase())
+    .filter((extension) => /^\.[a-z0-9]+$/.test(extension));
+  return [
+    ...new Set([
+      ...extensions.map((extension) => `claude${extension}`),
+      "claude.exe",
+      "claude.cmd",
+      "claude",
+    ]),
+  ];
+}
+
+export function claudeBinaryAvailable(options: {
+  platform?: NodeJS.Platform | string;
+  pathValue?: string;
+  pathExt?: string;
+  fileExists?: (path: string) => boolean;
+} = {}): boolean {
+  const platform = options.platform ?? process.platform;
+  const pathValue = options.pathValue ?? process.env.PATH ?? "";
+  const fileExists = options.fileExists ?? existsSync;
+  const pathDelimiter = platform === "win32" ? ";" : delimiter;
+  const candidates = claudeBinaryCandidates(platform, options.pathExt);
+  for (const entry of pathValue.split(pathDelimiter)) {
+    if (
+      entry &&
+      candidates.some((name) => fileExists(join(resolve(entry), name)))
+    )
+      return true;
   }
   return false;
 }
