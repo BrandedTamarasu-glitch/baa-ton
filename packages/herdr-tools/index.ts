@@ -2238,11 +2238,52 @@ function syncLaneSessionLog(
   };
 }
 
+const piRootSessionPathHints = new WeakMap<object, string>();
+
+function attestedPiRootSessionPath(
+  root: ControllerRootMapping,
+  native: NativeSessionRef | undefined,
+  sessionPath: string | undefined,
+): string | undefined {
+  if (
+    root.agent_kind !== "pi" ||
+    native?.kind !== "id" ||
+    typeof sessionPath !== "string" ||
+    !isAbsolute(sessionPath)
+  )
+    return undefined;
+  try {
+    const info = lstatSync(sessionPath);
+    const canonical = realpathSync(sessionPath);
+    if (
+      !info.isFile() ||
+      info.isSymbolicLink() ||
+      !basename(canonical).endsWith(`_${native.value}.jsonl`)
+    )
+      return undefined;
+    return canonical;
+  } catch {
+    return undefined;
+  }
+}
+
 function rootSessionPersistence(
   root: ControllerRootMapping,
   agent: unknown,
 ): PersistenceHandle {
   const native = nativeSessionFromAgent(agent);
+  const sessionPath = attestedPiRootSessionPath(
+    root,
+    native,
+    isRecord(agent) ? piRootSessionPathHints.get(agent) : undefined,
+  );
+  if (native && sessionPath)
+    return {
+      provider: "pi",
+      sessionId: native.value,
+      nativeHandle: native,
+      metadata: { sessionPath },
+    };
   if (native)
     return toPersistenceHandle(native, root.agent_kind ?? "herdr");
   const sessionId =
@@ -3605,7 +3646,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   async function reconcileRootIdentity(
     cwd: string,
     signal?: AbortSignal,
-  ): Promise<{
+    sessionPath?: string,
+  ): Promise<{ 
     reconciled: boolean;
     root: ControllerRootMapping;
     previousRoot: ControllerRootMapping;
@@ -3623,6 +3665,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       { result: { type: "agent_info", agent: rootAgent } },
       "root identity reconciliation",
     );
+    if (isRecord(rootAgent) && sessionPath) piRootSessionPathHints.set(rootAgent, sessionPath);
     if (
       verifiedAgent.paneId !== root.pane_id ||
       verifiedAgent.workspaceId !== root.workspace_id ||
@@ -7217,12 +7260,21 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           detail: "No controller config is available; no registered root identity can be checked.",
         };
       const findings: string[] = [];
+      const warnings: string[] = [];
+      const currentPaneId = process.env.HERDR_PANE_ID;
+      const currentWorkspaceId = process.env.HERDR_WORKSPACE_ID;
+      const isCurrentRoot = (root: ControllerRootMapping) =>
+        root.pane_id === currentPaneId && root.workspace_id === currentWorkspaceId;
+      const recordFinding = (root: ControllerRootMapping, detail: string) => {
+        (isCurrentRoot(root) ? findings : warnings).push(detail);
+      };
       const seen = new Set<string>();
       for (const orchestrator of controllerConfig.orchestrators) {
         const root = orchestrator.root;
         const identityKey = `${root.workspace_id}:${root.pane_id}`;
         if (seen.has(identityKey)) {
-          findings.push(
+          recordFinding(
+            root,
             `${orchestrator.id} duplicates root identity ${identityKey}`,
           );
           continue;
@@ -7251,13 +7303,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               `target stored=${root.target} live=${live.name ?? "<unnamed>"}`,
             );
           if (mismatches.length > 0)
-            findings.push(`${orchestrator.id}: ${mismatches.join(", ")}`);
-          else if (live.kind === "pi" && root.pane_id === process.env.HERDR_PANE_ID &&
-              root.workspace_id === process.env.HERDR_WORKSPACE_ID && ctx.sessionManager?.getSessionId) {
+            recordFinding(root, `${orchestrator.id}: ${mismatches.join(", ")}`);
+          else if (live.kind === "pi" && isCurrentRoot(root) && ctx.sessionManager?.getSessionId) {
             await inspectPiRootIdentity(ctx, signal);
           }
         } catch (error) {
-          findings.push(
+          recordFinding(
+            root,
             `${orchestrator.id} (${root.workspace_id}:${root.pane_id}): ${error instanceof Error ? error.message : String(error)}`,
           );
         }
@@ -7265,7 +7317,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       if (findings.length > 0)
         return {
           status: "fail",
-          detail: `Root identity drift blocks safe root operations: ${findings.join("; ")} Inspect the named root and live metadata. Use herdr_reconcile_root only for proven registration drift; session proof failures require native identity repair, not a reset.`,
+          detail: `Current root identity drift blocks safe root operations: ${findings.join("; ")} Inspect the named root and live metadata. Use herdr_reconcile_root only for proven registration drift; session proof failures require native identity repair, not a reset.${warnings.length ? ` Other roots need separate attention: ${warnings.join("; ")}` : ""}`,
+        };
+      if (warnings.length > 0)
+        return {
+          status: "warn",
+          detail: `Current root identity matches. Other registered roots need separate attention: ${warnings.join("; ")}`,
         };
       return {
         status: "ok",
@@ -7806,7 +7863,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     ],
     parameters: Type.Object({}, { additionalProperties: false }),
     async execute(_id, _params, signal, _update, ctx) {
-      const result = await reconcileRootIdentity(ctx.cwd, signal);
+      const result = await reconcileRootIdentity(
+        ctx.cwd,
+        signal,
+        ctx.sessionManager?.getSessionFile?.(),
+      );
       return {
         content: [
           {

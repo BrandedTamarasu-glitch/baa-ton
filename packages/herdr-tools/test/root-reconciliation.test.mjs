@@ -271,6 +271,30 @@ test("reconcile root repairs only the current root and is idempotent", async () 
   }
 });
 
+test("reconcile preserves an attested Pi session-file binding alongside Herdr's native UUID", async () => {
+  const f = await fixture();
+  const sessionPath = join(f.directory, "pi-root_new-session.jsonl");
+  const saved = Object.fromEntries(
+    ["PI_CODING_AGENT", "PI_SESSION_ID", "PI_SESSION_FILE"].map((key) => [key, process.env[key]]),
+  );
+  try {
+    await writeFile(sessionPath, "{}\n");
+    f.context.sessionManager = { getSessionFile: () => sessionPath };
+    await f.tools
+      .get("herdr_reconcile_root")
+      .execute("reconcile", {}, undefined, undefined, f.context);
+    const entry = (await f.manifest()).rootSessionLogs.find((item) => item.rootId === "root-a");
+    assert.equal(entry.sessionRef.provider, "pi");
+    assert.equal(entry.sessionRef.sessionId, "new-session");
+    assert.deepEqual(entry.sessionRef.nativeHandle, { kind: "id", value: "new-session" });
+    assert.equal(entry.sessionRef.metadata.sessionPath, sessionPath);
+  } finally {
+    for (const [key, value] of Object.entries(saved))
+      value === undefined ? delete process.env[key] : (process.env[key] = value);
+    await f.cleanup();
+  }
+});
+
 test("doctor makes stale and missing root panes blocking findings", async () => {
   const f = await fixture();
   try {
@@ -284,6 +308,25 @@ test("doctor makes stale and missing root panes blocking findings", async () => 
     assert.match(check.detail, /root-b/);
     assert.match(check.detail, /herdr_reconcile_root/);
     assert.equal(report.details.ok, false);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("doctor warns without blocking the current root when only another root is stale", async () => {
+  const f = await fixture();
+  try {
+    const config = await f.config();
+    config.orchestrators[0].root.agent_kind = "pi";
+    await writeFile(join(f.configDir, "config.json"), `${JSON.stringify(config, null, 2)}\n`);
+    f.missing.add(f.otherRoot.pane_id);
+    const report = await f.tools
+      .get("herdr_doctor")
+      .execute("doctor", {}, undefined, undefined, f.context);
+    const check = report.details.checks.find((entry) => entry.id === "root-identity");
+    assert.equal(check.status, "warn");
+    assert.match(check.detail, /Current root identity matches/);
+    assert.match(check.detail, /root-b/);
   } finally {
     await f.cleanup();
   }

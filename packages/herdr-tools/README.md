@@ -45,6 +45,9 @@ New Pi plans bind the canonical session path. Dispatch/resume check the same
 proof; historical UUID bindings are accepted only for the exact live runtime
 UUID and are not rewritten. Doctor checks this proof for the current Pi root;
 other registered roots still receive their existing native identity checks.
+Unrelated stale roots remain warnings, as in the upstream doctor fix. Upstream
+reconciliation's persisted `sessionRef.metadata.sessionPath` hint is preserved;
+the bridge does not treat a saved hint as fresh ownership proof.
 Doctor's root drift findings identify the affected root; a session proof failure
 is not an instruction to reset registration. This interface addresses
 [Baa-ton #9](https://github.com/zachristmas/baa-ton/issues/9) and the downstream
