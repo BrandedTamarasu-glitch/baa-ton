@@ -108,6 +108,10 @@ extension.default({
       const child = require("node:child_process").spawn(command, args, {
         cwd: process.cwd(),
         env: process.env,
+        // Windows harness installs may expose Herdr through a .cmd shim;
+        // match live-herdr.mjs so the bridge resolves both shims and native
+        // executables through PATHEXT.
+        shell: process.platform === "win32",
         stdio: ["ignore", "pipe", "pipe"],
       });
       let stdout = "";
