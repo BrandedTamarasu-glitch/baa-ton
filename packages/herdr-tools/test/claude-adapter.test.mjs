@@ -72,7 +72,8 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
     assert.equal(adapter.capabilities.supportsLiveCapabilityDiscovery, false);
     assert.equal(adapter.capabilities.supportsStartupHandshake, false);
     assert.equal(adapter.discoverCatalog, undefined);
-    const args = adapter.launchArguments(profile);
+    const context = { startupIntentPath: "/intents/lane.json" };
+    const args = adapter.launchArguments(profile, "/source/index.ts", context);
     assert.equal(args[args.indexOf("--model") + 1], "claude-sonnet-5");
     assert.equal(args[args.indexOf("--effort") + 1], "high");
     const settings = JSON.parse(
@@ -95,6 +96,10 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
       mcp.mcpServers["herdr-orchestrator"].args[0],
       "/bridge/mcp-server.mjs",
     );
+    assert.deepEqual(mcp.mcpServers["herdr-orchestrator"].env, {
+      BAA_STARTUP_INTENT: "/intents/lane.json",
+      HERDR_ENV: "1",
+    });
     assert.equal(args.includes("--permission-prompt-tool"), false);
     const resumed = adapter.resumeArguments(
       profile,
@@ -104,6 +109,7 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
         nativeHandle: { kind: "id", value: "claude-session-123" },
       },
       "/source/index.ts",
+      context,
     );
     assert.deepEqual(
       resumed.slice(0, 2),
@@ -125,7 +131,9 @@ test("permission broker launch flag is opt-in and preserves the exact tool name"
       scratchDirectory: scratch,
       permissionPromptTool: CLAUDE_PERMISSION_PROMPT_TOOL,
     });
-    const args = adapter.launchArguments(profile);
+    const args = adapter.launchArguments(profile, "/source/index.ts", {
+      startupIntentPath: "/intents/lane.json",
+    });
     const flag = args.indexOf("--permission-prompt-tool");
     assert.equal(
       args.slice(flag, flag + 2).join(" "),
@@ -145,7 +153,9 @@ test("permission broker can be enabled by an explicit default-off environment op
       attestHelper: "/a.js",
       scratchDirectory: "/tmp",
     });
-    const args = adapter.launchArguments(profile);
+    const args = adapter.launchArguments(profile, "/source/index.ts", {
+      startupIntentPath: "/intents/lane.json",
+    });
     assert.deepEqual(
       args.slice(
         args.indexOf("--permission-prompt-tool"),
@@ -167,7 +177,13 @@ test("permission broker rejects an empty opt-in value", () => {
     scratchDirectory: "/tmp",
     permissionPromptTool: " ",
   });
-  assert.throws(() => adapter.launchArguments(profile), /non-empty string/);
+  assert.throws(
+    () =>
+      adapter.launchArguments(profile, "/source/index.ts", {
+        startupIntentPath: "/intents/lane.json",
+      }),
+    /non-empty string/,
+  );
 });
 
 test("preflight rejects foreign providers", () => {
