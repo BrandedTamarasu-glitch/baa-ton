@@ -191,6 +191,7 @@ test("Windows live identity lookup uses an unqualified Herdr command for native 
   let invocation;
   const result = await liveHerdrAgentList({
     platform: "win32",
+    env: { PATH: "", Path: "" },
     spawnProcess: (command, args, options) => {
       invocation = { command, args, options };
       queueMicrotask(() => {
