@@ -2459,6 +2459,10 @@ function isRootOrchestrator(): boolean {
   });
 }
 
+function currentResolvedIdentityDescription(): string {
+  return `(resolved pane_id=${process.env[HERDR_PANE_ID_ENV] ?? "<unset>"}, workspace_id=${process.env.HERDR_WORKSPACE_ID ?? "<unset>"})`;
+}
+
 type CurrentRootScope = {
   rootId: string;
   root: ControllerRootMapping;
@@ -6799,7 +6803,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       );
       return {
         status: "ok",
-        detail: `${controllerConfig.orchestrators.length} registered orchestrator(s), ${workflowCount} routed workflow(s). This pane is${isRootOrchestrator() ? "" : " not"} a registered root.`,
+        detail: `${controllerConfig.orchestrators.length} registered orchestrator(s), ${workflowCount} routed workflow(s). This pane is${isRootOrchestrator() ? "" : " not"} a registered root ${currentResolvedIdentityDescription()}.`,
       };
     });
 
