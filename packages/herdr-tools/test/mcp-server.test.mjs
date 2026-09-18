@@ -64,7 +64,13 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
       );
     });
   const rpc = (method, params = {}) => rpcWithId(++nextId, method, params);
-  const timeout = setTimeout(() => child.kill(), 15000);
+  const timeout = setTimeout(() => {
+    if (process.env.BAA_DEBUG_WINDOWS_MCP && env.TEST_COMMAND_LOG)
+      readFile(env.TEST_COMMAND_LOG, "utf8")
+        .then((value) => console.error("fixture commands", value))
+        .catch((error) => console.error("fixture command log read failed", error));
+    child.kill();
+  }, 15000);
   try {
     return await run(rpc, rpcWithId);
   } finally {
