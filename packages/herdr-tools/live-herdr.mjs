@@ -1,6 +1,7 @@
 import { spawn as defaultSpawn } from "node:child_process";
 
 export const HERDR_COMMAND = "herdr";
+export const CONTROLLER_PLUGIN_ID = "herdr-orchestrator-controller";
 const DEFAULT_TIMEOUT_MS = 35_000;
 
 async function runHerdrCommand(args, {
@@ -76,6 +77,21 @@ function parseHerdrJson(output, description) {
   }
 }
 
+function parseConfigDirectory(output) {
+  const text = output.trim();
+  if (!text) throw new Error("herdr plugin config-dir returned an empty directory.");
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed === "string") return parsed;
+    const result = parsed?.result ?? parsed;
+    if (typeof result?.config_dir === "string" && result.config_dir)
+      return result.config_dir;
+  } catch {
+    // Native Herdr installations may print the directory directly.
+  }
+  return text;
+}
+
 /**
  * Run the live agent lookup used to resolve a Claude MCP subprocess.
  * On Windows, shell/PATHEXT resolution lets the unqualified command select
@@ -85,6 +101,19 @@ export async function liveHerdrAgentList(options = {}) {
   return parseHerdrJson(
     await runHerdrCommand(["agent", "list"], options),
     "agent list",
+  );
+}
+
+/**
+ * Resolve a plugin's live config directory instead of trusting a harness's
+ * project-scoped environment snapshot.
+ */
+export async function liveHerdrConfigDirectory(
+  pluginId = CONTROLLER_PLUGIN_ID,
+  options = {},
+) {
+  return parseConfigDirectory(
+    await runHerdrCommand(["plugin", "config-dir", pluginId], options),
   );
 }
 

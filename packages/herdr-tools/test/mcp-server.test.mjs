@@ -245,7 +245,9 @@ test("mapped root bridge exposes root-role parity and returns non-Pi root ground
     HERDR_ENV: "1",
     HERDR_PANE_ID: fixture.root.pane_id,
     HERDR_WORKSPACE_ID: fixture.root.workspace_id,
-    HERDR_PLUGIN_CONFIG_DIR: fixture.stateDir,
+    // The MCP registration may freeze a config directory from a different
+    // machine. The bridge must refresh this from Herdr before routing.
+    HERDR_PLUGIN_CONFIG_DIR: join(fixture.directory, "frozen-config"),
     TEST_CONFIG_DIR: fixture.stateDir,
     TEST_ROOT_WORKSPACE: fixture.root.workspace_id,
     PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
@@ -359,7 +361,7 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
     // live Claude pane below actually occupies this pane or workspace.
     HERDR_PANE_ID: "w-frozen:original",
     HERDR_WORKSPACE_ID: "w-frozen",
-    HERDR_PLUGIN_CONFIG_DIR: fixture.stateDir,
+    HERDR_PLUGIN_CONFIG_DIR: join(fixture.directory, "frozen-config"),
     TEST_CONFIG_DIR: fixture.stateDir,
     PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
   };

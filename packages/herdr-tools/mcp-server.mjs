@@ -17,6 +17,7 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { Value } from "typebox/value";
@@ -40,7 +41,9 @@ import {
   resolveHerdrIdentity,
 } from "./live-identity.mjs";
 import {
+  CONTROLLER_PLUGIN_ID,
   liveHerdrAgentList,
+  liveHerdrConfigDirectory,
   liveHerdrPaneProcessInfo,
 } from "./live-herdr.mjs";
 import { liveProcessParentPid } from "./live-process.mjs";
@@ -58,7 +61,6 @@ const extension = await jiti.import(join(root, "index.ts"));
 // preflight; keeping this bridge-start registry snapshot out of preflight is
 // important because a stale catalog must never authorize a launch. The package
 // exports map does not expose internals, so resolve them by absolute file path.
-const { existsSync } = await import("node:fs");
 let packageRoot = null;
 for (let dir = root; dir !== dirname(dir); dir = dirname(dir)) {
   const candidate = join(
@@ -146,6 +148,21 @@ extension.default({
 });
 
 async function refreshCurrentHerdrIdentity() {
+  const configuredDirectory = process.env.HERDR_PLUGIN_CONFIG_DIR;
+  const configuredConfig =
+    configuredDirectory && isAbsolute(configuredDirectory)
+      ? join(resolve(configuredDirectory), "config.json")
+      : undefined;
+  if (!configuredConfig || !existsSync(configuredConfig)) {
+    try {
+      const directory = await liveHerdrConfigDirectory(CONTROLLER_PLUGIN_ID);
+      if (isAbsolute(directory))
+        process.env.HERDR_PLUGIN_CONFIG_DIR = resolve(directory);
+    } catch {
+      // Identity resolution and read-only diagnostics retain their existing
+      // fallback behavior if a live config-dir query is unavailable.
+    }
+  }
   const identity = await resolveHerdrIdentity({
     env: process.env,
     listAgents: liveHerdrAgentList,
@@ -207,16 +224,29 @@ function timestamp() {
 function configDirectory() {
   const directory =
     process.env.HERDR_PLUGIN_CONFIG_DIR ?? process.env.HERDR_PLUGIN_STATE_DIR;
-  if (directory) return isAbsolute(directory) ? resolve(directory) : undefined;
+  if (directory && isAbsolute(directory)) {
+    const configured = resolve(directory);
+    if (existsSync(join(configured, "config.json"))) return configured;
+  }
   // Match index.ts's rootConfigPath fallback so Claude/OpenCode callers that
-  // inherit only the pane identity still resolve the controller route.
-  return join(
-    homedir(),
-    ".config",
-    "herdr",
-    "plugins",
-    "herdr-orchestrator-controller",
-  );
+  // inherit only the pane identity still resolve the controller route. On
+  // Windows Herdr stores plugin config under AppData rather than .config.
+  return process.platform === "win32"
+    ? join(
+        process.env.APPDATA || join(homedir(), "AppData", "Roaming"),
+        "herdr",
+        "plugins",
+        "config",
+        CONTROLLER_PLUGIN_ID,
+      )
+    : join(
+        homedir(),
+        ".config",
+        "herdr",
+        "plugins",
+        "config",
+        CONTROLLER_PLUGIN_ID,
+      );
 }
 
 async function readControllerConfig() {
