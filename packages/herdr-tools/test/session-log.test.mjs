@@ -111,6 +111,7 @@ async function fixture() {
     HERDR_PLUGIN_CONFIG_DIR: configDir,
   });
   let gone = false;
+  let agentStatus = "working";
   const tools = new Map();
   extension({
     on() {},
@@ -133,7 +134,7 @@ async function fixture() {
                 agent: "pi",
                 pane_id: "lane-pane",
                 workspace_id: root.workspace_id,
-                agent_status: "working",
+                agent_status: agentStatus,
                 agent_session: {
                   kind: "path",
                   value: "/sessions/child-session-log.jsonl",
@@ -155,6 +156,9 @@ async function fixture() {
     tools,
     setGone(value) {
       gone = value;
+    },
+    setAgentStatus(value) {
+      agentStatus = value;
     },
     async cleanup() {
       for (const [key, value] of Object.entries(saved))
@@ -208,7 +212,7 @@ const context = (cwd) => ({ cwd, hasUI: false, mode: "json", modelRegistry: {} }
   }
 });
 
- test("session trace remains readable after its worktree and lane agent are gone", async () => {
+test("session trace remains readable after its worktree and lane agent are gone", async () => {
   const f = await fixture();
   try {
     await rm(f.worktree, { recursive: true, force: true });
@@ -227,6 +231,40 @@ const context = (cwd) => ({ cwd, hasUI: false, mode: "json", modelRegistry: {} }
     const stored = JSON.parse(await readFile(f.manifestPath, "utf8"));
     assert.equal(stored.workflows[0].lanes[0].sessionLog.sessionRef.sessionId, "/sessions/child-session-log.jsonl");
     assert.equal(stored.workflows[0].lanes[0].sessionLog.status, "gone");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("observe preserves a retryable dispatch failure when lane telemetry is unknown", async () => {
+  const f = await fixture();
+  try {
+    const manifest = JSON.parse(await readFile(f.manifestPath, "utf8"));
+    manifest.workflows[0].status = "dispatch-failed";
+    manifest.workflows[0].outcome = "unknown";
+    manifest.workflows[0].retry = {
+      state: "retryable",
+      attempt: 1,
+      retryCommand: "herdr_dispatch session-log-workflow execute=true",
+      failedStage: "startup-proof",
+      error: "startup proof mismatch",
+    };
+    await writeFile(f.manifestPath, JSON.stringify(manifest));
+    f.setAgentStatus("idle");
+
+    const result = await f.tools.get("herdr_observe").execute(
+      "observe-retryable-failure",
+      { workflowId: "session-log-workflow" },
+      undefined,
+      undefined,
+      context(f.cwd),
+    );
+    assert.equal(result.details.workflow.status, "dispatch-failed");
+    assert.equal(result.details.workflow.retry.state, "retryable");
+    assert.equal(
+      JSON.parse(await readFile(f.manifestPath, "utf8")).workflows[0].status,
+      "dispatch-failed",
+    );
   } finally {
     await f.cleanup();
   }
