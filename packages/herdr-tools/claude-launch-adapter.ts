@@ -160,6 +160,15 @@ function buildClaudeLaunchArguments(
     paths.scratchDirectory,
     `claude-mcp-${tag}.json`,
   );
+  // --strict-mcp-config below makes this file the lane's *entire* MCP
+  // surface, deliberately excluding every other configured server
+  // (including claude.ai account connectors) for headless-lane determinism.
+  // A lane that genuinely needs one, e.g. a domain MCP tool, gets it only
+  // via an explicit extraMcpServers grant from the authorized root, never
+  // by silently inheriting the operator's full config.
+  const extraMcpServers = { ...(context?.extraMcpServers ?? {}) };
+  delete extraMcpServers["herdr-orchestrator"];
+  const extraServerKeys = Object.keys(extraMcpServers);
   const settings = {
     hooks: {
       SessionStart: [
@@ -173,10 +182,20 @@ function buildClaudeLaunchArguments(
         },
       ],
     },
-    permissions: LANE_PERMISSIONS,
+    permissions: {
+      ...LANE_PERMISSIONS,
+      // A headless lane has nobody to answer a permission prompt. A granted
+      // extra server's tools must be pre-allowed the same way the two fixed
+      // herdr-orchestrator tools below already are, or every call hangs.
+      allow: [
+        ...LANE_PERMISSIONS.allow,
+        ...extraServerKeys.map((key) => `mcp__${key}__*`),
+      ],
+    },
   };
   const mcpConfig = {
     mcpServers: {
+      ...extraMcpServers,
       "herdr-orchestrator": {
         command: "node",
         args: [paths.bridge],

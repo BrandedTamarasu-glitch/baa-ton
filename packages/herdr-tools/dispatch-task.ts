@@ -732,6 +732,7 @@ export async function dispatchTask(
                   "--",
                   ...adapters[i].launchArguments(profile, port.source, {
                     startupIntentPath: lane.startupIntentPath!,
+                    extraMcpServers: lane.mcpServers,
                   }),
                 ],
                 signal,
@@ -1292,7 +1293,7 @@ export async function resumeTask(
           profile,
           info.session,
           port.source,
-          { startupIntentPath: lane.startupIntentPath },
+          { startupIntentPath: lane.startupIntentPath, extraMcpServers: lane.mcpServers },
         );
         await port.run(
           [

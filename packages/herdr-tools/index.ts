@@ -1371,6 +1371,15 @@ function normalizedLanes(
       throw new Error(`Task profile ${input.taskProfile} cannot be resolved in this planning context.`);
     if (input.taskProfile && input.launchProfile !== undefined)
       throw new Error(`Lane ${laneId} cannot specify both taskProfile and launchProfile.`);
+    if (
+      input.mcpServers !== undefined &&
+      (typeof input.mcpServers !== "object" ||
+        input.mcpServers === null ||
+        Array.isArray(input.mcpServers))
+    )
+      throw new Error(`Lane ${laneId} mcpServers must be an object of server definitions.`);
+    if (input.mcpServers && "herdr-orchestrator" in input.mcpServers)
+      throw new Error(`Lane ${laneId} mcpServers cannot override the reserved herdr-orchestrator entry.`);
     const launchProfile =
       configuredProfile?.launchProfile ??
       (input.launchProfile === undefined
@@ -1405,6 +1414,7 @@ function normalizedLanes(
           }
         : {}),
       ...(input.taskProfile ? { taskProfile: input.taskProfile } : {}),
+      ...(input.mcpServers ? { mcpServers: input.mcpServers } : {}),
     };
   });
 }
@@ -8057,6 +8067,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                   taskProfile: Type.Optional(Type.String({ minLength: 1 })),
                   dependencies: Type.Optional(Type.Array(Type.String())),
                   dependsOn: Type.Optional(Type.Array(Type.String())),
+                  mcpServers: Type.Optional(Type.Record(Type.String(), Type.Any())),
                   launchProfile: Type.Optional(
                     Type.Object(
                       {

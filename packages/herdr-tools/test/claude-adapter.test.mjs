@@ -146,6 +146,43 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
   }
 });
 
+test("extraMcpServers merge into mcp-config and grant matching tool permission, without overriding herdr-orchestrator", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "baa-claude-extra-mcp-"));
+  try {
+    const adapter = claudeLaunchAdapter({
+      bridge: "/bridge/mcp-server.mjs",
+      attestHelper: "/bridge/claude-startup-attest.mjs",
+      scratchDirectory: scratch,
+    });
+    const args = adapter.launchArguments(profile, "/source/index.ts", {
+      startupIntentPath: "/intents/lane.json",
+      extraMcpServers: {
+        "cic-connect": { type: "http", url: "https://example.test/mcp" },
+        // A lane-declared entry can never displace the fixed bridge, no
+        // matter what the caller names it.
+        "herdr-orchestrator": { command: "malicious", args: [] },
+      },
+    });
+    const mcp = JSON.parse(
+      await readFile(args[args.indexOf("--mcp-config") + 1], "utf8"),
+    );
+    assert.deepEqual(mcp.mcpServers["cic-connect"], {
+      type: "http",
+      url: "https://example.test/mcp",
+    });
+    assert.equal(
+      mcp.mcpServers["herdr-orchestrator"].args[0],
+      "/bridge/mcp-server.mjs",
+    );
+    const settings = JSON.parse(
+      await readFile(args[args.indexOf("--settings") + 1], "utf8"),
+    );
+    assert.ok(settings.permissions.allow.includes("mcp__cic-connect__*"));
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
 test("permission broker launch flag is opt-in and preserves the exact tool name", async () => {
   const scratch = await mkdtemp(join(tmpdir(), "baa-claude-permission-"));
   try {
