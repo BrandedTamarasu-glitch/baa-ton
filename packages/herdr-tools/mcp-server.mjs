@@ -8,7 +8,7 @@
  */
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   lstat,
   mkdir,
@@ -354,7 +354,7 @@ async function currentRoute() {
 async function acquireManifestLock(manifestPath) {
   const lockPath = join(
     dirname(manifestPath),
-    `.${manifestPath.split("/").at(-1)}.herdr-orchestrator.lock`,
+    `.${basename(manifestPath)}.herdr-orchestrator.lock`,
   );
   const deadline = Date.now() + 2_000;
   while (true) {
