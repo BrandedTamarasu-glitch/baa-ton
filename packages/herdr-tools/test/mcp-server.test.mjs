@@ -80,7 +80,8 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
     child.stdin.end();
     await once(child, "close");
     lines.close();
-    if (stderr.trim()) throw new Error(`mcp-server.mjs stderr: ${stderr}`);
+    if (stderr.trim() && !process.env.BAA_DEBUG_WINDOWS_MCP)
+      throw new Error(`mcp-server.mjs stderr: ${stderr}`);
   }
 }
 
