@@ -1332,6 +1332,34 @@ function laneAgentKind(workflow: Workflow, lane: Lane): AgentKind {
   return validateAgentKind(lane.agentKind ?? workflow.agentKind ?? "pi");
 }
 
+// Tool names are "mcp__<server>__<tool>"; neither segment contains "__", so
+// a non-greedy match up to the first literal "__" isolates the server key.
+const MCP_TOOL_REFERENCE_PATTERN = /\bmcp__([A-Za-z0-9._-]*?)__[A-Za-z0-9_]+/g;
+
+export function referencedMcpServers(text: string): string[] {
+  const servers = new Set<string>();
+  for (const match of text.matchAll(MCP_TOOL_REFERENCE_PATTERN))
+    if (match[1] && match[1] !== "herdr-orchestrator") servers.add(match[1]);
+  return [...servers];
+}
+
+export function assertMcpServersGranted(
+  laneId: string,
+  objective: string,
+  granted: Record<string, unknown> | undefined,
+): void {
+  const grantedKeys = new Set(Object.keys(granted ?? {}));
+  const missing = referencedMcpServers(objective).filter(
+    (name) => !grantedKeys.has(name),
+  );
+  if (missing.length)
+    throw new Error(
+      `Lane ${laneId} objective references mcp__${missing[0]}__* tools, but mcpServers does not grant "${missing[0]}". ` +
+        `--strict-mcp-config scopes a dispatched lane to herdr-orchestrator plus whatever mcpServers lists, so any other server -- including a claude.ai account connector -- is unreachable unless granted there. ` +
+        `Add its raw --mcp-config entry to this lane's mcpServers, or remove the reference from the objective.`,
+    );
+}
+
 function normalizedLanes(
   objective: string,
   inputs: LaneInput[],
@@ -1345,7 +1373,8 @@ function normalizedLanes(
   return values.map((input, index) => {
     const laneId = `lane-${index + 1}`;
     const goalId = `${rootGoalId}/${laneId}`;
-    if (typeof input === "string")
+    if (typeof input === "string") {
+      assertMcpServersGranted(laneId, input, undefined);
       return {
         id: laneId,
         objective: input,
@@ -1362,6 +1391,7 @@ function normalizedLanes(
           authority: "lane" as const,
         },
       };
+    }
     if (!input || typeof input.objective !== "string" || !input.objective)
       throw new Error("Each lane object needs a non-empty objective.");
     const configuredProfile = input.taskProfile
@@ -1380,6 +1410,7 @@ function normalizedLanes(
       throw new Error(`Lane ${laneId} mcpServers must be an object of server definitions.`);
     if (input.mcpServers && "herdr-orchestrator" in input.mcpServers)
       throw new Error(`Lane ${laneId} mcpServers cannot override the reserved herdr-orchestrator entry.`);
+    assertMcpServersGranted(laneId, input.objective, input.mcpServers);
     const launchProfile =
       configuredProfile?.launchProfile ??
       (input.launchProfile === undefined
