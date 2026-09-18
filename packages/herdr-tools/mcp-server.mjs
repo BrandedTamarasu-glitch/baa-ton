@@ -493,7 +493,11 @@ async function persistBridgeMessage(name, args, requestId) {
   const path = bridgeStorePath(route);
   if (!route || !endpoints || !path) return undefined;
   const logicalKey = `${kind}:${route.workflowId ?? "root"}:${route.laneId ?? route.root.pane_id}:${name}:${digest(args)}`;
-  const occurrenceId = `${name}:${String(requestId)}`;
+  // JSON-RPC request IDs are only unique enough for an in-flight request. A
+  // harness may reuse one across turns, so the durable occurrence must also
+  // include the payload-bound logical key; otherwise a fresh plan can resolve
+  // to an old, already-resolved message and regress it to received.
+  const occurrenceId = `${name}:${String(requestId)}:${digest(logicalKey)}`;
   const stored = await putMessage(path, {
     envelope: makeEnvelope({
       logicalKey,
@@ -504,9 +508,10 @@ async function persistBridgeMessage(name, args, requestId) {
       payload: args,
     }),
   });
-  await markState(path, stored.message.occurrence_id, "received", {
-    transport: "mcp",
-  });
+  if (stored.created)
+    await markState(path, stored.message.occurrence_id, "received", {
+      transport: "mcp",
+    });
   await enqueueWakeHint(path, {
     recipient: endpoints.to,
     occurrenceId: stored.message.occurrence_id,
