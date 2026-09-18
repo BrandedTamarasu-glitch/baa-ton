@@ -224,6 +224,29 @@ test("readOpencodeDefaults spawns the CLI with shell:true so a Windows .cmd shim
   });
   assert.equal(calls.length, 2);
   for (const call of calls) assert.equal(call.options.shell, true);
+  assert.deepEqual(calls[0].args, ["models", "--verbose"]);
+});
+
+test("readOpencodeDefaults parses cost and reasoning-effort variants from `opencode models --verbose`'s header+JSON-block output", () => {
+  const verboseOutput = [
+    "opencode/big-pickle",
+    JSON.stringify({ id: "big-pickle", providerID: "opencode", name: "Big Pickle", cost: { input: 0, output: 0 }, variants: {} }, null, 2),
+    "github-copilot/gpt-5.6-terra",
+    JSON.stringify(
+      { id: "gpt-5.6-terra", providerID: "github-copilot", name: "GPT 5.6 Terra", cost: { input: 2, output: 12 }, variants: { low: {}, high: {} } },
+      null,
+      2,
+    ),
+  ].join("\n");
+  const result = readOpencodeDefaults({
+    configDirectory: join(fixtures, "does-not-exist-dir"),
+    stateDirectory: join(fixtures, "does-not-exist-dir-2"),
+    execFileSyncImpl: () => verboseOutput,
+  });
+  assert.deepEqual(result.catalog, [
+    { id: "opencode/big-pickle", label: "Big Pickle", thinkingLevels: [], provider: "opencode", cost: { input: 0, output: 0 } },
+    { id: "github-copilot/gpt-5.6-terra", label: "GPT 5.6 Terra", thinkingLevels: ["low", "high"], provider: "github-copilot", cost: { input: 2, output: 12 } },
+  ]);
 });
 
 test("readOpencodeDefaults never throws when nothing is available", () => {

@@ -293,10 +293,16 @@ export async function readPiDefaults({ homeDirectory, projectRoot, execFileSyncI
     if (ModelRuntime?.create) {
       const runtime = await ModelRuntime.create();
       const available = await runtime.getAvailable();
+      // provider/cost pass through so profile-defaults.mjs can rank pi's
+      // catalog by real per-token pricing -- pi's SDK reports no
+      // priority/tier field, so without cost every profile fell back to
+      // the single detected default (e.g. always gpt-5.6-terra).
       result.catalog = (available ?? []).map((entry) => ({
         id: entry.id ?? entry.model,
         label: entry.label ?? entry.id ?? entry.model,
         thinkingLevels: entry.thinkingLevels ?? [],
+        provider: entry.provider,
+        cost: entry.cost,
       }));
       result.source = result.source === "static" ? "sdk" : result.source;
       return result;
@@ -324,6 +330,46 @@ export async function readPiDefaults({ homeDirectory, projectRoot, execFileSyncI
 // ---------------------------------------------------------------------------
 // OpenCode
 // ---------------------------------------------------------------------------
+
+/**
+ * `opencode models --verbose` prints a "provider/id" header line followed
+ * by a pretty-printed JSON object per model -- not one combined JSON
+ * document, so it needs a line-oriented parse rather than JSON.parse on the
+ * whole output. Pulls out cost and supported reasoning-effort variants; the
+ * plain (non-verbose) form gives only bare ids, which left every profile
+ * with no way to rank models and made them all fall back to the same
+ * single detected default.
+ */
+function opencodeCatalogFromVerboseText(text) {
+  const headerPattern = /^[\w.-]+\/[\w.-]+$/;
+  const catalog = [];
+  let header = null;
+  let buffer = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (header === null) {
+      if (headerPattern.test(line.trim())) header = line.trim();
+      continue;
+    }
+    buffer.push(line);
+    if (line === "}") {
+      try {
+        const model = JSON.parse(buffer.join("\n"));
+        catalog.push({
+          id: header,
+          label: model.name ?? header,
+          thinkingLevels: Object.keys(model.variants ?? {}),
+          provider: model.providerID,
+          cost: model.cost,
+        });
+      } catch {
+        // Malformed block for this one model; skip it rather than losing the whole catalog.
+      }
+      header = null;
+      buffer = [];
+    }
+  }
+  return catalog;
+}
 
 export function readOpencodeDefaults({ configDirectory, stateDirectory, execFileSyncImpl = execFileSync } = {}) {
   const result = emptyResult("static");
@@ -373,17 +419,13 @@ export function readOpencodeDefaults({ configDirectory, stateDirectory, execFile
     // Volta's opencode.cmd shim even though `opencode models` runs fine
     // typed into a real shell; this was silently emptying the catalog and
     // making every profile fall back to the single detected default.
-    const modelsOutput = execFileSyncImpl("opencode", ["models"], {
+    const modelsOutput = execFileSyncImpl("opencode", ["models", "--verbose"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 5000,
       shell: true,
     });
-    result.catalog = modelsOutput
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((id) => ({ id, label: id, thinkingLevels: [] }));
+    result.catalog = opencodeCatalogFromVerboseText(modelsOutput);
   } catch (error) {
     result.warnings.push(`\`opencode models\` unavailable: ${error instanceof Error ? error.message : String(error)}`);
   }

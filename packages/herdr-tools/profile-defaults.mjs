@@ -12,6 +12,43 @@ const HARNESS_TO_PROVIDER = {
   opencode: "opencode",
 };
 
+// Pi's SDK catalog carries no priority/description signal at all, only
+// cost -- and cost turned out to reflect reseller/subscription billing,
+// not capability (verified wrong twice: gpt-5.3-codex-spark priced above
+// gpt-5.6-luna despite being the cheap/subscription pick in practice, and
+// OpenCode's github-copilot resale pricing put the older gpt-5.4 above
+// gpt-5.6-terra). Cost-based ranking was dropped entirely for OpenCode as
+// a result -- no reliable tier signal exists there, so it falls back to
+// the single detected default like any other unranked catalog.
+//
+// For Pi specifically, Zach's own usage is the actual signal: stick to
+// the gpt-5.6+/gpt-6+ generation for real work, except the cheap tier,
+// which should get gpt-5.3-codex-spark precisely because it runs on a
+// flat subscription rather than being billed at its sticker price. This
+// is hand-curated the same way Claude's static catalog is (see
+// harness-catalog.json) -- verified, not inferred -- not the live-ranking
+// approach Codex's genuinely volatile catalog needs.
+const PI_MODERN_GENERATION = /^gpt-(?:5\.6|6)(?:[.-]|$)/;
+const PI_CHEAP_MODEL_ID = "gpt-5.3-codex-spark";
+
+/** Cost-rank Pi's gpt-5.6+/gpt-6+ models only (see comment above) -- cost is a coherent signal within that single-vendor, single-generation set, unlike across Pi's full mixed-generation, mixed-reseller catalog. */
+function pickPiModelForTier(detection, tier) {
+  if (tier === "cheap") {
+    const spark = (detection.catalog ?? []).find((entry) => entry.id === PI_CHEAP_MODEL_ID);
+    if (spark) return spark;
+  }
+  const modern = (detection.catalog ?? []).filter(
+    (entry) => PI_MODERN_GENERATION.test(entry.id ?? "") && typeof entry.cost?.output === "number",
+  );
+  if (modern.length === 0) return undefined;
+  const ranked = [...modern].sort((a, b) => b.cost.output - a.cost.output).map((entry, index) => ({ ...entry, priority: index }));
+  if (tier === "flagship") return ranked[0];
+  if (tier === "frontier") return ranked[1] ?? ranked[0];
+  if (tier === "cheap") return ranked[ranked.length - 1];
+  const midIndex = ranked.length === 2 ? 1 : Math.floor(ranked.length / 2);
+  return ranked[midIndex];
+}
+
 const EFFORT_LADDER = ["low", "medium", "high", "xhigh", "max"];
 
 // Per-profile-category thinking preference, expressed as a position on the
@@ -109,17 +146,24 @@ function pickCatalogEntryForTier(ranked, tier) {
  * (in order): an explicit hand-curated `tier` on a catalog entry (safe for
  * a static, maintained list like Claude's -- no live volatility to guard
  * against); tier-based inference from a live catalog's own priority
- * ranking (Codex's case, where no one can hand-curate); the harness's
- * single detected default (no catalog data at all, e.g. Pi/OpenCode).
- * Never a hardcoded model name in any case.
+ * ranking (Codex's case, where no one can hand-curate); Pi's own
+ * hand-curated generation/cheap-tier rule (see PI_MODERN_GENERATION above
+ * -- Pi's SDK has no priority signal, and its cost data turned out to
+ * reflect billing, not capability); the harness's single detected default
+ * when none of the above apply. Never a hardcoded model name outside of
+ * Pi's verified exception above.
  */
-function modelForProfile(profileName, detection, tierOverride) {
+function modelForProfile(profileName, detection, harnessId, tierOverride) {
   const tier = tierOverride ?? PROFILE_MODEL_TIER[profileName];
   if (tier) {
     const explicit = (detection.catalog ?? []).find((entry) => entry.tier === tier);
     if (explicit) return { modelId: explicit.id, thinkingLevels: explicit.thinkingLevels };
     const picked = pickCatalogEntryForTier(rankedCatalog(detection), tier);
     if (picked) return { modelId: picked.id, thinkingLevels: picked.thinkingLevels };
+    if (harnessId === "pi") {
+      const pickedForPi = pickPiModelForTier(detection, tier);
+      if (pickedForPi) return { modelId: pickedForPi.id, thinkingLevels: pickedForPi.thinkingLevels };
+    }
   }
   return { modelId: detection.defaultModel, thinkingLevels: catalogThinkingLevels(detection, detection.defaultModel) };
 }
@@ -173,7 +217,7 @@ export function defaultLaunchProfiles(selectedHarnessIds, detectionResults, task
     const provider = HARNESS_TO_PROVIDER[harnessId];
     if (!provider) continue;
     const preferredEffort = PROFILE_EFFORT_PREFERENCE[profileName] ?? profileDefaults.thinking ?? "medium";
-    const { modelId, thinkingLevels } = modelForProfile(profileName, detection);
+    const { modelId, thinkingLevels } = modelForProfile(profileName, detection, harnessId);
     const thinking = nearestSupportedThinking(preferredEffort, thinkingLevels ?? undefined) ?? detection.defaultThinking ?? preferredEffort;
     profiles[profileName] = {
       agentKind: harnessId,
@@ -194,7 +238,7 @@ function allProfilesOnHarness(harnessId, detection, taskProfilesDefaults) {
   const profiles = {};
   for (const [profileName, profileDefaults] of Object.entries(taskProfilesDefaults)) {
     const preferredEffort = PROFILE_EFFORT_PREFERENCE[profileName] ?? profileDefaults.thinking ?? "medium";
-    const { modelId, thinkingLevels } = modelForProfile(profileName, detection);
+    const { modelId, thinkingLevels } = modelForProfile(profileName, detection, harnessId);
     const thinking = nearestSupportedThinking(preferredEffort, thinkingLevels ?? undefined) ?? detection.defaultThinking ?? preferredEffort;
     profiles[profileName] = {
       agentKind: harnessId,
@@ -221,7 +265,7 @@ function buildRoleBasedTemplate(selectedHarnessIds, detectionResults, taskProfil
     const provider = HARNESS_TO_PROVIDER[harnessId];
     if (!provider) continue;
     const preferredEffort = PROFILE_EFFORT_PREFERENCE[profileName] ?? profileDefaults.thinking ?? "medium";
-    const { modelId, thinkingLevels } = modelForProfile(profileName, detection);
+    const { modelId, thinkingLevels } = modelForProfile(profileName, detection, harnessId);
     const thinking = nearestSupportedThinking(preferredEffort, thinkingLevels ?? undefined) ?? detection.defaultThinking ?? preferredEffort;
     profiles[profileName] = {
       agentKind: harnessId,
@@ -257,7 +301,7 @@ function allProfilesAtEffort(effort, tier, selectedHarnessIds, detectionResults,
     const { harnessId, detection } = picked;
     const provider = HARNESS_TO_PROVIDER[harnessId];
     if (!provider) continue;
-    const { modelId, thinkingLevels } = modelForProfile(profileName, detection, tier);
+    const { modelId, thinkingLevels } = modelForProfile(profileName, detection, harnessId, tier);
     const thinking = nearestSupportedThinking(effort, thinkingLevels ?? undefined) ?? detection.defaultThinking ?? effort;
     profiles[profileName] = {
       agentKind: harnessId,
