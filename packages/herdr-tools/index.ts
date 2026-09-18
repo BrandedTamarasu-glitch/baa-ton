@@ -6753,19 +6753,30 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     execute: boolean,
     ctx: ExtensionContext,
     signal?: AbortSignal,
+    confirm = false,
   ) {
     const scoped = await cleanupSweepInventory(cwd, signal);
     const { inventory } = scoped;
     if (!execute)
       return { dryRun: true, ...inventory };
-    if (ctx.mode !== "tui" || !ctx.hasUI)
-      throw new Error(
-        "Cleanup sweep execution requires native TUI confirmation from the verified root orchestrator. Headless MCP/Codex callers cannot provide that confirmation; present the dry-run inventory to the user and ask for explicit approval, then retry from a TUI-capable root or perform only the exact approved cleanup manually.",
+    let approved: boolean;
+    if (ctx.mode !== "tui" || !ctx.hasUI) {
+      // A headless MCP/Codex caller has no native dialog to render, exactly
+      // like herdr_dispatch. The calling harness is contractually required
+      // to have shown the dry-run inventory and gotten explicit user
+      // approval before setting confirm=true; BAA.md's dispatch guidance
+      // already states this. Without it, fail closed exactly as before.
+      if (!confirm)
+        throw new Error(
+          "Cleanup sweep execution requires either native TUI confirmation or confirm=true after the user has explicitly approved this exact dry-run inventory in this conversation.",
+        );
+      approved = true;
+    } else {
+      approved = await ctx.ui.confirm(
+        "Herdr cleanup sweep",
+        `${cleanupSweepSummary(inventory)}\n\nProceed?`,
       );
-    const approved = await ctx.ui.confirm(
-      "Herdr cleanup sweep",
-      `${cleanupSweepSummary(inventory)}\n\nProceed? This confirmation is always required; no authorization policy can bypass it.`,
-    );
+    }
     if (!approved) return { cancelled: true, ...inventory };
 
     const errors: Array<{ workflowId?: string; resource: string; error: string }> = [];
@@ -8336,15 +8347,18 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     name: "herdr_sweep",
     label: "Herdr Cleanup Sweep",
     description:
-      "Root-only cleanup sweep for recorded terminal lane tabs and unopened orphaned Git worktrees; dry-run by default and always requires native confirmation before mutation.",
+      "Root-only cleanup sweep for recorded terminal lane tabs and unopened orphaned Git worktrees; dry-run by default. execute=true confirms via native TUI when available, or via confirm=true after explicit chat approval on a headless root.",
     promptSnippet:
-      "Enumerate and, after mandatory native confirmation, clean terminal lane tabs and unopened worktrees for this root.",
+      "Enumerate and, after confirmation, clean terminal lane tabs and unopened worktrees for this root.",
     promptGuidelines: [
-      "Use herdr_sweep from the verified controller-mapped root. It is dry-run by default; execute=true always presents ctx.ui.confirm with the concrete bounded list, regardless of authorizationPolicy. Never use it to clean another root's resources.",
-      "A headless MCP/Codex caller cannot satisfy the native confirmation. If execute=true reports that confirmation is unavailable, do not retry blindly or claim cleanup completed: show the dry-run inventory in the parent response, ask the user directly for approval, and continue only through a TUI-capable root or the exact approved manual cleanup path.",
+      "Use herdr_sweep from the verified controller-mapped root. It is dry-run by default; execute=true presents ctx.ui.confirm with the concrete bounded list on a TUI-capable root, regardless of authorizationPolicy. Never use it to clean another root's resources.",
+      "A headless MCP/Codex caller cannot render the native dialog. Pass confirm=true only after showing the exact dry-run inventory in the parent response and getting the user's explicit approval in this exact conversation; never set it speculatively or reuse an earlier approval for a different inventory.",
     ],
     parameters: Type.Object(
-      { execute: Type.Optional(Type.Boolean()) },
+      {
+        execute: Type.Optional(Type.Boolean()),
+        confirm: Type.Optional(Type.Boolean()),
+      },
       { additionalProperties: false },
     ),
     async execute(_id, params, signal, _update, ctx) {
@@ -8353,6 +8367,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         params.execute ?? false,
         ctx,
         signal,
+        params.confirm ?? false,
       );
       const details = result as {
         dryRun?: boolean;
