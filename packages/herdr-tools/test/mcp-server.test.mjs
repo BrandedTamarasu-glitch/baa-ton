@@ -43,6 +43,8 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
     env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
   });
+  if (env.TEST_MCP_PID_FILE)
+    await writeFile(env.TEST_MCP_PID_FILE, String(child.pid));
   let stderr = "";
   child.stderr.on("data", (chunk) => (stderr += chunk));
   const lines = createInterface({ input: child.stdout });
@@ -78,6 +80,7 @@ async function rootBridgeFixture() {
   const stateDir = join(directory, "config");
   const cwd = join(directory, "workspace");
   const binDir = join(directory, "bin");
+  const mcpPidFile = join(directory, "mcp.pid");
   const herdr = join(
     binDir,
     process.platform === "win32" ? "herdr.cmd" : "herdr",
@@ -94,7 +97,7 @@ async function rootBridgeFixture() {
   await mkdir(binDir, { recursive: true, mode: 0o700 });
   // This read-only native stub proves the bridge uses the live pane identity
   // while keeping the test independent of a focused Herdr client.
-  const script = `const { appendFileSync } = require("node:fs");
+  const script = `const { appendFileSync, readFileSync } = require("node:fs");
 const args = process.argv.slice(2);
 const result = (value) => process.stdout.write(JSON.stringify({ result: value }) + "\\n");
 if (args[0] === "plugin" && args[1] === "config-dir") {
@@ -137,10 +140,13 @@ if (args[0] === "plugin" && args[1] === "config-dir") {
 } else if (args[0] === "pane" && args[1] === "process-info") {
   const pane = args[3];
   const matches = pane === process.env.TEST_PROCESS_MATCH_PANE;
+  const matchedPid = process.env.TEST_MCP_PID_FILE
+    ? Number(readFileSync(process.env.TEST_MCP_PID_FILE, "utf8"))
+    : process.ppid;
   result({
     type: "pane_process_info",
     process_info: {
-      foreground_processes: matches ? [{ pid: process.ppid }] : [],
+      foreground_processes: matches ? [{ pid: matchedPid }] : [],
     },
   });
 } else if (args[0] === "pane" && args[1] === "get") {
@@ -173,6 +179,7 @@ if (args[0] === "plugin" && args[1] === "config-dir") {
     stateDir,
     cwd,
     binDir,
+    mcpPidFile,
     root: {
       target: "w-root:root",
       target_kind: "pane_id",
@@ -551,6 +558,7 @@ test("MCP pane process correlation survives a regenerated Claude session id", as
         TEST_LIVE_WORKSPACE: "w-process",
         TEST_LIVE_CWD: "C:\\cic",
         TEST_PROCESS_MATCH_PANE: "w-process:current",
+        TEST_MCP_PID_FILE: fixture.mcpPidFile,
         TEST_ROOT_WORKSPACE: "w-process",
         PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
       },
