@@ -13,25 +13,34 @@ const here = dirname(fileURLToPath(import.meta.url));
 const serverPath = join(here, "..", "mcp-server.mjs");
 
 async function withMcpServer(env, run, { cwd = here } = {}) {
+  const childEnv = {
+    ...process.env,
+    // A lane shell exports its startup intent for the harness bridge. The
+    // test bridge must never merge into that live intent while test files
+    // execute concurrently; fixtures below provide their own config when
+    // they need one.
+    BAA_STARTUP_INTENT: undefined,
+    CLAUDE_CODE_SESSION_ID: undefined,
+    HERDR_PLUGIN_CONFIG_DIR: undefined,
+    HERDR_PLUGIN_STATE_DIR: undefined,
+    HERDR_PANE_ID: "w-test:p1",
+    HERDR_WORKSPACE_ID: "w-test",
+    ...env,
+  };
+  // Windows environment keys are case-insensitive, but Node inherits the
+  // spelling `Path`. Supplying a test-only `PATH` alongside it can leave the
+  // inherited search path active, causing the real Herdr binary to win over
+  // the fixture at the front of the intended path.
+  if (process.platform === "win32" && (env.PATH ?? env.Path)) {
+    childEnv.Path = env.PATH ?? env.Path;
+    delete childEnv.PATH;
+  }
   const child = spawn(process.execPath, [serverPath], {
     cwd,
     // Pin a neutral Herdr identity so behavior is identical whether the
     // suite runs from a lane pane or from the registered root pane; callers
     // may still override via `env`.
-    env: {
-      ...process.env,
-      // A lane shell exports its startup intent for the harness bridge. The
-      // test bridge must never merge into that live intent while test files
-      // execute concurrently; fixtures below provide their own config when
-      // they need one.
-      BAA_STARTUP_INTENT: undefined,
-      CLAUDE_CODE_SESSION_ID: undefined,
-      HERDR_PLUGIN_CONFIG_DIR: undefined,
-      HERDR_PLUGIN_STATE_DIR: undefined,
-      HERDR_PANE_ID: "w-test:p1",
-      HERDR_WORKSPACE_ID: "w-test",
-      ...env,
-    },
+    env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
   });
   let stderr = "";
@@ -284,11 +293,7 @@ test("mapped root bridge exposes root-role parity and returns non-Pi root ground
         name: "herdr_bootstrap_root",
         arguments: {},
       });
-      assert.equal(
-        bootstrap.result.isError,
-        undefined,
-        JSON.stringify(bootstrap.result),
-      );
+      assert.equal(bootstrap.result.isError, undefined);
       assert.match(bootstrap.result.content.map((item) => item.text).join("\n"), /ROOT BRIEFING/);
       assert.match(bootstrap.result.structuredContent.rootBriefing, /sole Baa-ton parent executor/);
       assert.equal(bootstrap.result.structuredContent.root.agent_kind, "claude");
