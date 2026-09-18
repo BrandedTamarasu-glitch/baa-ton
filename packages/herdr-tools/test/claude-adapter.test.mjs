@@ -72,6 +72,17 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
     assert.equal(adapter.capabilities.supportsLiveCapabilityDiscovery, false);
     assert.equal(adapter.capabilities.supportsStartupHandshake, false);
     assert.equal(adapter.discoverCatalog, undefined);
+    assert.equal(
+      adapter.attestationComplete({
+        sessionId: "abc",
+        operations: ["plan", "dispatch", "complete"],
+      }),
+      true,
+    );
+    assert.equal(
+      adapter.attestationComplete({ sessionId: "abc", operations: ["plan"] }),
+      false,
+    );
     const context = { startupIntentPath: "/intents/lane.json" };
     const args = adapter.launchArguments(profile, "/source/index.ts", context);
     assert.equal(args[args.indexOf("--model") + 1], "claude-sonnet-5");
@@ -249,7 +260,8 @@ test("SessionStart helper merges lane identity and preserves bridge operations",
       }),
       { mode: 0o600 },
     );
-    // Bridge writes its operations first; the hook must preserve them.
+    // A lazy bridge may have written only a partial set; the hook must seed
+    // the stable contract while preserving the identity merge.
     await mergeAttestation(intentPath, { operations: ["plan", "complete"] });
     const { spawn } = require("node:child_process");
     await new Promise((resolve, reject) => {
@@ -278,7 +290,7 @@ test("SessionStart helper merges lane identity and preserves bridge operations",
     assert.equal(ready.nonce, "nonce-1");
     assert.equal(ready.source, "/source/index.ts");
     assert.deepEqual(ready.profile, profile);
-    assert.deepEqual(ready.operations, ["plan", "complete"]);
+    assert.deepEqual(ready.operations, ["plan", "dispatch", "complete"]);
     // Wrong pane binding must fail closed.
     await assert.rejects(
       new Promise((_, reject) => {

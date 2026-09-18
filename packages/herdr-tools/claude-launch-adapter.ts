@@ -5,6 +5,7 @@ import type { LaunchProfile } from "./launch-profile.js";
 import type { PersistenceHandle } from "./contract.js";
 import {
   PROTOCOL_OPERATIONS,
+  STARTUP_PROOF_REQUIRED_OPERATIONS,
   type HarnessLaunchAdapter,
   type LaunchContext,
   type ProtocolOperation,
@@ -232,6 +233,28 @@ export function claudeLaunchAdapter(
       // SessionStart emits the startup proof without a first turn. Do not send
       // an unnecessary prompt or imply that a handshake is supported.
       supportsStartupHandshake: false,
+    },
+    // Claude may start stdio MCP servers lazily. Do not accept the
+    // SessionStart identity half as a complete proof before the bridge's
+    // protocol contract has also been attested by the hook or MCP process.
+    attestationComplete(attestation: unknown): boolean {
+      const hello = attestation as {
+        sessionPath?: unknown;
+        sessionId?: unknown;
+        operations?: unknown;
+      };
+      const operations = Array.isArray(hello?.operations)
+        ? hello.operations.filter(
+            (operation): operation is string => typeof operation === "string",
+          )
+        : [];
+      return (
+        (typeof hello?.sessionPath === "string" ||
+          typeof hello?.sessionId === "string") &&
+        STARTUP_PROOF_REQUIRED_OPERATIONS.every((operation) =>
+          operations.includes(operation),
+        )
+      );
     },
     // Honest capability reporting: Herdr's Claude integration exposes session
     // identity, but lifecycle state is screen-derived, not native.
