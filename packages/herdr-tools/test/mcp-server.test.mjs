@@ -49,30 +49,19 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
   let nextId = 0;
   const pending = new Map();
   lines.on("line", (line) => {
-    if (process.env.BAA_DEBUG_WINDOWS_MCP) console.error("mcp line", line);
     const message = JSON.parse(line);
     pending.get(message.id)?.(message);
     pending.delete(message.id);
   });
   const rpcWithId = (id, method, params = {}) =>
     new Promise((resolve) => {
-      if (process.env.BAA_DEBUG_WINDOWS_MCP)
-        console.error("mcp request", id, method, params.name ?? "");
       pending.set(id, resolve);
       child.stdin.write(
         `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`,
       );
     });
   const rpc = (method, params = {}) => rpcWithId(++nextId, method, params);
-  const timeout = setTimeout(() => {
-    if (process.env.BAA_DEBUG_WINDOWS_MCP && stderr)
-      console.error("mcp stderr", stderr);
-    if (process.env.BAA_DEBUG_WINDOWS_MCP && env.TEST_COMMAND_LOG)
-      readFile(env.TEST_COMMAND_LOG, "utf8")
-        .then((value) => console.error("fixture commands", value))
-        .catch((error) => console.error("fixture command log read failed", error));
-    child.kill();
-  }, 15000);
+  const timeout = setTimeout(() => child.kill(), 15000);
   try {
     return await run(rpc, rpcWithId);
   } finally {
@@ -80,8 +69,7 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
     child.stdin.end();
     await once(child, "close");
     lines.close();
-    if (stderr.trim() && !process.env.BAA_DEBUG_WINDOWS_MCP)
-      throw new Error(`mcp-server.mjs stderr: ${stderr}`);
+    if (stderr.trim()) throw new Error(`mcp-server.mjs stderr: ${stderr}`);
   }
 }
 
@@ -109,8 +97,6 @@ async function rootBridgeFixture() {
   const script = `const { appendFileSync } = require("node:fs");
 const args = process.argv.slice(2);
 const result = (value) => process.stdout.write(JSON.stringify({ result: value }) + "\\n");
-if (process.env.TEST_COMMAND_LOG)
-  appendFileSync(process.env.TEST_COMMAND_LOG, process.pid + " " + args.join(" ") + "\\n");
 if (args[0] === "plugin" && args[1] === "config-dir") {
   result({ config_dir: process.env.TEST_CONFIG_DIR });
 } else if (args[0] === "agent" && args[1] === "list") {
@@ -474,7 +460,6 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
       TEST_ROOT_WORKSPACE: "w-live-b",
     };
     await withMcpServer(first, async (rpc) => {
-      if (process.env.BAA_DEBUG_WINDOWS_MCP) console.error("first server start");
       const bootstrap = await rpc("tools/call", {
         name: "herdr_bootstrap_root",
         arguments: { add: true },
@@ -482,7 +467,6 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
       assert.equal(bootstrap.result.isError, undefined);
       assert.equal(bootstrap.result.structuredContent.root.pane_id, "w-live-b:second");
       assert.equal(bootstrap.result.structuredContent.root.workspace_id, "w-live-b");
-      if (process.env.BAA_DEBUG_WINDOWS_MCP) console.error("first bootstrap done");
     }, { cwd: fixture.cwd });
 
     const second = {
@@ -493,10 +477,8 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
       TEST_LIVE_WORKSPACE: "w-live-c",
       TEST_ROOT_WORKSPACE: "w-live-c",
       TEST_AGENT_LIST_LOG: join(fixture.directory, "agent-list.log"),
-      TEST_COMMAND_LOG: join(fixture.directory, "command.log"),
     };
     await withMcpServer(second, async (rpc) => {
-      if (process.env.BAA_DEBUG_WINDOWS_MCP) console.error("second server start");
       const bootstrap = await rpc("tools/call", {
         name: "herdr_bootstrap_root",
         arguments: { add: true },
@@ -504,14 +486,12 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
       assert.equal(bootstrap.result.isError, undefined);
       assert.equal(bootstrap.result.structuredContent.root.pane_id, "w-live-c:third");
       assert.equal(bootstrap.result.structuredContent.root.workspace_id, "w-live-c");
-      if (process.env.BAA_DEBUG_WINDOWS_MCP) console.error("second bootstrap done");
 
       const doctor = await rpc("tools/call", {
         name: "herdr_doctor",
         arguments: {},
       });
       assert.equal(doctor.result.isError, undefined);
-      if (process.env.BAA_DEBUG_WINDOWS_MCP) console.error("second doctor done");
       const routing = doctor.result.structuredContent.checks.find(
         (check) => check.id === "plugin-enablement-and-routing",
       );

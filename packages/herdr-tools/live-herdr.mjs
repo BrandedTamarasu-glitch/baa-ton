@@ -64,8 +64,6 @@ async function runHerdrCommand(args, {
   const output = await new Promise((resolve, reject) => {
     let child;
     try {
-      if (process.env.BAA_DEBUG_WINDOWS_MCP)
-        console.error("live-herdr spawn", args.join(" "));
       child = spawnHerdrProcess(HERDR_COMMAND, args, {
         cwd,
         env,
@@ -101,10 +99,6 @@ async function runHerdrCommand(args, {
         ),
       ),
     );
-    child.on("close", () => {
-      if (process.env.BAA_DEBUG_WINDOWS_MCP)
-        console.error("live-herdr close", args.join(" "));
-    });
     child.on("close", (code) =>
       finish(() =>
         code === 0
