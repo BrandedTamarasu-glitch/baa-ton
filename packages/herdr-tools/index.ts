@@ -2237,11 +2237,41 @@ function syncLaneSessionLog(
   };
 }
 
+function attestedPiRootSessionPath(
+  root: ControllerRootMapping,
+  native: NativeSessionRef | undefined,
+): string | undefined {
+  if (
+    root.agent_kind !== "pi" ||
+    native?.kind !== "id" ||
+    process.env.PI_CODING_AGENT !== "true" ||
+    process.env.PI_SESSION_ID !== native.value ||
+    typeof process.env.PI_SESSION_FILE !== "string" ||
+    !isAbsolute(process.env.PI_SESSION_FILE)
+  )
+    return undefined;
+  try {
+    const info = lstatSync(process.env.PI_SESSION_FILE);
+    if (!info.isFile() || info.isSymbolicLink()) return undefined;
+    return realpathSync(process.env.PI_SESSION_FILE);
+  } catch {
+    return undefined;
+  }
+}
+
 function rootSessionPersistence(
   root: ControllerRootMapping,
   agent: unknown,
 ): PersistenceHandle {
   const native = nativeSessionFromAgent(agent);
+  const sessionPath = attestedPiRootSessionPath(root, native);
+  if (native && sessionPath)
+    return {
+      provider: "pi",
+      sessionId: native.value,
+      nativeHandle: native,
+      metadata: { sessionPath },
+    };
   if (native)
     return toPersistenceHandle(native, root.agent_kind ?? "herdr");
   const sessionId =

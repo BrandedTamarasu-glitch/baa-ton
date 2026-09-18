@@ -344,7 +344,7 @@ test("headless cleanup reports the user-confirmation handoff and never mutates",
         undefined,
         headlessContext(f.cwd),
       ),
-      /Headless MCP\/Codex callers cannot provide that confirmation.*ask for explicit approval/i,
+      /requires either native TUI confirmation or confirm=true after the user has explicitly approved this exact dry-run inventory/i,
     );
     assert.equal(
       f.calls.some((args) => args[0] === "tab" && args[1] === "close"),
