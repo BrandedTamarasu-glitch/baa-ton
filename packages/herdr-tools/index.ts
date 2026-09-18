@@ -2237,23 +2237,30 @@ function syncLaneSessionLog(
   };
 }
 
+const piRootSessionPathHints = new WeakMap<object, string>();
+
 function attestedPiRootSessionPath(
   root: ControllerRootMapping,
   native: NativeSessionRef | undefined,
+  sessionPath: string | undefined,
 ): string | undefined {
   if (
     root.agent_kind !== "pi" ||
     native?.kind !== "id" ||
-    process.env.PI_CODING_AGENT !== "true" ||
-    process.env.PI_SESSION_ID !== native.value ||
-    typeof process.env.PI_SESSION_FILE !== "string" ||
-    !isAbsolute(process.env.PI_SESSION_FILE)
+    typeof sessionPath !== "string" ||
+    !isAbsolute(sessionPath)
   )
     return undefined;
   try {
-    const info = lstatSync(process.env.PI_SESSION_FILE);
-    if (!info.isFile() || info.isSymbolicLink()) return undefined;
-    return realpathSync(process.env.PI_SESSION_FILE);
+    const info = lstatSync(sessionPath);
+    const canonical = realpathSync(sessionPath);
+    if (
+      !info.isFile() ||
+      info.isSymbolicLink() ||
+      !basename(canonical).endsWith(`_${native.value}.jsonl`)
+    )
+      return undefined;
+    return canonical;
   } catch {
     return undefined;
   }
@@ -2264,7 +2271,11 @@ function rootSessionPersistence(
   agent: unknown,
 ): PersistenceHandle {
   const native = nativeSessionFromAgent(agent);
-  const sessionPath = attestedPiRootSessionPath(root, native);
+  const sessionPath = attestedPiRootSessionPath(
+    root,
+    native,
+    isRecord(agent) ? piRootSessionPathHints.get(agent) : undefined,
+  );
   if (native && sessionPath)
     return {
       provider: "pi",
@@ -3599,7 +3610,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   async function reconcileRootIdentity(
     cwd: string,
     signal?: AbortSignal,
-  ): Promise<{
+    sessionPath?: string,
+  ): Promise<{ 
     reconciled: boolean;
     root: ControllerRootMapping;
     previousRoot: ControllerRootMapping;
@@ -3617,6 +3629,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       { result: { type: "agent_info", agent: rootAgent } },
       "root identity reconciliation",
     );
+    if (isRecord(rootAgent) && sessionPath) piRootSessionPathHints.set(rootAgent, sessionPath);
     if (
       verifiedAgent.paneId !== root.pane_id ||
       verifiedAgent.workspaceId !== root.workspace_id ||
@@ -7805,7 +7818,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     ],
     parameters: Type.Object({}, { additionalProperties: false }),
     async execute(_id, _params, signal, _update, ctx) {
-      const result = await reconcileRootIdentity(ctx.cwd, signal);
+      const result = await reconcileRootIdentity(
+        ctx.cwd,
+        signal,
+        ctx.sessionManager?.getSessionFile?.(),
+      );
       return {
         content: [
           {

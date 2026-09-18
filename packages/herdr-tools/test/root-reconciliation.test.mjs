@@ -273,17 +273,13 @@ test("reconcile root repairs only the current root and is idempotent", async () 
 
 test("reconcile preserves an attested Pi session-file binding alongside Herdr's native UUID", async () => {
   const f = await fixture();
-  const sessionPath = join(f.directory, "pi-root.jsonl");
+  const sessionPath = join(f.directory, "pi-root_new-session.jsonl");
   const saved = Object.fromEntries(
     ["PI_CODING_AGENT", "PI_SESSION_ID", "PI_SESSION_FILE"].map((key) => [key, process.env[key]]),
   );
   try {
     await writeFile(sessionPath, "{}\n");
-    Object.assign(process.env, {
-      PI_CODING_AGENT: "true",
-      PI_SESSION_ID: "new-session",
-      PI_SESSION_FILE: sessionPath,
-    });
+    f.context.sessionManager = { getSessionFile: () => sessionPath };
     await f.tools
       .get("herdr_reconcile_root")
       .execute("reconcile", {}, undefined, undefined, f.context);
