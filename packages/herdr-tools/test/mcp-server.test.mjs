@@ -325,6 +325,20 @@ test("mapped root bridge exposes root-role parity and returns non-Pi root ground
     await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
 
     await withMcpServer({ ...env, HERDR_PANE_ID: "w-root:child" }, async (rpc) => {
+      const doctor = await rpc("tools/call", {
+        name: "herdr_doctor",
+        arguments: {},
+      });
+      assert.equal(doctor.result.isError, undefined);
+      const routing = doctor.result.structuredContent.checks.find(
+        (check) => check.id === "plugin-enablement-and-routing",
+      );
+      assert.match(routing.detail, /This pane is not a registered root/);
+      assert.match(
+        routing.detail,
+        /resolved pane_id=w-root:child, workspace_id=w-root/,
+      );
+
       const childGoal = await rpc("tools/call", {
         name: "herdr_goal",
         arguments: { action: "status" },
@@ -395,6 +409,10 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
         (check) => check.id === "plugin-enablement-and-routing",
       );
       assert.match(routing.detail, /This pane is a registered root/);
+      assert.match(
+        routing.detail,
+        /resolved pane_id=w-live-c:third, workspace_id=w-live-c/,
+      );
 
       const plan = await rpc("tools/call", {
         name: "herdr_plan",
@@ -509,6 +527,12 @@ test("MCP falls back to a registered static root when process and session hints 
           (check) => check.id === "plugin-enablement-and-routing",
         );
         assert.match(routing.detail, /This pane is a registered root/);
+        assert.match(
+          routing.detail,
+          new RegExp(
+            `resolved pane_id=${fixture.root.pane_id}, workspace_id=${fixture.root.workspace_id}`,
+          ),
+        );
       },
       { cwd: fixture.cwd },
     );
