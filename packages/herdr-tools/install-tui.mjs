@@ -330,6 +330,15 @@ function formatOption(harnessId, entry) {
   return `${harnessId}/${entry.model} (${entry.thinking})`;
 }
 
+/** One colorized "profileName: harness/model (thinking)" line per profile, in defaults.profiles order, with unconfigured ones called out instead of silently omitted. */
+function profileSummaryLines(profiles, profileOrder) {
+  return profileOrder.map((name) => {
+    const resolved = profiles[name];
+    if (!resolved) return `  ${gray(`${name}: unconfigured`)}`;
+    return `  ${bold(name)}: ${brightCyan(resolved.agentKind)}/${green(resolved.launchProfile.model)} (${yellow(resolved.launchProfile.thinking)})`;
+  });
+}
+
 function availableModelsForHarness(detection) {
   if (!detection) return [];
   if (detection.catalog?.length) return detection.catalog;
@@ -637,6 +646,10 @@ async function runWizard(options) {
         const profileCount = Object.keys(defaults.profiles).length;
         if (templates.length === 0) { phase = "profile-edit"; continue; }
 
+        const profileOrder = Object.keys(defaults.profiles);
+        const profilesForValue = (value) => templates.find((template) => template.id === value)?.profiles ?? computedDefaults;
+        const previewFor = (value) => [dim("Preview of this starting point:"), ...profileSummaryLines(profilesForValue(value), profileOrder)].join("\n");
+
         const result = await new Promise((resolvePromise) => {
           setStep(4, "Pick a starting point -- Shift+Tab: back to detection results");
           const items = templates.map((template) => ({
@@ -646,12 +659,19 @@ async function runWizard(options) {
           }));
           items.push({ value: "__custom__", label: "Start from current defaults", description: "configure every profile individually, no template applied" });
           const list = new SelectList(items, Math.min(items.length, 8), SELECT_THEME);
-          list.onSelect = (item) => {
-            const chosen = templates.find((template) => template.id === item.value);
-            resolvePromise(chosen ? chosen.profiles : computedDefaults);
-          };
+          // SelectList's own `description` is a single truncated line squeezed
+          // onto each row -- not enough room for a real per-profile
+          // breakdown. This preview panel updates on every highlight change
+          // (onSelectionChange, arrow keys or mouse hover-click) instead.
+          const preview = new Text(previewFor(items[0].value));
+          list.onSelectionChange = (item) => preview.setText(previewFor(item.value));
+          list.onSelect = (item) => resolvePromise(profilesForValue(item.value));
           list.onCancel = () => { abort(); resolvePromise(computedDefaults); };
-          swapBody(list);
+          const container = new Container();
+          container.addChild(list);
+          container.addChild(new Text(""));
+          container.addChild(preview);
+          swapBody(container);
           tui.setFocus(list);
           requestBack = () => resolvePromise(BACK);
         });
@@ -723,9 +743,7 @@ async function runWizard(options) {
       }
 
       // phase === "confirm"
-      const summaryLines = Object.entries(resolvedProfiles).map(
-        ([name, resolved]) => `  ${bold(name)}: ${brightCyan(resolved.agentKind)}/${green(resolved.launchProfile.model)} (${yellow(resolved.launchProfile.thinking)})`,
-      );
+      const summaryLines = profileSummaryLines(resolvedProfiles, Object.keys(defaults.profiles));
       const missing = unconfiguredProfiles(defaults, resolvedProfiles);
       const canGoBackToProfileEdit = !options.configOnly && !options.acceptDefaults;
       const confirmResult = await new Promise((resolvePromise) => {
