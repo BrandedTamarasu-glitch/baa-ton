@@ -187,6 +187,17 @@ function registeredTools(data) {
           }),
         };
       }
+      if (args[0] === "tab" && args[1] === "get") {
+        const tabId = args[2];
+        if (!data.liveTabs.has(tabId)) throw new Error(`no such tab: ${tabId}`);
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: { tab_id: tabId, workspace_id: data.tabWorkspace },
+          }),
+        };
+      }
       if (args[0] === "tab" && args[1] === "close") {
         const tabId = args[2];
         if (data.failTabs.has(tabId)) throw new Error(`close failed for ${tabId}`);
@@ -380,6 +391,30 @@ test("lane retirement records partial close failures durably for retry", async (
     assert.deepEqual(stored.workflows[0].laneRetirement.failedTabIds, ["task-tab-2"]);
     assert.deepEqual(stored.workflows[0].laneRetirement.pendingTabIds, ["task-tab-2"]);
     assert.equal(stored.workflows[0].outcome, "unknown");
+  } finally {
+    await cleanup(data, restore);
+  }
+});
+
+test("lane retirement accepts a lane tab already closed outside herdr_close", async () => {
+  const data = await fixture({ liveTabs: [] });
+  const restore = setupEnvironment(data);
+  try {
+    const tools = registeredTools(data);
+    const result = await close(data, tools);
+    assert.equal(result.details.laneRetired, true);
+    assert.deepEqual(result.details.closedTabIds, data.tabIds);
+    assert.deepEqual(result.details.remainingTabIds, []);
+    assert.equal(
+      data.calls.some((args) => args[0] === "tab" && args[1] === "close"),
+      false,
+      "an already-closed tab must never be re-closed",
+    );
+    assert.equal(result.details.workflow.laneRetirement.status, "retired");
+    const alreadyClosedEvidence = result.details.workflow.evidence.filter(
+      (entry) => entry.kind === "lane-retirement-tab-already-closed",
+    );
+    assert.equal(alreadyClosedEvidence.length, data.tabIds.length);
   } finally {
     await cleanup(data, restore);
   }

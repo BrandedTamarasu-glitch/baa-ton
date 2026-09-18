@@ -5834,6 +5834,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
 
     const closedBefore = new Set(storedRetirement?.closedTabIds ?? []);
     const pendingTabIds = tabIds.filter((tabId) => !closedBefore.has(tabId));
+    const alreadyGoneTabIds: string[] = [];
     if (pendingTabIds.length > 0) {
       const listed = responseRecord(
         await runHerdr(["tab", "list", "--workspace", taskBinding.workspaceId], signal),
@@ -5848,14 +5849,35 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           (item: unknown): item is Record<string, unknown> =>
             isRecord(item) && item.tab_id === tabId,
         );
-        if (!tab || tab.workspace_id !== taskBinding.workspaceId)
+        if (tab && tab.workspace_id === taskBinding.workspaceId) continue;
+        // Not in this workspace's tab list. A tab can be manually closed
+        // outside herdr_close (e.g. `herdr tab close` run directly with the
+        // user's approval); that is not an error, it already accomplished
+        // the goal. Distinguish that from an ID reused by a tab that now
+        // lives in a different workspace, which is a real collision risk and
+        // must still refuse.
+        let existsElsewhere = false;
+        try {
+          const got = responseRecord(
+            await runHerdr(["tab", "get", tabId], signal),
+            "tab lookup",
+          );
+          existsElsewhere = got.workspace_id !== taskBinding.workspaceId;
+        } catch {
+          existsElsewhere = false; // herdr has no record of this tab anywhere.
+        }
+        if (existsElsewhere)
           throw new Error(
             `Lane tab ${tabId} is not in the root's task workspace ${taskBinding.workspaceId}; refusing cleanup.`,
           );
+        alreadyGoneTabIds.push(tabId);
       }
     }
 
-    const commands = pendingTabIds.map((tabId) => `herdr tab close ${tabId}`);
+    const closeCommandTabIds = pendingTabIds.filter(
+      (tabId) => !alreadyGoneTabIds.includes(tabId),
+    );
+    const commands = closeCommandTabIds.map((tabId) => `herdr tab close ${tabId}`);
     if (!execute)
       return {
         dryRun: true,
@@ -5906,6 +5928,15 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         requestedAt: timestamp,
         evidence: [],
       };
+      for (const tabId of alreadyGoneTabIds) {
+        if (record.closedTabIds.includes(tabId)) continue;
+        record.closedTabIds.push(tabId);
+        stored.evidence.push({
+          at: timestamp,
+          kind: "lane-retirement-tab-already-closed",
+          text: `Lane tab ${tabId} was already closed outside herdr_close (no matching Herdr tab); accepted as closed without attempting to close it again.`,
+        });
+      }
       record.pendingTabIds = record.tabIds.filter(
         (tabId) => !record.closedTabIds.includes(tabId),
       );
