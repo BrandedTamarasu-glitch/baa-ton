@@ -2384,19 +2384,46 @@ async function inspectCodexSandboxGitMetadata(
   };
 }
 
-function rootConfigPath(): string {
+function configuredControllerConfigPath(): string | undefined {
   const configuredDirectory = process.env[HERDR_PLUGIN_CONFIG_DIR_ENV];
-  if (configuredDirectory && isAbsolute(configuredDirectory))
-    return join(resolve(configuredDirectory), CONTROLLER_CONFIG_NAME);
-  return join(
-    homedir(),
-    ".config",
-    "herdr",
-    "plugins",
-    "config",
-    CONTROLLER_PLUGIN_ID,
-    CONTROLLER_CONFIG_NAME,
-  );
+  if (configuredDirectory && isAbsolute(configuredDirectory)) {
+    const configuredPath = join(
+      resolve(configuredDirectory),
+      CONTROLLER_CONFIG_NAME,
+    );
+    try {
+      const details = lstatSync(configuredPath);
+      if (details.isFile() && !details.isSymbolicLink()) return configuredPath;
+    } catch {
+      // A project-scoped harness registration can freeze a path from a
+      // different platform or Herdr installation. Fall through to the native
+      // platform location instead of treating that snapshot as authoritative.
+    }
+  }
+  return undefined;
+}
+
+function rootConfigPath(): string {
+  const configuredPath = configuredControllerConfigPath();
+  if (configuredPath) return configuredPath;
+  const directory =
+    process.platform === "win32"
+      ? join(
+          process.env.APPDATA || join(homedir(), "AppData", "Roaming"),
+          "herdr",
+          "plugins",
+          "config",
+          CONTROLLER_PLUGIN_ID,
+        )
+      : join(
+          homedir(),
+          ".config",
+          "herdr",
+          "plugins",
+          "config",
+          CONTROLLER_PLUGIN_ID,
+        );
+  return join(directory, CONTROLLER_CONFIG_NAME);
 }
 
 function readControllerConfigForCurrentPane(): ControllerConfig | undefined {
@@ -3019,6 +3046,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   async function refreshHerdrIdentity(
     signal?: AbortSignal,
   ): Promise<{ paneId?: string; workspaceId?: string }> {
+    if (!configuredControllerConfigPath()) await controllerConfigPath(signal);
     const identity =
       currentAppliedHerdrIdentity() ??
       (await resolveHerdrIdentity({
@@ -3246,6 +3274,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ),
       ),
     );
+    // Keep synchronous routing readers aligned with Herdr's live answer. The
+    // inherited value may be a frozen project registration snapshot.
+    process.env[HERDR_PLUGIN_CONFIG_DIR_ENV] = directory;
     return join(directory, CONTROLLER_CONFIG_NAME);
   }
 
