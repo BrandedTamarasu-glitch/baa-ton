@@ -3003,15 +3003,23 @@ async function persistParentMessage(
 async function confirmExecution(
   ctx: ExtensionContext,
   label: string,
+  explicitConfirm = false,
 ): Promise<boolean> {
   if (!isRootOrchestrator())
     throw new Error(
       "Only the verified controller-mapped root may request direct approval.",
     );
-  if (ctx.mode !== "tui" || !ctx.hasUI)
+  if (ctx.mode !== "tui" || !ctx.hasUI) {
+    // A headless MCP/JSON bridge has no native confirm UI to render at all.
+    // The calling harness (Claude, Codex, OpenCode) is contractually required
+    // to have obtained explicit user intent before setting explicitConfirm;
+    // BAA.md's dispatch guidance already states this. Without it, fail closed
+    // exactly as before.
+    if (explicitConfirm) return true;
     throw new Error(
       `${label} requires TUI confirmation from the designated root orchestrator.`,
     );
+  }
   return ctx.ui.confirm(
     "Herdr orchestrator",
     `${label}? Only extension-owned resources will be changed.`,
@@ -4709,6 +4717,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     ctx: ExtensionContext,
     signal?: AbortSignal,
     restart = false,
+    confirm = false,
   ): Promise<{
     workflow: Workflow;
     dryRun?: boolean;
@@ -4821,6 +4830,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             (await confirmExecution(
               ctx,
               `Dispatch ${w.id} in task workspace ${w.taskBinding?.workspaceId}`,
+              confirm,
             ))
           );
         },
@@ -7799,12 +7809,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     promptSnippet:
       "Dispatch only a planned Herdr workflow; dry-run by default.",
     promptGuidelines: [
-      "Use herdr_dispatch with execute=true only after explicit user intent. A root bypasses UI only when the workflow's validated local authorizationPolicy grants dispatch or retry; children remain UI-free and return parentApprovalRequired.",
+      "Use herdr_dispatch with execute=true only after explicit user intent. A root bypasses UI only when the workflow's validated local authorizationPolicy grants dispatch or retry; children remain UI-free and return parentApprovalRequired. On a headless bridge with no native confirm UI, pass confirm=true only after the user has explicitly said to proceed in this exact conversation; never set it speculatively.",
     ],
     parameters: Type.Object({
       workflowId: Type.String(),
       execute: Type.Optional(Type.Boolean()),
       restart: Type.Optional(Type.Boolean()),
+      confirm: Type.Optional(Type.Boolean()),
     }),
     async execute(_id, params, signal, _update, ctx) {
       const result = await dispatch(
@@ -7814,6 +7825,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ctx,
         signal,
         params.restart ?? false,
+        params.confirm ?? false,
       );
       return {
         content: [
