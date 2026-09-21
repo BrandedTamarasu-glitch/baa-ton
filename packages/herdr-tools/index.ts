@@ -25,6 +25,7 @@ import type {
 import { Type } from "typebox";
 import { blocksUnmanagedAgentCommand } from "./command-policy.js";
 import { approveFastForward, parseFastForward } from "./fast-forward-approval.mjs";
+import { resolvePiSessionIdentity, registerPiIdentityBridge } from "./pi-session-identity.mjs";
 import {
   AUTHORIZATION_CAPABILITIES,
   SUPPORTED_AGENT_KINDS,
@@ -124,7 +125,7 @@ async function importRouteChildMessage() {
 
 const { routeChildMessage } = await importRouteChildMessage();
 
-const MANIFEST_DIR = ".pi/herdr-orchestrator";
+const MANIFEST_DIR = ".baa-ton/herdr-orchestrator";
 const MANIFEST_NAME = "manifest.json";
 const OWNER = "herdr-orchestrator";
 const BB029_AUTHORIZATION_SCOPE = "BB-029";
@@ -837,6 +838,36 @@ async function acquireManifestLock(
   }
 }
 
+async function acquireControllerConfigLock(
+  configPath: string,
+  waitMs = 10_000,
+): Promise<() => Promise<void>> {
+  const lockPath = `${configPath}.lock`;
+  const deadline = Date.now() + waitMs;
+  while (true) {
+    try {
+      await mkdir(lockPath, { mode: 0o700 });
+      await writeFile(
+        join(lockPath, "owner.json"),
+        `${jsonText({ pid: process.pid, createdAt: now(), configPath })}\n`,
+        { mode: 0o600 },
+      );
+      return async () => rm(lockPath, { recursive: true, force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        if (Date.now() < deadline) {
+          await lockRetryDelay(10);
+          continue;
+        }
+        throw new Error(
+          `Herdr controller config is busy: ${configPath}. Wait for the active root operation, then retry.`,
+        );
+      }
+      throw error;
+    }
+  }
+}
+
 // The single transactional state owner for the manifest: every writer that
 // needs to mutate durable state after any await (a terminal/network call,
 // user confirmation, etc.) must reconcile against a freshly reloaded copy
@@ -1303,6 +1334,34 @@ function laneAgentKind(workflow: Workflow, lane: Lane): AgentKind {
   return validateAgentKind(lane.agentKind ?? workflow.agentKind ?? "pi");
 }
 
+// Tool names are "mcp__<server>__<tool>"; neither segment contains "__", so
+// a non-greedy match up to the first literal "__" isolates the server key.
+const MCP_TOOL_REFERENCE_PATTERN = /\bmcp__([A-Za-z0-9._-]*?)__[A-Za-z0-9_]+/g;
+
+export function referencedMcpServers(text: string): string[] {
+  const servers = new Set<string>();
+  for (const match of text.matchAll(MCP_TOOL_REFERENCE_PATTERN))
+    if (match[1] && match[1] !== "herdr-orchestrator") servers.add(match[1]);
+  return [...servers];
+}
+
+export function assertMcpServersGranted(
+  laneId: string,
+  objective: string,
+  granted: Record<string, unknown> | undefined,
+): void {
+  const grantedKeys = new Set(Object.keys(granted ?? {}));
+  const missing = referencedMcpServers(objective).filter(
+    (name) => !grantedKeys.has(name),
+  );
+  if (missing.length)
+    throw new Error(
+      `Lane ${laneId} objective references mcp__${missing[0]}__* tools, but mcpServers does not grant "${missing[0]}". ` +
+        `--strict-mcp-config scopes a dispatched lane to herdr-orchestrator plus whatever mcpServers lists, so any other server -- including a claude.ai account connector -- is unreachable unless granted there. ` +
+        `Add its raw --mcp-config entry to this lane's mcpServers, or remove the reference from the objective.`,
+    );
+}
+
 function normalizedLanes(
   objective: string,
   inputs: LaneInput[],
@@ -1316,7 +1375,8 @@ function normalizedLanes(
   return values.map((input, index) => {
     const laneId = `lane-${index + 1}`;
     const goalId = `${rootGoalId}/${laneId}`;
-    if (typeof input === "string")
+    if (typeof input === "string") {
+      assertMcpServersGranted(laneId, input, undefined);
       return {
         id: laneId,
         objective: input,
@@ -1333,6 +1393,7 @@ function normalizedLanes(
           authority: "lane" as const,
         },
       };
+    }
     if (!input || typeof input.objective !== "string" || !input.objective)
       throw new Error("Each lane object needs a non-empty objective.");
     const configuredProfile = input.taskProfile
@@ -1342,6 +1403,16 @@ function normalizedLanes(
       throw new Error(`Task profile ${input.taskProfile} cannot be resolved in this planning context.`);
     if (input.taskProfile && input.launchProfile !== undefined)
       throw new Error(`Lane ${laneId} cannot specify both taskProfile and launchProfile.`);
+    if (
+      input.mcpServers !== undefined &&
+      (typeof input.mcpServers !== "object" ||
+        input.mcpServers === null ||
+        Array.isArray(input.mcpServers))
+    )
+      throw new Error(`Lane ${laneId} mcpServers must be an object of server definitions.`);
+    if (input.mcpServers && "herdr-orchestrator" in input.mcpServers)
+      throw new Error(`Lane ${laneId} mcpServers cannot override the reserved herdr-orchestrator entry.`);
+    assertMcpServersGranted(laneId, input.objective, input.mcpServers);
     const launchProfile =
       configuredProfile?.launchProfile ??
       (input.launchProfile === undefined
@@ -1376,6 +1447,7 @@ function normalizedLanes(
           }
         : {}),
       ...(input.taskProfile ? { taskProfile: input.taskProfile } : {}),
+      ...(input.mcpServers ? { mcpServers: input.mcpServers } : {}),
     };
   });
 }
@@ -2167,11 +2239,52 @@ function syncLaneSessionLog(
   };
 }
 
+const piRootSessionPathHints = new WeakMap<object, string>();
+
+function attestedPiRootSessionPath(
+  root: ControllerRootMapping,
+  native: NativeSessionRef | undefined,
+  sessionPath: string | undefined,
+): string | undefined {
+  if (
+    root.agent_kind !== "pi" ||
+    native?.kind !== "id" ||
+    typeof sessionPath !== "string" ||
+    !isAbsolute(sessionPath)
+  )
+    return undefined;
+  try {
+    const info = lstatSync(sessionPath);
+    const canonical = realpathSync(sessionPath);
+    if (
+      !info.isFile() ||
+      info.isSymbolicLink() ||
+      !basename(canonical).endsWith(`_${native.value}.jsonl`)
+    )
+      return undefined;
+    return canonical;
+  } catch {
+    return undefined;
+  }
+}
+
 function rootSessionPersistence(
   root: ControllerRootMapping,
   agent: unknown,
 ): PersistenceHandle {
   const native = nativeSessionFromAgent(agent);
+  const sessionPath = attestedPiRootSessionPath(
+    root,
+    native,
+    isRecord(agent) ? piRootSessionPathHints.get(agent) : undefined,
+  );
+  if (native && sessionPath)
+    return {
+      provider: "pi",
+      sessionId: native.value,
+      nativeHandle: native,
+      metadata: { sessionPath },
+    };
   if (native)
     return toPersistenceHandle(native, root.agent_kind ?? "herdr");
   const sessionId =
@@ -2385,19 +2498,46 @@ async function inspectCodexSandboxGitMetadata(
   };
 }
 
-function rootConfigPath(): string {
+function configuredControllerConfigPath(): string | undefined {
   const configuredDirectory = process.env[HERDR_PLUGIN_CONFIG_DIR_ENV];
-  if (configuredDirectory && isAbsolute(configuredDirectory))
-    return join(resolve(configuredDirectory), CONTROLLER_CONFIG_NAME);
-  return join(
-    homedir(),
-    ".config",
-    "herdr",
-    "plugins",
-    "config",
-    CONTROLLER_PLUGIN_ID,
-    CONTROLLER_CONFIG_NAME,
-  );
+  if (configuredDirectory && isAbsolute(configuredDirectory)) {
+    const configuredPath = join(
+      resolve(configuredDirectory),
+      CONTROLLER_CONFIG_NAME,
+    );
+    try {
+      const details = lstatSync(configuredPath);
+      if (details.isFile() && !details.isSymbolicLink()) return configuredPath;
+    } catch {
+      // A project-scoped harness registration can freeze a path from a
+      // different platform or Herdr installation. Fall through to the native
+      // platform location instead of treating that snapshot as authoritative.
+    }
+  }
+  return undefined;
+}
+
+function rootConfigPath(): string {
+  const configuredPath = configuredControllerConfigPath();
+  if (configuredPath) return configuredPath;
+  const directory =
+    process.platform === "win32"
+      ? join(
+          process.env.APPDATA || join(homedir(), "AppData", "Roaming"),
+          "herdr",
+          "plugins",
+          "config",
+          CONTROLLER_PLUGIN_ID,
+        )
+      : join(
+          homedir(),
+          ".config",
+          "herdr",
+          "plugins",
+          "config",
+          CONTROLLER_PLUGIN_ID,
+        );
+  return join(directory, CONTROLLER_CONFIG_NAME);
 }
 
 function readControllerConfigForCurrentPane(): ControllerConfig | undefined {
@@ -2416,17 +2556,52 @@ function readControllerConfigForCurrentPane(): ControllerConfig | undefined {
   }
 }
 
-function isRootOrchestrator(): boolean {
-  const paneId = process.env[HERDR_PANE_ID_ENV];
-  const workspaceId = process.env.HERDR_WORKSPACE_ID;
-  if (!paneId || !workspaceId) return false;
+function isRegisteredRootIdentity(identity: {
+  paneId?: string;
+  workspaceId?: string;
+}): boolean {
+  if (!identity.paneId || !identity.workspaceId) return false;
   return (
     readControllerConfigForCurrentPane()?.orchestrators.some(
       (record) =>
-        record.root.pane_id === paneId &&
-        record.root.workspace_id === workspaceId,
+        record.root.pane_id === identity.paneId &&
+        record.root.workspace_id === identity.workspaceId,
     ) ?? false
   );
+}
+
+function liveClaudeAgentAtIdentity(
+  agents: unknown[],
+  identity: { paneId?: string; workspaceId?: string },
+): boolean {
+  return agents.some((value) => {
+    if (!isRecord(value)) return false;
+    const session = isRecord(value.agent_session)
+      ? value.agent_session
+      : undefined;
+    const kind =
+      typeof value.agent === "string"
+        ? value.agent
+        : typeof session?.agent === "string"
+          ? session.agent
+          : undefined;
+    return (
+      kind === "claude" &&
+      value.pane_id === identity.paneId &&
+      value.workspace_id === identity.workspaceId
+    );
+  });
+}
+
+function isRootOrchestrator(): boolean {
+  return isRegisteredRootIdentity({
+    paneId: process.env[HERDR_PANE_ID_ENV],
+    workspaceId: process.env.HERDR_WORKSPACE_ID,
+  });
+}
+
+function currentResolvedIdentityDescription(): string {
+  return `(resolved pane_id=${process.env[HERDR_PANE_ID_ENV] ?? "<unset>"}, workspace_id=${process.env.HERDR_WORKSPACE_ID ?? "<unset>"})`;
 }
 
 type CurrentRootScope = {
@@ -2942,15 +3117,23 @@ async function persistParentMessage(
 async function confirmExecution(
   ctx: ExtensionContext,
   label: string,
+  explicitConfirm = false,
 ): Promise<boolean> {
   if (!isRootOrchestrator())
     throw new Error(
       "Only the verified controller-mapped root may request direct approval.",
     );
-  if (ctx.mode !== "tui" || !ctx.hasUI)
+  if (ctx.mode !== "tui" || !ctx.hasUI) {
+    // A headless MCP/JSON bridge has no native confirm UI to render at all.
+    // The calling harness (Claude, Codex, OpenCode) is contractually required
+    // to have obtained explicit user intent before setting explicitConfirm;
+    // BAA.md's dispatch guidance already states this. Without it, fail closed
+    // exactly as before.
+    if (explicitConfirm) return true;
     throw new Error(
       `${label} requires TUI confirmation from the designated root orchestrator.`,
     );
+  }
   return ctx.ui.confirm(
     "Herdr orchestrator",
     `${label}? Only extension-owned resources will be changed.`,
@@ -2958,6 +3141,41 @@ async function confirmExecution(
 }
 
 export default function herdrOrchestrator(pi: ExtensionAPI) {
+  registerPiIdentityBridge(pi, (ctx) => inspectPiRootIdentity(ctx, ctx.signal));
+
+  async function inspectPiRootIdentity(ctx: ExtensionContext, signal?: AbortSignal) {
+    requireHerdr();
+    await refreshHerdrIdentity(signal);
+    const scope = requireRootManifestExecutor(ctx.cwd);
+    const root = scope.root;
+    const registrations = readControllerConfigForCurrentPane()?.orchestrators.filter(
+      (item) => item.id === scope.rootId || item.root.pane_id === root.pane_id || item.root.workspace_id === root.workspace_id,
+    );
+    if (registrations?.length !== 1)
+      throw new Error("Native Pi root registration is ambiguous; no identity proof issued.");
+    const raw = await runHerdr(["agent", "get", root.pane_id], signal);
+    const live = liveAgentIdentity(raw, "Pi root identity");
+    if (root.agent_kind !== "pi" || live.kind !== "pi" ||
+        live.paneId !== root.pane_id || live.workspaceId !== root.workspace_id ||
+        (root.target_kind === "name" && live.name !== root.target))
+      throw new Error("Registered root differs from the live Pi pane/workspace/harness.");
+    const proof = await resolvePiSessionIdentity({
+      agent: responseRecord(raw, "Pi root identity").agent, runtime: ctx.sessionManager,
+      paneId: root.pane_id, workspaceId: root.workspace_id, cwd: ctx.cwd,
+    });
+    return { ...proof, registrationId: scope.rootId };
+  }
+
+  async function rootSessionMatches(native: unknown, stored: string | undefined, ctx: ExtensionContext, signal?: AbortSignal) {
+    if (!isRecord(native) || !isRecord(native.agent_session)) return false;
+    if (native.agent !== "pi") return native.agent_session.value === stored;
+    const proof = await inspectPiRootIdentity(ctx, signal);
+    // Historical UUID bindings remain immutable and require the same fresh proof.
+    if (stored === proof.sessionId || stored === proof.sessionPath) return true;
+    if (!stored || !isAbsolute(stored) || /[\u0000-\u001f\u007f]/.test(stored)) return false;
+    try { return await realpath(stored) === proof.sessionPath; } catch { return false; }
+  }
+
   async function runHerdrRaw(
     args: string[],
     signal?: AbortSignal,
@@ -2985,11 +3203,16 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   async function refreshHerdrIdentity(
     signal?: AbortSignal,
   ): Promise<{ paneId?: string; workspaceId?: string }> {
+    if (!configuredControllerConfigPath()) await controllerConfigPath(signal);
     const identity =
       currentAppliedHerdrIdentity() ??
       (await resolveHerdrIdentity({
         env: process.env,
         listAgents: () => runHerdr(["agent", "list"], signal),
+        currentCwd: process.cwd(),
+        allowStaticFallback: ({ fallback, agents }) =>
+          isRegisteredRootIdentity(fallback) &&
+          liveClaudeAgentAtIdentity(agents, fallback),
       }));
     applyHerdrIdentity(process.env, identity);
     return identity;
@@ -3208,6 +3431,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ),
       ),
     );
+    // Keep synchronous routing readers aligned with Herdr's live answer. The
+    // inherited value may be a frozen project registration snapshot.
+    process.env[HERDR_PLUGIN_CONFIG_DIR_ENV] = directory;
     return join(directory, CONTROLLER_CONFIG_NAME);
   }
 
@@ -3418,6 +3644,190 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     };
   }
 
+  async function reconcileRootIdentity(
+    cwd: string,
+    signal?: AbortSignal,
+    sessionPath?: string,
+  ): Promise<{ 
+    reconciled: boolean;
+    root: ControllerRootMapping;
+    previousRoot: ControllerRootMapping;
+    configPath: string;
+    manifestPath: string;
+    evidence: string[];
+  }> {
+    requireHerdr();
+    const root = await currentPaneRoot(signal);
+    const rootAgent = responseRecord(
+      await runHerdr(["agent", "get", root.pane_id], signal),
+      "root identity reconciliation",
+    ).agent;
+    const verifiedAgent = liveAgentIdentity(
+      { result: { type: "agent_info", agent: rootAgent } },
+      "root identity reconciliation",
+    );
+    if (isRecord(rootAgent) && sessionPath) piRootSessionPathHints.set(rootAgent, sessionPath);
+    if (
+      verifiedAgent.paneId !== root.pane_id ||
+      verifiedAgent.workspaceId !== root.workspace_id ||
+      verifiedAgent.kind !== root.agent_kind
+    )
+      throw new Error(
+        "Herdr current pane identity changed during root reconciliation; retry from the verified pane.",
+      );
+
+    const configPath = await controllerConfigPath(signal);
+    const resolvedCwd = resolve(cwd);
+    const manifestFile = resolve(manifestPath(cwd));
+    const findRoot = (config: ControllerConfig): ControllerOrchestrator => {
+      const childMatches = config.orchestrators.flatMap((orchestrator) =>
+        orchestrator.workflows.flatMap((workflow) =>
+          workflow.lanes
+            .filter(
+              (lane) =>
+                lane.pane_id === root.pane_id &&
+                lane.workspace_id === root.workspace_id,
+            )
+            .map((lane) => `${orchestrator.id}/${workflow.workflow_id}/${lane.lane_id}`),
+        ),
+      );
+      if (childMatches.length > 0)
+        throw new Error(
+          `Current pane ${root.pane_id} is registered as a child lane (${childMatches.join(", ")}) and cannot reconcile root authority.`,
+        );
+
+      const sameIdentity = config.orchestrators.filter(
+        (candidate) =>
+          candidate.root.pane_id === root.pane_id &&
+          candidate.root.workspace_id === root.workspace_id,
+      );
+      if (sameIdentity.length > 1)
+        throw new Error(
+          `Current pane ${root.pane_id} has ambiguous root mappings for workspace ${root.workspace_id}; reconciliation is refused.`,
+        );
+      const samePane = config.orchestrators.filter(
+        (candidate) => candidate.root.pane_id === root.pane_id,
+      );
+      if (samePane.some((candidate) => candidate.root.workspace_id !== root.workspace_id))
+        throw new Error(
+          `Current pane ${root.pane_id} has root mappings in multiple workspaces; reconciliation is refused.`,
+        );
+      const current = sameIdentity[0];
+      if (!current)
+        throw new Error(
+          `Current verified pane ${root.pane_id} in workspace ${root.workspace_id} is not a registered root; bootstrap it before reconciling.`,
+        );
+      if (!rootOwnsManifest(current, cwd))
+        throw new Error(
+          `Current root ${current.id} is registered for a different project and cannot be reconciled from ${resolvedCwd}.`,
+        );
+      return current;
+    };
+
+    // Keep lock order identical to bootstrapRoot: manifest first, then the
+    // controller config. This prevents a concurrent bootstrap/reconciliation
+    // pair from waiting on each other indefinitely.
+    const releaseManifest = await acquireManifestLock(cwd, 10_000);
+    try {
+      const releaseConfig = await acquireControllerConfigLock(configPath, 10_000);
+      try {
+        const latestConfig = await loadControllerConfig(configPath);
+        if (!latestConfig)
+          throw new Error("Herdr controller config disappeared during reconciliation.");
+        const current = findRoot(latestConfig);
+        const previousRoot = { ...current.root };
+        const nextRoot: ControllerRootMapping = {
+          ...current.root,
+          agent_kind: root.agent_kind,
+        };
+        const identityChanged = !sameControllerRoot(current.root, nextRoot);
+        const nextOrchestrator: ControllerOrchestrator = {
+          ...current,
+          root: nextRoot,
+        };
+        if (identityChanged)
+          await saveControllerConfig(configPath, {
+            ...latestConfig,
+            orchestrators: latestConfig.orchestrators.map((candidate) =>
+              candidate.id === current.id ? nextOrchestrator : candidate,
+            ),
+          });
+
+        const manifest = await loadManifest(cwd);
+        const scope: CurrentRootScope = {
+          rootId: current.id,
+          root: nextRoot,
+          orchestrator: nextOrchestrator,
+        };
+        const currentSession =
+          manifest.rootSessionLogs?.find((entry) => entry.rootId === current.id) ??
+          (legacyRootIdForManifest(cwd) === current.id
+            ? manifest.sessionLog
+            : undefined);
+        const expectedPersistence = rootSessionPersistence(nextRoot, rootAgent);
+        const sessionNeedsRefresh =
+          !currentSession ||
+          currentSession.paneId !== nextRoot.pane_id ||
+          currentSession.workspaceId !== nextRoot.workspace_id ||
+          JSON.stringify(currentSession.sessionRef) !==
+            JSON.stringify(expectedPersistence);
+        let manifestChanged = false;
+        if (sessionNeedsRefresh) {
+          rootSessionEntryFor(
+            manifest,
+            cwd,
+            scope,
+            rootAgent,
+            currentSession?.startedAt ?? manifest.sessionLog?.startedAt ?? now(),
+            now(),
+          );
+          manifestChanged = true;
+        }
+        const refreshRootSnapshot = (value: unknown): void => {
+          if (!isRecord(value) || !isRecord(value.root)) return;
+          if (sameControllerRoot(value.root as ControllerRootMapping, nextRoot))
+            return;
+          value.root = { ...nextRoot };
+          manifestChanged = true;
+        };
+        refreshRootSnapshot(manifest.parentGoals?.[current.id]);
+        refreshRootSnapshot(
+          manifest.rootSessionLogs?.find((entry) => entry.rootId === current.id),
+        );
+        refreshRootSnapshot(
+          manifest.rootQueues?.roots.find((entry) => entry.rootId === current.id),
+        );
+        for (const history of manifest.goalHistoryByRoot?.[current.id] ?? [])
+          refreshRootSnapshot(history);
+        if (manifestChanged) await saveManifest(cwd, manifest);
+
+        const changes: string[] = [];
+        if (identityChanged)
+          changes.push(
+            `agent_kind ${previousRoot.agent_kind ?? "<unset>"} -> ${nextRoot.agent_kind}`,
+          );
+        if (sessionNeedsRefresh)
+          changes.push("durable root session identity refreshed");
+        if (manifestChanged && !sessionNeedsRefresh)
+          changes.push("root-scoped manifest identity snapshots refreshed");
+        return {
+          reconciled: changes.length > 0,
+          root: nextRoot,
+          previousRoot,
+          configPath,
+          manifestPath: manifestFile,
+          evidence: changes.length
+            ? [`Reconciled current verified root ${current.id}: ${changes.join("; ")}.`]
+            : [`Root ${current.id} identity is already current; no state changed.`],
+        };
+      } finally {
+        await releaseConfig();
+      }
+    } finally {
+      await releaseManifest();
+    }
+  }
+
   async function discoverControllerRoot(
     signal?: AbortSignal,
   ): Promise<ControllerRootMapping> {
@@ -3515,6 +3925,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       );
     const current = rootForPaneAndCwd(config);
     const conflictingPaneRoot = rootForPane(config);
+    const existingStateMessage = (
+      candidate: ControllerConfig | undefined,
+    ): string =>
+      rootForWorkspace(candidate)
+        ? "Controller config or parent manifest has existing state, including a root already registered in this pane's workspace. Review it, then call herdr_bootstrap_root with reset=true to retire it before claiming this manually started root."
+        : "Controller config or parent manifest has existing state from a different pane/workspace. This pane's workspace has no existing root, so add=true registers a concurrent root without touching any existing root or manifest state; use reset=true only if you intend to retire every existing root and wipe the shared parent manifest for this cwd.";
     const labelEvidence: string[] = [];
     let rootTabId: string | undefined;
     // Best-effort sync read for display labels only; authoritative manifest
@@ -3648,10 +4064,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       !add &&
       ((config && config.orchestrators.length > 0) || manifestHasLegacyState)
     ) {
-      if (!reset)
-        throw new Error(
-          "Controller config or parent manifest has existing state. Review it, then call herdr_bootstrap_root with reset=true to retire it before claiming this manually started root.",
-        );
+      if (!reset) throw new Error(existingStateMessage(config));
     }
     const label = add
       ? "Add this manually started Baa-ton root"
@@ -3707,9 +4120,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               manifestHasState(latestManifest)) &&
             !reset
           )
-            throw new Error(
-              "Controller config or parent manifest has existing state. Review it, then call herdr_bootstrap_root with reset=true to retire it before claiming this manually started root.",
-            );
+            throw new Error(existingStateMessage(latestConfig));
           const bootstrapStamp = now();
           const rootScope: CurrentRootScope = {
             rootId: next.id,
@@ -4434,6 +4845,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     launchProfileInput?: unknown,
     queueItemId?: string,
     taskProfileInput?: unknown,
+    ctx?: ExtensionContext,
   ): Promise<Workflow> {
     let objective = objectiveInput?.trim() ?? "";
     let linkedQueueItem: QueueItem | undefined;
@@ -4538,7 +4950,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       throw new Error(
         "Task planning requires a verified native root session path or id.",
       );
-    const rootSessionPath = rootAgent.agent_session.value;
+    if (rootAgent.agent === "pi" && !ctx) throw new Error("Native Pi context is required for planning.");
+    const rootSessionPath = rootAgent.agent === "pi"
+      ? (await inspectPiRootIdentity(ctx!)).sessionPath
+      : rootAgent.agent_session.value;
     const launchProfile =
       configuredProfile?.launchProfile ??
       (launchProfileInput === undefined
@@ -4640,6 +5055,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     ctx: ExtensionContext,
     signal?: AbortSignal,
     restart = false,
+    confirm = false,
   ): Promise<{
     workflow: Workflow;
     dryRun?: boolean;
@@ -4733,11 +5149,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             await runHerdr(["agent", "get", root.pane_id], signal),
             "task root",
           ).agent;
-          if (
-            !isRecord(native) ||
-            !isRecord(native.agent_session) ||
-            native.agent_session.value !== w.taskBinding.rootSessionPath
-          )
+          if (!(await rootSessionMatches(native, w.taskBinding.rootSessionPath, ctx, signal)))
             throw new Error(
               "Root incarnation changed; authorized task recovery is required before dispatch.",
             );
@@ -4752,6 +5164,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             (await confirmExecution(
               ctx,
               `Dispatch ${w.id} in task workspace ${w.taskBinding?.workspaceId}`,
+              confirm,
             ))
           );
         },
@@ -4977,7 +5390,19 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       }
       const explicitlyCompleted = workflowHasExplicitSuccess(stored);
       if (observations.length > 0) {
-        stored.status = explicitlyCompleted ? "completed" : observedStatus;
+        const retryableDispatchFailure =
+          !explicitlyCompleted &&
+          stored.retry?.state === "retryable" &&
+          (stored.status === "dispatch-failed" || stored.status === "unknown") &&
+          observedStatus === "unknown";
+        // Herdr's idle/unknown snapshot is telemetry, not a replacement for a
+        // durable dispatch failure. Preserve the retryable state so the
+        // manifest's own retryCommand remains executable after observe().
+        stored.status = explicitlyCompleted
+          ? "completed"
+          : retryableDispatchFailure
+            ? "dispatch-failed"
+            : observedStatus;
         stored.outcome = explicitlyCompleted ? "completed" : "unknown";
       }
       stored.observedAt = now();
@@ -5116,11 +5541,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             await runHerdr(["agent", "get", root.pane_id], signal),
             "task root",
           ).agent;
-          if (
-            !isRecord(native) ||
-            !isRecord(native.agent_session) ||
-            native.agent_session.value !== w.taskBinding.rootSessionPath
-          )
+          if (!(await rootSessionMatches(native, w.taskBinding.rootSessionPath, ctx, signal)))
             throw new Error(
               "Root incarnation changed; authorized task recovery is required before native resume.",
             );
@@ -5656,6 +6077,28 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     };
   }
 
+  // A dry-run/result payload previously embedded the entire workflow record
+  // verbatim. Each lane's full objective text is duplicated across the lane
+  // itself and its mirrored goal record, so a handful of lanes with a normal
+  // multi-hundred-character objective routinely produced tens of thousands
+  // of characters, well past what any caller reading this result needs.
+  // Every other field (laneRetirement, evidence, ownership, status, ...)
+  // stays exactly as-is; callers rely on those.
+  function workflowRetirementSummary(workflow: Workflow): Record<string, unknown> {
+    return {
+      ...workflow,
+      objective: clip(workflow.objective, 200),
+      lanes: workflow.lanes.map((lane) => ({
+        ...lane,
+        objective: clip(lane.objective, 200),
+      })),
+      goals: (workflow.goals ?? []).map((goal) => ({
+        ...goal,
+        objective: clip(goal.objective, 200),
+      })),
+    };
+  }
+
   async function retireTaskLaneTabs(
     cwd: string,
     id: string,
@@ -5721,7 +6164,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         laneRetired: true,
         retired: true,
         alreadyRetired: true,
-        workflow,
+        workflow: workflowRetirementSummary(workflow),
         tabIds: storedRetirement.tabIds,
         closedTabIds: storedRetirement.closedTabIds,
         failedTabIds: [],
@@ -5743,6 +6186,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
 
     const closedBefore = new Set(storedRetirement?.closedTabIds ?? []);
     const pendingTabIds = tabIds.filter((tabId) => !closedBefore.has(tabId));
+    const alreadyGoneTabIds: string[] = [];
     if (pendingTabIds.length > 0) {
       const listed = responseRecord(
         await runHerdr(["tab", "list", "--workspace", taskBinding.workspaceId], signal),
@@ -5757,20 +6201,41 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           (item: unknown): item is Record<string, unknown> =>
             isRecord(item) && item.tab_id === tabId,
         );
-        if (!tab || tab.workspace_id !== taskBinding.workspaceId)
+        if (tab && tab.workspace_id === taskBinding.workspaceId) continue;
+        // Not in this workspace's tab list. A tab can be manually closed
+        // outside herdr_close (e.g. `herdr tab close` run directly with the
+        // user's approval); that is not an error, it already accomplished
+        // the goal. Distinguish that from an ID reused by a tab that now
+        // lives in a different workspace, which is a real collision risk and
+        // must still refuse.
+        let existsElsewhere = false;
+        try {
+          const got = responseRecord(
+            await runHerdr(["tab", "get", tabId], signal),
+            "tab lookup",
+          );
+          existsElsewhere = got.workspace_id !== taskBinding.workspaceId;
+        } catch {
+          existsElsewhere = false; // herdr has no record of this tab anywhere.
+        }
+        if (existsElsewhere)
           throw new Error(
             `Lane tab ${tabId} is not in the root's task workspace ${taskBinding.workspaceId}; refusing cleanup.`,
           );
+        alreadyGoneTabIds.push(tabId);
       }
     }
 
-    const commands = pendingTabIds.map((tabId) => `herdr tab close ${tabId}`);
+    const closeCommandTabIds = pendingTabIds.filter(
+      (tabId) => !alreadyGoneTabIds.includes(tabId),
+    );
+    const commands = closeCommandTabIds.map((tabId) => `herdr tab close ${tabId}`);
     if (!execute)
       return {
         dryRun: true,
         laneRetirement: true,
         retired: false,
-        workflow,
+        workflow: workflowRetirementSummary(workflow),
         tabIds: pendingTabIds,
         commands,
         workspaceRetained: true,
@@ -5815,6 +6280,15 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         requestedAt: timestamp,
         evidence: [],
       };
+      for (const tabId of alreadyGoneTabIds) {
+        if (record.closedTabIds.includes(tabId)) continue;
+        record.closedTabIds.push(tabId);
+        stored.evidence.push({
+          at: timestamp,
+          kind: "lane-retirement-tab-already-closed",
+          text: `Lane tab ${tabId} was already closed outside herdr_close (no matching Herdr tab); accepted as closed without attempting to close it again.`,
+        });
+      }
       record.pendingTabIds = record.tabIds.filter(
         (tabId) => !record.closedTabIds.includes(tabId),
       );
@@ -5974,7 +6448,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       retired: finalRetirement.status === "retired",
       routesRetired,
       partialFailure: closeErrors.length > 0,
-      workflow: currentWorkflow,
+      workflow: workflowRetirementSummary(currentWorkflow),
       tabIds: finalRetirement.tabIds,
       closedTabIds: finalRetirement.closedTabIds,
       failedTabIds: finalRetirement.failedTabIds,
@@ -6386,19 +6860,30 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     execute: boolean,
     ctx: ExtensionContext,
     signal?: AbortSignal,
+    confirm = false,
   ) {
     const scoped = await cleanupSweepInventory(cwd, signal);
     const { inventory } = scoped;
     if (!execute)
       return { dryRun: true, ...inventory };
-    if (ctx.mode !== "tui" || !ctx.hasUI)
-      throw new Error(
-        "Cleanup sweep execution requires native TUI confirmation from the verified root orchestrator. Headless MCP/Codex callers cannot provide that confirmation; present the dry-run inventory to the user and ask for explicit approval, then retry from a TUI-capable root or perform only the exact approved cleanup manually.",
+    let approved: boolean;
+    if (ctx.mode !== "tui" || !ctx.hasUI) {
+      // A headless MCP/Codex caller has no native dialog to render, exactly
+      // like herdr_dispatch. The calling harness is contractually required
+      // to have shown the dry-run inventory and gotten explicit user
+      // approval before setting confirm=true; BAA.md's dispatch guidance
+      // already states this. Without it, fail closed exactly as before.
+      if (!confirm)
+        throw new Error(
+          "Cleanup sweep execution requires either native TUI confirmation or confirm=true after the user has explicitly approved this exact dry-run inventory in this conversation.",
+        );
+      approved = true;
+    } else {
+      approved = await ctx.ui.confirm(
+        "Herdr cleanup sweep",
+        `${cleanupSweepSummary(inventory)}\n\nProceed?`,
       );
-    const approved = await ctx.ui.confirm(
-      "Herdr cleanup sweep",
-      `${cleanupSweepSummary(inventory)}\n\nProceed? This confirmation is always required; no authorization policy can bypass it.`,
-    );
+    }
     if (!approved) return { cancelled: true, ...inventory };
 
     const errors: Array<{ workflowId?: string; resource: string; error: string }> = [];
@@ -6603,7 +7088,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     if (!execute)
       return {
         dryRun: true,
-        workflow,
+        workflow: workflowRetirementSummary(workflow),
         commands:
           workflow.ownership.workspaceId && !sharedWorkspace
             ? [`herdr workspace close ${workflow.ownership.workspaceId}`]
@@ -6765,7 +7250,84 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       );
       return {
         status: "ok",
-        detail: `${controllerConfig.orchestrators.length} registered orchestrator(s), ${workflowCount} routed workflow(s). This pane is${isRootOrchestrator() ? "" : " not"} a registered root.`,
+        detail: `${controllerConfig.orchestrators.length} registered orchestrator(s), ${workflowCount} routed workflow(s). This pane is${isRootOrchestrator() ? "" : " not"} a registered root ${currentResolvedIdentityDescription()}.`,
+      };
+    });
+
+    await check("root-identity", async () => {
+      if (!controllerConfig)
+        return {
+          status: "warn",
+          detail: "No controller config is available; no registered root identity can be checked.",
+        };
+      const findings: string[] = [];
+      const warnings: string[] = [];
+      const currentPaneId = process.env.HERDR_PANE_ID;
+      const currentWorkspaceId = process.env.HERDR_WORKSPACE_ID;
+      const isCurrentRoot = (root: ControllerRootMapping) =>
+        root.pane_id === currentPaneId && root.workspace_id === currentWorkspaceId;
+      const recordFinding = (root: ControllerRootMapping, detail: string) => {
+        (isCurrentRoot(root) ? findings : warnings).push(detail);
+      };
+      const seen = new Set<string>();
+      for (const orchestrator of controllerConfig.orchestrators) {
+        const root = orchestrator.root;
+        const identityKey = `${root.workspace_id}:${root.pane_id}`;
+        if (seen.has(identityKey)) {
+          recordFinding(
+            root,
+            `${orchestrator.id} duplicates root identity ${identityKey}`,
+          );
+          continue;
+        }
+        seen.add(identityKey);
+        try {
+          const live = liveAgentIdentity(
+            await runHerdr(["agent", "get", root.pane_id], signal),
+            `registered root ${orchestrator.id}`,
+          );
+          const mismatches: string[] = [];
+          if (live.paneId !== root.pane_id)
+            mismatches.push(`pane_id stored=${root.pane_id} live=${live.paneId}`);
+          if (live.workspaceId !== root.workspace_id)
+            mismatches.push(
+              `workspace_id stored=${root.workspace_id} live=${live.workspaceId}`,
+            );
+          if (!root.agent_kind)
+            mismatches.push(`agent_kind stored=<unset> live=${live.kind}`);
+          else if (live.kind !== root.agent_kind)
+            mismatches.push(
+              `agent_kind stored=${root.agent_kind} live=${live.kind}`,
+            );
+          if (root.target_kind === "name" && live.name !== root.target)
+            mismatches.push(
+              `target stored=${root.target} live=${live.name ?? "<unnamed>"}`,
+            );
+          if (mismatches.length > 0)
+            recordFinding(root, `${orchestrator.id}: ${mismatches.join(", ")}`);
+          else if (live.kind === "pi" && isCurrentRoot(root) && ctx.sessionManager?.getSessionId) {
+            await inspectPiRootIdentity(ctx, signal);
+          }
+        } catch (error) {
+          recordFinding(
+            root,
+            `${orchestrator.id} (${root.workspace_id}:${root.pane_id}): ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      if (findings.length > 0)
+        return {
+          status: "fail",
+          detail: `Current root identity drift blocks safe root operations: ${findings.join("; ")} Inspect the named root and live metadata. Use herdr_reconcile_root only for proven registration drift; session proof failures require native identity repair, not a reset.${warnings.length ? ` Other roots need separate attention: ${warnings.join("; ")}` : ""}`,
+        };
+      if (warnings.length > 0)
+        return {
+          status: "warn",
+          detail: `Current root identity matches. Other registered roots need separate attention: ${warnings.join("; ")}`,
+        };
+      return {
+        status: "ok",
+        detail: `Checked ${controllerConfig.orchestrators.length} registered root identity${controllerConfig.orchestrators.length === 1 ? "" : "ies"}; all live panes and harness identities match.`,
       };
     });
 
@@ -7295,6 +7857,44 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     },
   });
   pi.registerTool({
+    name: "herdr_root_identity",
+    label: "Inspect Native Pi Root Identity",
+    description: "Read-only proof of the current registered Pi root: native pane/workspace, runtime session UUID, session header and canonical path. Does not register, reconcile, plan or dispatch.",
+    parameters: Type.Object({}, { additionalProperties: false }),
+    async execute(_id, _params, signal, _update, ctx) {
+      const proof = await inspectPiRootIdentity(ctx, signal);
+      return { content: [{ type: "text", text: jsonText(proof) }], details: proof };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_reconcile_root",
+    label: "Reconcile Herdr Root",
+    description:
+      "Safely reconcile the current verified root pane's live harness identity in place without resetting or replacing any controller state.",
+    promptSnippet:
+      "Repair a stale root harness identity from the affected live Herdr pane.",
+    promptGuidelines: [
+      "Use herdr_reconcile_root only from the affected live root pane after herdr_doctor reports root identity drift. It updates that exact pane/workspace mapping and durable root session snapshots only; it never resets a root, changes workflows, or repairs a different pane.",
+    ],
+    parameters: Type.Object({}, { additionalProperties: false }),
+    async execute(_id, _params, signal, _update, ctx) {
+      const result = await reconcileRootIdentity(
+        ctx.cwd,
+        signal,
+        ctx.sessionManager?.getSessionFile?.(),
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: result.evidence.join(" "),
+          },
+        ],
+        details: result,
+      };
+    },
+  });
+  pi.registerTool({
     name: "herdr_goal",
     label: "Herdr Goal",
     description:
@@ -7653,6 +8253,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                   taskProfile: Type.Optional(Type.String({ minLength: 1 })),
                   dependencies: Type.Optional(Type.Array(Type.String())),
                   dependsOn: Type.Optional(Type.Array(Type.String())),
+                  mcpServers: Type.Optional(Type.Record(Type.String(), Type.Any())),
                   launchProfile: Type.Optional(
                     Type.Object(
                       {
@@ -7724,6 +8325,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         params.launchProfile,
         params.queueItemId,
         params.taskProfile,
+        ctx,
       );
       return {
         content: [
@@ -7744,12 +8346,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     promptSnippet:
       "Dispatch only a planned Herdr workflow; dry-run by default.",
     promptGuidelines: [
-      "Use herdr_dispatch with execute=true only after explicit user intent. A root bypasses UI only when the workflow's validated local authorizationPolicy grants dispatch or retry; children remain UI-free and return parentApprovalRequired.",
+      "Use herdr_dispatch with execute=true only after explicit user intent. A root bypasses UI only when the workflow's validated local authorizationPolicy grants dispatch or retry; children remain UI-free and return parentApprovalRequired. On a headless bridge with no native confirm UI, pass confirm=true only after the user has explicitly said to proceed in this exact conversation; never set it speculatively.",
     ],
     parameters: Type.Object({
       workflowId: Type.String(),
       execute: Type.Optional(Type.Boolean()),
       restart: Type.Optional(Type.Boolean()),
+      confirm: Type.Optional(Type.Boolean()),
     }),
     async execute(_id, params, signal, _update, ctx) {
       const result = await dispatch(
@@ -7759,6 +8362,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ctx,
         signal,
         params.restart ?? false,
+        params.confirm ?? false,
       );
       return {
         content: [
@@ -7897,15 +8501,18 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     name: "herdr_sweep",
     label: "Herdr Cleanup Sweep",
     description:
-      "Root-only cleanup sweep for recorded terminal lane tabs and unopened orphaned Git worktrees; dry-run by default and always requires native confirmation before mutation.",
+      "Root-only cleanup sweep for recorded terminal lane tabs and unopened orphaned Git worktrees; dry-run by default. execute=true confirms via native TUI when available, or via confirm=true after explicit chat approval on a headless root.",
     promptSnippet:
-      "Enumerate and, after mandatory native confirmation, clean terminal lane tabs and unopened worktrees for this root.",
+      "Enumerate and, after confirmation, clean terminal lane tabs and unopened worktrees for this root.",
     promptGuidelines: [
-      "Use herdr_sweep from the verified controller-mapped root. It is dry-run by default; execute=true always presents ctx.ui.confirm with the concrete bounded list, regardless of authorizationPolicy. Never use it to clean another root's resources.",
-      "A headless MCP/Codex caller cannot satisfy the native confirmation. If execute=true reports that confirmation is unavailable, do not retry blindly or claim cleanup completed: show the dry-run inventory in the parent response, ask the user directly for approval, and continue only through a TUI-capable root or the exact approved manual cleanup path.",
+      "Use herdr_sweep from the verified controller-mapped root. It is dry-run by default; execute=true presents ctx.ui.confirm with the concrete bounded list on a TUI-capable root, regardless of authorizationPolicy. Never use it to clean another root's resources.",
+      "A headless MCP/Codex caller cannot render the native dialog. Pass confirm=true only after showing the exact dry-run inventory in the parent response and getting the user's explicit approval in this exact conversation; never set it speculatively or reuse an earlier approval for a different inventory.",
     ],
     parameters: Type.Object(
-      { execute: Type.Optional(Type.Boolean()) },
+      {
+        execute: Type.Optional(Type.Boolean()),
+        confirm: Type.Optional(Type.Boolean()),
+      },
       { additionalProperties: false },
     ),
     async execute(_id, params, signal, _update, ctx) {
@@ -7914,6 +8521,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         params.execute ?? false,
         ctx,
         signal,
+        params.confirm ?? false,
       );
       const details = result as {
         dryRun?: boolean;
@@ -7970,7 +8578,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     description: "Create a Herdr workflow plan: /herdr-plan <objective>",
     handler: async (args, ctx) => {
       if (!args.trim()) throw new Error("Usage: /herdr-plan <objective>");
-      const workflow = await plan(ctx.cwd, args.trim(), []);
+      const workflow = await plan(ctx.cwd, args.trim(), [], undefined, undefined, undefined, undefined, undefined, undefined, ctx);
       ctx.ui.notify(`Planned ${workflow.id}`, "info");
     },
   });

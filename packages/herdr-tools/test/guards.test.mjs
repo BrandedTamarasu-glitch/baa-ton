@@ -11,7 +11,10 @@ const { blocksUnmanagedAgentCommand, isReadOnlyPiDiagnostic } =
 const { default: extension } = await jiti.import("../index.ts");
 
 test("Git shell guard distinguishes merge-base and requires root approval for fast-forward", async () => {
-  const saved = Object.fromEntries(["HERDR_ENV", "HERDR_PANE_ID", "HERDR_WORKSPACE_ID"].map(k => [k, process.env[k]]));
+  const dir = await mkdtemp(join(tmpdir(), "baa-git-guard-"));
+  const saved = Object.fromEntries(["HERDR_ENV", "HERDR_PANE_ID", "HERDR_WORKSPACE_ID", "HERDR_PLUGIN_CONFIG_DIR"].map(k => [k, process.env[k]]));
+  process.env.HERDR_PLUGIN_CONFIG_DIR = dir;
+  await writeFile(join(dir, "config.json"), JSON.stringify({ version: 2, owner: "herdr-orchestrator", orchestrators: [] }), { mode: 0o600 });
   const handlers = new Map();
   extension({ on: (event, handler) => handlers.set(event, handler), registerTool() {}, registerCommand() {} });
   process.env.HERDR_ENV = "1";
@@ -33,6 +36,7 @@ test("Git shell guard distinguishes merge-base and requires root approval for fa
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
@@ -84,7 +88,7 @@ test("child question routing failures are visible and never masquerade as an app
   const store = join(
     dir,
     "parent",
-    ".pi",
+    ".baa-ton",
     "herdr-orchestrator",
     "manifest.json",
   );
@@ -186,7 +190,7 @@ test("child question routing failures are visible and never masquerade as an app
     assert.equal(missing.block, true);
     assert.notEqual(missing.terminate, true);
     assert.match(missing.reason, /routing failed.*Unknown Herdr workflow/);
-    await mkdir(join(dir, "parent", ".pi", "herdr-orchestrator"), {
+    await mkdir(join(dir, "parent", ".baa-ton", "herdr-orchestrator"), {
       recursive: true,
     });
     await writeFile(
@@ -219,7 +223,7 @@ test("child question routing failures are visible and never masquerade as an app
     );
     await assert.rejects(
       readFile(
-        join(dir, "different-checkout", ".pi/herdr-orchestrator/manifest.json"),
+        join(dir, "different-checkout", ".baa-ton/herdr-orchestrator/manifest.json"),
       ),
       { code: "ENOENT" },
     );

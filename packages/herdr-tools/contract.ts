@@ -325,6 +325,9 @@ export type LaneInput =
       agentKind?: AgentKind;
       taskProfile?: string;
       launchProfile?: unknown;
+      /** Extra MCP servers (raw --mcp-config entries) this lane needs beyond
+       * herdr-orchestrator. Only an authorized root may grant these. */
+      mcpServers?: Record<string, unknown>;
       dependencies?: string[];
       dependsOn?: string[];
     };
@@ -373,6 +376,9 @@ export type Lane = {
   taskProfile?: string;
   launchProfile?: LaunchProfile;
   launchProfileVersion?: LaunchProfileVersion;
+  /** Extra MCP servers (raw --mcp-config entries) this lane needs beyond
+   * herdr-orchestrator. Only an authorized root may grant these. */
+  mcpServers?: Record<string, unknown>;
   incarnationId?: string;
   incarnationRevision?: number;
   incarnationStartedAt?: string;
