@@ -25,7 +25,8 @@ export async function approveFastForward(command, context, ports) {
     if (await realpath(inputPath) !== checkout) throw new Error("Checkout path changed during approval.");
     const top = await realpath(await git("rev-parse", "--show-toplevel"));
     if (top !== checkout) throw new Error("Use the checkout root as the integration target.");
-    const branch = await git("symbolic-ref", "--quiet", "HEAD");
+    const branchName = await git("branch", "--show-current");
+    const branch = branchName ? `refs/heads/${branchName}` : "(detached HEAD)";
     const head = await git("rev-parse", "HEAD");
     const target = await git("rev-parse", "--verify", `${request.commit}^{commit}`);
     if (target !== request.commit) throw new Error("Target must be the exact commit object ID.");

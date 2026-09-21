@@ -41,11 +41,12 @@ test("approval is root-only, exact, fresh, clean and non-mutating", async () => 
     const target = await run("rev-parse", "HEAD");
     await run("checkout", "main");
     const command = `git -C '${dir}' merge --ff-only ${target}`;
+    let expectedBranch = "refs/heads/main";
     let owner = "root-one", prompts = 0, response = true;
     let onConfirm = async () => {};
     const ctx = { cwd: dir, mode: "tui", hasUI: true, ui: { async confirm(title, body) {
       prompts++; assert.match(title, /fast-forward/);
-      for (const value of [dir, base, target, "refs/heads/main", command]) assert.ok(body.includes(value));
+      for (const value of [dir, base, target, expectedBranch, command]) assert.ok(body.includes(value));
       await onConfirm(); return response;
     } } };
     const ports = { git, rootIdentity: () => owner };
@@ -66,6 +67,22 @@ test("approval is root-only, exact, fresh, clean and non-mutating", async () => 
     await assert.rejects(check, /Checkout changed/);
     await run("checkout", "main");
     onConfirm = async () => {};
+    await run("checkout", "--detach", base);
+    expectedBranch = "(detached HEAD)";
+    assert.equal(await check(), true, "clean detached review can request approval");
+    assert.equal(await run("rev-parse", "HEAD"), base, "approval does not advance detached HEAD");
+    response = false; assert.equal(await check(), false); response = true;
+    onConfirm = async () => { await run("checkout", "main"); };
+    await assert.rejects(check, /Checkout changed/, "reattachment at the same commit invalidates approval");
+    expectedBranch = "refs/heads/main";
+    onConfirm = async () => {};
+    const failedGit = { ...ports, git: async (args) => {
+      if (args.includes("--show-current")) throw new Error("branch lookup failed");
+      return git(args);
+    } };
+    const promptsBeforeFailure = prompts;
+    await assert.rejects(() => approveFastForward(command, ctx, failedGit), /branch lookup failed/);
+    assert.equal(prompts, promptsBeforeFailure, "Git errors are not treated as detached HEAD");
     await writeFile(join(dir, "other.txt"), "diverged\n");
     await run("add", "other.txt"); await run("commit", "-m", "divergence");
     const before = prompts; await assert.rejects(check); assert.equal(prompts, before, "non-fast-forward rejected before approval");
