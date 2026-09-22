@@ -384,6 +384,10 @@ export async function dispatchTask(
         throw new Error("Blocked startup identity/profile/session proof mismatch; no recovery performed.");
     }
   }
+  // A retryable status alone must not bypass the existing-child proof above.
+  // Other unknown retryable failures retain upstream's normal recovery path.
+  const retryableFailure = workflow.retry?.state === "retryable" &&
+    !(workflow.retry?.failedStage === "agent-start" && workflow.lanes.some(lane => lane.agentStartAttemptedAt));
   if (
     ![
       "planned",
@@ -391,7 +395,8 @@ export async function dispatchTask(
       "starting",
       ...(recoverObservedStartup ? [workflow.status] : []),
       ...(restart ? ["running"] : []),
-    ].includes(workflow.status)
+    ].includes(workflow.status) &&
+    !(workflow.status === "unknown" && retryableFailure)
   )
     throw new Error(`Workflow cannot be dispatched from ${workflow.status}.`);
   if (!(await port.authorize(workflow))) return { cancelled: true, workflow };
@@ -774,6 +779,7 @@ export async function dispatchTask(
                   "--",
                   ...adapters[i].launchArguments(profile, port.source, {
                     startupIntentPath: lane.startupIntentPath!,
+                    extraMcpServers: lane.mcpServers,
                   }),
                 ],
                 signal,
@@ -842,21 +848,26 @@ export async function dispatchTask(
           "Startup attestation incomplete or unavailable; no work assigned. Verify the harness handshake and MCP bridge serve the protocol tools.",
         );
       const proof = adapters[i].verifyStartup(agent, hello);
-      if (
-        agent?.pane_id !== lane.paneId ||
-        agent?.workspace_id !== workspaceId ||
-        agent?.agent !== lane.agentKind ||
-        proof.paneId !== lane.paneId ||
-        proof.workspaceId !== workspaceId ||
-        proof.nonce !== lane.startupNonce ||
-        proof.source !== port.source ||
-        JSON.stringify(proof.profile) !== JSON.stringify(profile) ||
+      const startupMismatches = [
+        agent?.pane_id !== lane.paneId ? "native pane" : undefined,
+        agent?.workspace_id !== workspaceId ? "native workspace" : undefined,
+        agent?.agent !== lane.agentKind ? "native harness" : undefined,
+        proof.paneId !== lane.paneId ? "proof pane" : undefined,
+        proof.workspaceId !== workspaceId ? "proof workspace" : undefined,
+        proof.nonce !== lane.startupNonce ? "startup nonce" : undefined,
+        proof.source !== port.source ? "adapter source" : undefined,
+        JSON.stringify(proof.profile) !== JSON.stringify(profile)
+          ? "launch profile"
+          : undefined,
         !STARTUP_PROOF_REQUIRED_OPERATIONS.every((operation) =>
           proof.operations?.includes(operation),
         )
-      )
+          ? "protocol operations"
+          : undefined,
+      ].filter((value): value is string => value !== undefined);
+      if (startupMismatches.length > 0)
         throw new Error(
-          "Startup workspace/native-session/profile/tools mismatch; no work assigned.",
+          `Startup workspace/native-session/profile/tools mismatch (${startupMismatches.join(", ")}); no work assigned.`,
         );
       if (
         lane.nativeSession &&
@@ -1329,7 +1340,7 @@ export async function resumeTask(
           profile,
           info.session,
           port.source,
-          { startupIntentPath: lane.startupIntentPath },
+          { startupIntentPath: lane.startupIntentPath, extraMcpServers: lane.mcpServers },
         );
         await port.run(
           [

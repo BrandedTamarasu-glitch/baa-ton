@@ -8,8 +8,12 @@ import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const jiti = require("jiti")(import.meta.url);
-const { claudeLaunchAdapter, CLAUDE_PERMISSION_PROMPT_TOOL, CLAUDE_PROVIDER } =
-  await jiti.import("../claude-launch-adapter.ts");
+const {
+  claudeBinaryAvailable,
+  claudeLaunchAdapter,
+  CLAUDE_PERMISSION_PROMPT_TOOL,
+  CLAUDE_PROVIDER,
+} = await jiti.import("../claude-launch-adapter.ts");
 const { mergeAttestation } = await import("../attest-merge.mjs");
 const here = dirname(fileURLToPath(import.meta.url));
 const helperPath = join(here, "..", "claude-startup-attest.mjs");
@@ -19,6 +23,41 @@ const profile = {
   thinking: "high",
   auth: "subscription",
 };
+
+test("Claude binary detection honors Windows executable extensions and PATHEXT", () => {
+  const checked = [];
+  assert.equal(
+    claudeBinaryAvailable({
+      platform: "win32",
+      pathValue: "C:\\Users\\zchri\\.local\\bin",
+      pathExt: ".COM;.EXE;.BAT;.CMD",
+      fileExists: (path) => {
+        checked.push(path);
+        return path.endsWith("claude.exe");
+      },
+    }),
+    true,
+  );
+  assert.ok(checked.some((path) => path.endsWith("claude.exe")));
+
+  assert.equal(
+    claudeBinaryAvailable({
+      platform: "win32",
+      pathValue: "/tmp/baa-claude-bin",
+      pathExt: ".EXE;.CMD",
+      fileExists: (path) => path.endsWith("claude.cmd"),
+    }),
+    true,
+  );
+  assert.equal(
+    claudeBinaryAvailable({
+      platform: "linux",
+      pathValue: "/tmp/baa-claude-bin",
+      fileExists: (path) => path.endsWith("claude.exe"),
+    }),
+    false,
+  );
+});
 
 test("launchArguments emits exact model/effort and generated settings/mcp config", async () => {
   const scratch = await mkdtemp(join(tmpdir(), "baa-claude-adapter-"));
@@ -33,7 +72,19 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
     assert.equal(adapter.capabilities.supportsLiveCapabilityDiscovery, false);
     assert.equal(adapter.capabilities.supportsStartupHandshake, false);
     assert.equal(adapter.discoverCatalog, undefined);
-    const args = adapter.launchArguments(profile);
+    assert.equal(
+      adapter.attestationComplete({
+        sessionId: "abc",
+        operations: ["plan", "dispatch", "complete"],
+      }),
+      true,
+    );
+    assert.equal(
+      adapter.attestationComplete({ sessionId: "abc", operations: ["plan"] }),
+      false,
+    );
+    const context = { startupIntentPath: "/intents/lane.json" };
+    const args = adapter.launchArguments(profile, "/source/index.ts", context);
     assert.equal(args[args.indexOf("--model") + 1], "claude-sonnet-5");
     assert.equal(args[args.indexOf("--effort") + 1], "high");
     const settings = JSON.parse(
@@ -49,6 +100,19 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
     assert.ok(
       settings.permissions.deny.some((rule) => /^Bash\(git push/.test(rule)),
     );
+    // Without these, a dispatched lane cannot fulfil its own contract
+    // unattended -- every herdr_message/herdr_complete call would prompt
+    // for permission with nobody present to answer it.
+    assert.ok(
+      settings.permissions.allow.includes(
+        "mcp__herdr-orchestrator__herdr_message",
+      ),
+    );
+    assert.ok(
+      settings.permissions.allow.includes(
+        "mcp__herdr-orchestrator__herdr_complete",
+      ),
+    );
     assert.ok(
       settings.permissions.deny.some((rule) => /^Bash\(git merge/.test(rule)),
     );
@@ -56,6 +120,10 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
       mcp.mcpServers["herdr-orchestrator"].args[0],
       "/bridge/mcp-server.mjs",
     );
+    assert.deepEqual(mcp.mcpServers["herdr-orchestrator"].env, {
+      BAA_STARTUP_INTENT: "/intents/lane.json",
+      HERDR_ENV: "1",
+    });
     assert.equal(args.includes("--permission-prompt-tool"), false);
     const resumed = adapter.resumeArguments(
       profile,
@@ -65,6 +133,7 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
         nativeHandle: { kind: "id", value: "claude-session-123" },
       },
       "/source/index.ts",
+      context,
     );
     assert.deepEqual(
       resumed.slice(0, 2),
@@ -72,6 +141,43 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
     );
     assert.equal(resumed[resumed.indexOf("--model") + 1], profile.model);
     assert.equal(resumed[resumed.indexOf("--effort") + 1], profile.thinking);
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("extraMcpServers merge into mcp-config and grant matching tool permission, without overriding herdr-orchestrator", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "baa-claude-extra-mcp-"));
+  try {
+    const adapter = claudeLaunchAdapter({
+      bridge: "/bridge/mcp-server.mjs",
+      attestHelper: "/bridge/claude-startup-attest.mjs",
+      scratchDirectory: scratch,
+    });
+    const args = adapter.launchArguments(profile, "/source/index.ts", {
+      startupIntentPath: "/intents/lane.json",
+      extraMcpServers: {
+        "cic-connect": { type: "http", url: "https://example.test/mcp" },
+        // A lane-declared entry can never displace the fixed bridge, no
+        // matter what the caller names it.
+        "herdr-orchestrator": { command: "malicious", args: [] },
+      },
+    });
+    const mcp = JSON.parse(
+      await readFile(args[args.indexOf("--mcp-config") + 1], "utf8"),
+    );
+    assert.deepEqual(mcp.mcpServers["cic-connect"], {
+      type: "http",
+      url: "https://example.test/mcp",
+    });
+    assert.equal(
+      mcp.mcpServers["herdr-orchestrator"].args[0],
+      "/bridge/mcp-server.mjs",
+    );
+    const settings = JSON.parse(
+      await readFile(args[args.indexOf("--settings") + 1], "utf8"),
+    );
+    assert.ok(settings.permissions.allow.includes("mcp__cic-connect__*"));
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
@@ -86,7 +192,9 @@ test("permission broker launch flag is opt-in and preserves the exact tool name"
       scratchDirectory: scratch,
       permissionPromptTool: CLAUDE_PERMISSION_PROMPT_TOOL,
     });
-    const args = adapter.launchArguments(profile);
+    const args = adapter.launchArguments(profile, "/source/index.ts", {
+      startupIntentPath: "/intents/lane.json",
+    });
     const flag = args.indexOf("--permission-prompt-tool");
     assert.equal(
       args.slice(flag, flag + 2).join(" "),
@@ -106,7 +214,9 @@ test("permission broker can be enabled by an explicit default-off environment op
       attestHelper: "/a.js",
       scratchDirectory: "/tmp",
     });
-    const args = adapter.launchArguments(profile);
+    const args = adapter.launchArguments(profile, "/source/index.ts", {
+      startupIntentPath: "/intents/lane.json",
+    });
     assert.deepEqual(
       args.slice(
         args.indexOf("--permission-prompt-tool"),
@@ -128,7 +238,13 @@ test("permission broker rejects an empty opt-in value", () => {
     scratchDirectory: "/tmp",
     permissionPromptTool: " ",
   });
-  assert.throws(() => adapter.launchArguments(profile), /non-empty string/);
+  assert.throws(
+    () =>
+      adapter.launchArguments(profile, "/source/index.ts", {
+        startupIntentPath: "/intents/lane.json",
+      }),
+    /non-empty string/,
+  );
 });
 
 test("preflight rejects foreign providers", () => {
@@ -194,7 +310,8 @@ test("SessionStart helper merges lane identity and preserves bridge operations",
       }),
       { mode: 0o600 },
     );
-    // Bridge writes its operations first; the hook must preserve them.
+    // A lazy bridge may have written only a partial set; the hook must seed
+    // the stable contract while preserving the identity merge.
     await mergeAttestation(intentPath, { operations: ["plan", "complete"] });
     const { spawn } = require("node:child_process");
     await new Promise((resolve, reject) => {
@@ -223,7 +340,7 @@ test("SessionStart helper merges lane identity and preserves bridge operations",
     assert.equal(ready.nonce, "nonce-1");
     assert.equal(ready.source, "/source/index.ts");
     assert.deepEqual(ready.profile, profile);
-    assert.deepEqual(ready.operations, ["plan", "complete"]);
+    assert.deepEqual(ready.operations, ["plan", "dispatch", "complete"]);
     // Wrong pane binding must fail closed.
     await assert.rejects(
       new Promise((_, reject) => {

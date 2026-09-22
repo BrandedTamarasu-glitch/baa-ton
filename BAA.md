@@ -124,8 +124,11 @@ isolation or clarity.
   user explicitly asks.
 - Do not use `--trust-repository` as a retry; it grants Git trust.
 - For cross-machine work, run the agent on the machine that owns the checkout/session.
-- `herdr_sweep` is dry-run by default. Execute cleanup only through its required
-  native confirmation; a headless chat approval does not bypass that guard.
+- `herdr_sweep` is dry-run by default. Execute cleanup through native confirmation
+  when available, or `confirm=true` on a headless root after showing the user the
+  exact dry-run inventory and getting explicit approval in this conversation —
+  the same bar `herdr_dispatch` already uses. Never set `confirm=true` speculatively
+  or reuse an earlier approval for a different inventory.
 
 ## Anti-patterns
 

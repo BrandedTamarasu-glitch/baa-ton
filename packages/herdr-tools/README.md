@@ -6,6 +6,7 @@ Harness-neutral local workflow operations for Herdr. The local MCP bridge expose
 
 | Tool | Purpose |
 | --- | --- |
+| `herdr_reconcile_root` | Repair the current root pane's stale live harness identity without resetting controller state. |
 | `herdr_goal` | Manage the root-only durable parent goal. |
 | `herdr_reparent` | Preview or root-confirm a controller-root handoff. |
 | `herdr_plan` | Create a durable workflow and its lanes. |
@@ -36,6 +37,41 @@ previously unstarted lanes may start normally after qualification.
 This path performs no approval keystrokes and does not infer permission from
 elapsed time. `herdr_resume` remains native-session reattachment for done/gone
 lanes, not recovery of a live agent awaiting startup approval.
+
+### Native Pi session identity
+
+`herdr_root_identity` is a read-only inspection of the current registered Pi root.
+It checks native pane/workspace/harness and registration, then correlates Herdr's
+`agent_session` (`kind: "id"` or `"path"`) with Pi's live session manager and the
+JSONL session header. Its result includes `version: 1`,
+`source: "baa-ton-native-pi"`, `registrationId`, `paneId`, `workspaceId`,
+`checkout`, `sessionId`, `sessionPath` (canonical), and `nativeSession`.
+An absent `PI_SESSION_FILE` is allowed; a conflicting one is rejected. UUIDs are
+never inferred from filenames. Missing files, mismatching headers, another
+checkout, or stale native identity fail closed.
+
+Trusted Pi extensions can request the same fresh proof by synchronously emitting
+`baa-ton:pi-root-identity:v1` on `pi.events` with `{ respond(promise) { ... } }`.
+The native handler calls `respond` synchronously with a promise for the result;
+consumers must require exactly one responder, handle rejection/timeouts, and
+compare the result with their own current runtime/native observation. A request
+does not supply a runtime context or identity. Baa-ton captures context from Pi
+lifecycle events and inspects Herdr on every request. Missing lifecycle context
+or shutdown prevents proof. This is a trusted in-process extension interface,
+not a signed credential or an authorization grant. It does not modify Herdr's
+separately distributed CLI or `agent get` wire response.
+
+New Pi plans bind the canonical session path. Dispatch/resume check the same
+proof; historical UUID bindings are accepted only for the exact live runtime
+UUID and are not rewritten. Doctor checks this proof for the current Pi root;
+other registered roots still receive their existing native identity checks.
+Unrelated stale roots remain warnings, as in the upstream doctor fix. Upstream
+reconciliation's persisted `sessionRef.metadata.sessionPath` hint is preserved;
+the bridge does not treat a saved hint as fresh ownership proof.
+Doctor's root drift findings identify the affected root; a session proof failure
+is not an instruction to reset registration. This interface addresses
+[Baa-ton #9](https://github.com/zachristmas/baa-ton/issues/9) and the downstream
+[Forge Windows report](https://github.com/BrandedTamarasu-glitch/baa-ton-forge/issues/5).
 
 ## Messaging the parent
 
@@ -117,7 +153,8 @@ The bridge exposes tools only when `HERDR_ENV=1` is present. It has no platform-
 
 ## Any harness as root
 
-The bridge preserves root-role parity for `herdr_bootstrap_root`, `herdr_goal`,
+The bridge preserves root-role parity for `herdr_bootstrap_root`,
+`herdr_reconcile_root`, `herdr_goal`,
 `herdr_plan`, `herdr_dispatch`, `herdr_observe`, `herdr_resume`,
 `herdr_close`, `herdr_operator_close`, `herdr_reparent`,
 `herdr_question_answer`, and `herdr_doctor`. A non-Pi root receives a concise
@@ -157,6 +194,12 @@ parent goal, workflow/lanes, and wake/approval state. The controller keeps all
 orchestrator records in one config but routes lifecycle events and wakes by the
 registered pane/workspace mapping, so Pi, Claude Code, and other harness roots
 can run side by side without sharing parent state.
+
+If a pane's harness changes in place, `herdr_doctor` reports the stale root
+identity as a blocking finding. From that same live pane, call
+`herdr_reconcile_root`; it updates only the matching pane/workspace's recorded
+harness and durable session identity. It refuses foreign, ambiguous, missing,
+or child-lane mappings and never resets or replaces another root.
 
 ## The queue
 

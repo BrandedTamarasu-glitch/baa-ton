@@ -20,7 +20,7 @@ function event(status, paneId = "root:p2") {
 
 async function fixture({ blocked = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "baa-queue-controller-"));
-  const manifestPath = join(directory, "task", ".pi", "herdr-orchestrator", "manifest.json");
+  const manifestPath = join(directory, "task", ".baa-ton", "herdr-orchestrator", "manifest.json");
   const stateDir = join(directory, "state");
   await mkdir(dirname(manifestPath), { recursive: true, mode: 0o700 });
   await mkdir(stateDir, { recursive: true, mode: 0o700 });

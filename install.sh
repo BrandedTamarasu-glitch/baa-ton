@@ -12,21 +12,6 @@ REPO="https://github.com/zachristmas/baa-ton"
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-welcome() {
-  printf '\n'
-  cat <<'EOF'
-,-----.    ,---.    ,---.         ,--------. ,-----. ,--.  ,--.
-|  |) /_  /  O  \  /  O  \ ,-----.'--.  .--''  .-.  '|  ,'.|  |
-|  .-.  \|  .-.  ||  .-.  |'-----'   |  |   |  | |  ||  |' '  |
-|  '--' /|  | |  ||  | |  |          |  |   '  '-'  '|  | `   |
-`------' `--' `--'`--' `--'          `--'    `-----' `--'  `--'
-
-───────────────────🐕  🐑  🐑  🐑  🐑  🐑  🐑──────────────────
-
-                 your agent herd is ready
-EOF
-}
-
 copy_to_clipboard() {
   local value="$1"
   if command -v pbcopy >/dev/null 2>&1; then
@@ -48,9 +33,10 @@ copy_to_clipboard() {
 }
 
 command -v git >/dev/null 2>&1 || die "git is required (https://git-scm.com)"
-command -v node >/dev/null 2>&1 || die "Node.js 20+ is required (https://nodejs.org)"
-node_major="$(node -p 'process.versions.node.split(".")[0]')"
-[ "$node_major" -ge 20 ] || die "Node.js 20+ required, found $(node --version)"
+command -v node >/dev/null 2>&1 || die "Node.js 22.19+ is required (https://nodejs.org)"
+node_version="$(node -p 'process.versions.node')"
+node_ok="$(node -p 'const [maj,min]="'"$node_version"'".split(".").map(Number); maj>22 || (maj===22 && min>=19) ? 1 : 0')"
+[ "$node_ok" -eq 1 ] || die "Node.js 22.19+ required, found $(node --version)"
 
 if [ ! -d "$BAA_TON_DIR/.git" ]; then
   say "Cloning Baa-ton to $BAA_TON_DIR"
@@ -89,25 +75,25 @@ else
 fi
 
 say "Running the Baa-ton project wizard in $PWD"
+wizard_code=0
 if [ -r /dev/tty ] && [ -t 1 ]; then
-  node "$BAA_TON_DIR/packages/herdr-tools/setup.mjs" --project-root "$PWD" --prompt-project --quiet < /dev/tty
+  node "$BAA_TON_DIR/packages/herdr-tools/install-tui.mjs" --project-root "$PWD" --prompt-project --quiet < /dev/tty || wizard_code=$?
 else
-  node "$BAA_TON_DIR/packages/herdr-tools/setup.mjs" --project-root "$PWD" --non-interactive --quiet
+  node "$BAA_TON_DIR/packages/herdr-tools/install-tui.mjs" --project-root "$PWD" --non-interactive --quiet || wizard_code=$?
+fi
+if [ "$wizard_code" -eq 130 ]; then
+  say "Setup cancelled; nothing was written."
+  exit 130
+elif [ "$wizard_code" -ne 0 ]; then
+  die "Baa-ton project setup failed with exit code $wizard_code"
 fi
 
 root_prompt=$(cat <<EOF
 Finish Baa-ton root setup in this Herdr pane.
 
-The installer already configured the selected project and installed the
-project-local baa-ton-start skill for the selected harnesses. Invoke that skill
-now. It must read BAA.md, complete the harness-specific connection, restart in
-this same Herdr pane only if required, call herdr_bootstrap_root, verify the root
-identity, and wait for my task.
+The installer already configured the selected project and installed the project-local baa-ton-start skill for the selected harnesses. Invoke that skill now. It must read BAA.md, complete the harness-specific connection, restart in this same Herdr pane only if required, call herdr_bootstrap_root, verify the root identity, and wait for my task.
 
-Do not ask me to run setup.mjs, initialize a goal, or provide an objective during
-setup. If the skill is unavailable, use the installed root-setup helper as the
-fallback. Never reset an existing root unless the pane and checkout are
-intentionally being replaced.
+Do not ask me to run setup.mjs, initialize a goal, or provide an objective during setup. If the skill is unavailable, use the installed root-setup helper as the fallback. Never reset an existing root unless the pane and checkout are intentionally being replaced.
 EOF
 )
 
@@ -116,7 +102,6 @@ if copy_to_clipboard "$root_prompt"; then
 else
   say "The setup skill was installed, but the optional fallback prompt could not be copied."
 fi
-welcome
 say "Install complete."
 say "To get started, start your harness in that project and invoke the Baa-ton skill: baa-ton-start."
 say "Later: use baa-ton-configure for worker/model choices or baa-ton-update for updates."

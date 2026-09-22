@@ -19,7 +19,7 @@ const profile = {
 
 test("opencode adapter generates project config, plugin, and model mapping", async () => {
   const root = await mkdtemp(join(tmpdir(), "baa-opencode-adapter-"));
-  const scratch = join(root, ".pi", "herdr-orchestrator");
+  const scratch = join(root, ".baa-ton", "herdr-orchestrator");
   try {
     const adapter = opencodeLaunchAdapter({ scratchDirectory: scratch });
     assert.equal(adapter.startupHandshake, "Reply with exactly: READY");

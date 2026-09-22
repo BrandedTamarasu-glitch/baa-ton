@@ -21,7 +21,7 @@ test("a parent pause during herdr_observe's unlocked reads is never overwritten 
   const configDir = join(directory, "config");
   const manifestFile = join(
     parent,
-    ".pi",
+    ".baa-ton",
     "herdr-orchestrator",
     "manifest.json",
   );
@@ -104,7 +104,7 @@ test("a parent pause during herdr_observe's unlocked reads is never overwritten 
   for (const path of [
     parent,
     configDir,
-    join(parent, ".pi/herdr-orchestrator"),
+    join(parent, ".baa-ton/herdr-orchestrator"),
   ])
     await mkdir(path, { recursive: true });
   await writeFile(manifestFile, JSON.stringify(manifest));

@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 /** Claude Code SessionStart hook: writes the lane's startup attestation.
  * Invoked by Claude with hook JSON on stdin ({session_id, transcript_path, ...}).
- * Merges lane identity into <BAA_STARTUP_INTENT>.ready; the MCP bridge merges
- * the protocol operations into the same file. Both writers merge atomically. */
+ * Merges lane identity into <BAA_STARTUP_INTENT>.ready. Claude may start an
+ * MCP server lazily, so seed the stable protocol contract here as well; the
+ * MCP bridge merges the same live operations when it starts. Both writers
+ * merge atomically. */
 import { readFile } from "node:fs/promises";
 import { mergeAttestation } from "./attest-merge.mjs";
 
@@ -44,6 +46,7 @@ process.stdin.on("end", async () => {
       source: intent.source,
       profile: intent.profile,
       harness: "claude",
+      operations: ["plan", "dispatch", "complete"],
       ...identity,
     });
   } catch (error) {

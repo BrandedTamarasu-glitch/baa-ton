@@ -13,6 +13,7 @@
     "test:controller": "npm --prefix packages/controller test"
   },
   "dependencies": {
+    "@earendil-works/pi-tui": "0.85.1",
     "jiti": "^2.7.0"
   },
   "devDependencies": {
@@ -25,6 +26,6 @@
     "typebox": "*"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   }
 }

@@ -45,8 +45,8 @@ async function fixture({ withLane = false } = {}) {
   const cwdA = join(directory, "root-a");
   const cwdB = join(directory, "root-b");
   const configDir = join(directory, "config");
-  const manifestA = join(cwdA, ".pi", "herdr-orchestrator", "manifest.json");
-  const manifestB = join(cwdB, ".pi", "herdr-orchestrator", "manifest.json");
+  const manifestA = join(cwdA, ".baa-ton", "herdr-orchestrator", "manifest.json");
+  const manifestB = join(cwdB, ".baa-ton", "herdr-orchestrator", "manifest.json");
   const rootA = root("w-a:root", "w-a");
   const laneA = lane("lane-a", "w-a:child", "w-a");
   const workflowA = {
@@ -65,7 +65,7 @@ async function fixture({ withLane = false } = {}) {
     workflows: withLane ? [workflowA] : [],
   };
   await mkdir(configDir, { recursive: true, mode: 0o700 });
-  await mkdir(join(cwdA, ".pi", "herdr-orchestrator"), {
+  await mkdir(join(cwdA, ".baa-ton", "herdr-orchestrator"), {
     recursive: true,
     mode: 0o700,
   });
@@ -524,7 +524,7 @@ test("controller routes colliding workflow IDs by child pane to separate manifes
       ],
     };
     assert.equal(validateConfig(config).orchestrators.length, 2);
-    await mkdir(join(f.cwdB, ".pi", "herdr-orchestrator"), {
+    await mkdir(join(f.cwdB, ".baa-ton", "herdr-orchestrator"), {
       recursive: true,
       mode: 0o700,
     });

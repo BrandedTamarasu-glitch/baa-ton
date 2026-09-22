@@ -5,7 +5,9 @@ import type { LaunchProfile } from "./launch-profile.js";
 import type { PersistenceHandle } from "./contract.js";
 import {
   PROTOCOL_OPERATIONS,
+  STARTUP_PROOF_REQUIRED_OPERATIONS,
   type HarnessLaunchAdapter,
+  type LaunchContext,
   type ProtocolOperation,
   type StartupProof,
 } from "./harness-adapter.js";
@@ -28,9 +30,42 @@ export type ClaudeAdapterPaths = {
   permissionPromptTool?: string | false;
 };
 
-function claudeBinaryAvailable(): boolean {
-  for (const entry of (process.env.PATH ?? "").split(delimiter)) {
-    if (entry && existsSync(join(resolve(entry), "claude"))) return true;
+function claudeBinaryCandidates(
+  platform: NodeJS.Platform | string,
+  pathExt = process.env.PATHEXT,
+): string[] {
+  if (platform !== "win32") return ["claude"];
+  const extensions = (pathExt ?? ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((extension) => extension.trim().toLowerCase())
+    .filter((extension) => /^\.[a-z0-9]+$/.test(extension));
+  return [
+    ...new Set([
+      ...extensions.map((extension) => `claude${extension}`),
+      "claude.exe",
+      "claude.cmd",
+      "claude",
+    ]),
+  ];
+}
+
+export function claudeBinaryAvailable(options: {
+  platform?: NodeJS.Platform | string;
+  pathValue?: string;
+  pathExt?: string;
+  fileExists?: (path: string) => boolean;
+} = {}): boolean {
+  const platform = options.platform ?? process.platform;
+  const pathValue = options.pathValue ?? process.env.PATH ?? "";
+  const fileExists = options.fileExists ?? existsSync;
+  const pathDelimiter = platform === "win32" ? ";" : delimiter;
+  const candidates = claudeBinaryCandidates(platform, options.pathExt);
+  for (const entry of pathValue.split(pathDelimiter)) {
+    if (
+      entry &&
+      candidates.some((name) => fileExists(join(resolve(entry), name)))
+    )
+      return true;
   }
   return false;
 }
@@ -91,6 +126,13 @@ const LANE_PERMISSIONS = {
     "Bash(rg:*)",
     "Bash(grep:*)",
     "Bash(sed:*)",
+    // Without these, a dispatched lane's own contract (report via
+    // herdr_message, file the one lane receipt via herdr_complete) is
+    // impossible to fulfil unattended: Claude Code prompts for permission
+    // on every MCP tool call not in this allow-list, and nobody is present
+    // to answer it for a headless dispatched lane.
+    "mcp__herdr-orchestrator__herdr_message",
+    "mcp__herdr-orchestrator__herdr_complete",
   ],
   deny: [
     "Bash(git push:*)",
@@ -103,7 +145,11 @@ const LANE_PERMISSIONS = {
 function buildClaudeLaunchArguments(
   paths: ClaudeAdapterPaths,
   profile: LaunchProfile,
+  context?: LaunchContext,
 ): string[] {
+  const intentPath = context?.startupIntentPath;
+  if (!intentPath)
+    throw new Error("Claude launch requires the startup intent path.");
   mkdirSync(paths.scratchDirectory, { recursive: true, mode: 0o700 });
   const tag = randomUUID().slice(0, 8);
   const settingsPath = join(
@@ -114,6 +160,15 @@ function buildClaudeLaunchArguments(
     paths.scratchDirectory,
     `claude-mcp-${tag}.json`,
   );
+  // --strict-mcp-config below makes this file the lane's *entire* MCP
+  // surface, deliberately excluding every other configured server
+  // (including claude.ai account connectors) for headless-lane determinism.
+  // A lane that genuinely needs one, e.g. a domain MCP tool, gets it only
+  // via an explicit extraMcpServers grant from the authorized root, never
+  // by silently inheriting the operator's full config.
+  const extraMcpServers = { ...(context?.extraMcpServers ?? {}) };
+  delete extraMcpServers["herdr-orchestrator"];
+  const extraServerKeys = Object.keys(extraMcpServers);
   const settings = {
     hooks: {
       SessionStart: [
@@ -127,13 +182,31 @@ function buildClaudeLaunchArguments(
         },
       ],
     },
-    permissions: LANE_PERMISSIONS,
+    permissions: {
+      ...LANE_PERMISSIONS,
+      // A headless lane has nobody to answer a permission prompt. A granted
+      // extra server's tools must be pre-allowed the same way the two fixed
+      // herdr-orchestrator tools below already are, or every call hangs.
+      allow: [
+        ...LANE_PERMISSIONS.allow,
+        ...extraServerKeys.map((key) => `mcp__${key}__*`),
+      ],
+    },
   };
   const mcpConfig = {
     mcpServers: {
+      ...extraMcpServers,
       "herdr-orchestrator": {
         command: "node",
         args: [paths.bridge],
+        // Claude Code does not reliably inherit the Herdr pane environment
+        // into stdio MCP children. Pass the startup contract explicitly so
+        // mcp-server.mjs can publish the bridge's protocol operations before
+        // the SessionStart identity attestation is verified.
+        env: {
+          BAA_STARTUP_INTENT: intentPath,
+          HERDR_ENV: "1",
+        },
       },
     },
   };
@@ -187,6 +260,28 @@ export function claudeLaunchAdapter(
       // an unnecessary prompt or imply that a handshake is supported.
       supportsStartupHandshake: false,
     },
+    // Claude may start stdio MCP servers lazily. Do not accept the
+    // SessionStart identity half as a complete proof before the bridge's
+    // protocol contract has also been attested by the hook or MCP process.
+    attestationComplete(attestation: unknown): boolean {
+      const hello = attestation as {
+        sessionPath?: unknown;
+        sessionId?: unknown;
+        operations?: unknown;
+      };
+      const operations = Array.isArray(hello?.operations)
+        ? hello.operations.filter(
+            (operation): operation is string => typeof operation === "string",
+          )
+        : [];
+      return (
+        (typeof hello?.sessionPath === "string" ||
+          typeof hello?.sessionId === "string") &&
+        STARTUP_PROOF_REQUIRED_OPERATIONS.every((operation) =>
+          operations.includes(operation),
+        )
+      );
+    },
     // Honest capability reporting: Herdr's Claude integration exposes session
     // identity, but lifecycle state is screen-derived, not native.
     lifecycle: "screen",
@@ -206,12 +301,13 @@ export function claudeLaunchAdapter(
       // claude exit before its SessionStart hook writes the handshake, so
       // dispatch fails closed rather than silently substituting a model.
     },
-    launchArguments: (profile) => buildClaudeLaunchArguments(paths, profile),
+    launchArguments: (profile, _source, context) =>
+      buildClaudeLaunchArguments(paths, profile, context),
     resumeSessionId: claudeResumeSessionId,
-    resumeArguments: (profile, session) => [
+    resumeArguments: (profile, session, _source, context) => [
       "--resume",
       claudeResumeSessionId(session),
-      ...buildClaudeLaunchArguments(paths, profile),
+      ...buildClaudeLaunchArguments(paths, profile, context),
     ],
     verifyStartup(nativeAgent: unknown, attestation: unknown): StartupProof {
       const agent = nativeAgent as {

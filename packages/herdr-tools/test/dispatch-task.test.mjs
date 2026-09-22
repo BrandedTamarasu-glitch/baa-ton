@@ -303,6 +303,24 @@ test("workflow short IDs use the generated UUID prefix in child agent names", ()
   assert.equal(childAgentName("herdr-b5cc61d5-ignored-suffix", 1), "child-b5cc61d5-1");
 });
 
+test("a retryable workflow observed as unknown remains dispatchable", async () => {
+  const f = await fixture();
+  try {
+    f.state.status = "unknown";
+    f.state.outcome = "unknown";
+    f.state.retry = {
+      state: "retryable",
+      attempt: 1,
+      retryCommand: "herdr_dispatch wf execute=true",
+      failedStage: "startup-proof",
+      error: "startup proof mismatch",
+    };
+    assert.equal((await f.run()).dispatched, true);
+  } finally {
+    await f.close();
+  }
+});
+
 test("opaque IDs and different checkout still produce only tabs in one designated workspace", async () => {
   const f = await fixture();
   try {

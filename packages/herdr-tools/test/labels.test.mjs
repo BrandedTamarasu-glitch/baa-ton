@@ -114,7 +114,7 @@ test("root bootstrap labels the current tab and repeats the idempotent rename", 
     );
     assert.match(first.details.evidence[0], /labeled 🐕 pi·w-labels/);
     const manifest = JSON.parse(
-      await readFile(join(f.cwd, ".pi", "herdr-orchestrator", "manifest.json"), "utf8"),
+      await readFile(join(f.cwd, ".baa-ton", "herdr-orchestrator", "manifest.json"), "utf8"),
     );
     assert.equal(manifest.sessionLog.kind, "root");
     assert.equal(manifest.sessionLog.paneId, "w-labels:root");
@@ -138,7 +138,7 @@ test("root bootstrap labels the current tab and repeats the idempotent rename", 
       2,
     );
     const refreshed = JSON.parse(
-      await readFile(join(f.cwd, ".pi", "herdr-orchestrator", "manifest.json"), "utf8"),
+      await readFile(join(f.cwd, ".baa-ton", "herdr-orchestrator", "manifest.json"), "utf8"),
     );
     assert.equal(refreshed.sessionLog.startedAt, firstStartedAt);
     assert.equal(refreshed.sessionLog.tabId, "w-labels:root-tab");
