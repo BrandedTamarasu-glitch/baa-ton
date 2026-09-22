@@ -57,6 +57,18 @@ function explicitEnv(identity) {
   ].join(" \\\n  ");
 }
 
+// Claude Code's `mcp add` takes repeated -e KEY=value flags (its --env alias
+// takes the same form). Kept distinct from explicitEnv/codex's --env syntax
+// in case the two CLIs' flag grammars diverge further later.
+function explicitEnvFlags(identity) {
+  return [
+    `-e HERDR_ENV=${shellQuote(identity.HERDR_ENV)}`,
+    `-e HERDR_WORKSPACE_ID=${shellQuote(identity.HERDR_WORKSPACE_ID)}`,
+    `-e HERDR_PANE_ID=${shellQuote(identity.HERDR_PANE_ID)}`,
+    `-e HERDR_PLUGIN_CONFIG_DIR=${shellQuote(identity.HERDR_PLUGIN_CONFIG_DIR)}`,
+  ].join(" \\\n  ");
+}
+
 function exportCommand(identity) {
   return `export HERDR_ENV=${shellQuote(identity.HERDR_ENV)} HERDR_WORKSPACE_ID=${shellQuote(identity.HERDR_WORKSPACE_ID)} HERDR_PANE_ID=${shellQuote(identity.HERDR_PANE_ID)} HERDR_PLUGIN_CONFIG_DIR=${shellQuote(identity.HERDR_PLUGIN_CONFIG_DIR)}`;
 }
@@ -90,11 +102,12 @@ function printInstructions(harness, identity) {
   console.log("");
   console.log(`Harness: ${harnessLabel}`);
   console.log("1. Apply this one-time integration:");
-  console.log(`  ${exportCommand(identity)}`);
   if (harness === "claude") {
-    console.log(
-      `  claude mcp add --transport stdio herdr-orchestrator -- node ${shellQuote(bridge)}`,
-    );
+    console.log([
+      `  claude mcp add --transport stdio herdr-orchestrator \\`,
+      `  ${explicitEnvFlags(identity)} \\`,
+      `  -- node ${shellQuote(bridge)}`,
+    ].join("\n"));
   } else if (harness === "codex") {
     console.log([
       `  codex mcp add herdr-orchestrator \\`,
@@ -105,6 +118,10 @@ function printInstructions(harness, identity) {
     console.log("Merge this project-local MCP entry into opencode.json, then restart OpenCode:");
     console.log(opencodeConfig(identity));
   } else {
+    // Pi has no separate MCP config file of its own to carry the identity in
+    // (it loads the extension in-process), so it is the one harness that
+    // still genuinely needs the pane identity exported into its own shell.
+    console.log(`  ${exportCommand(identity)}`);
     console.log(`Pi is already wired through the installed extension: ${shellQuote(extension)}`);
   }
   console.log("");
@@ -155,7 +172,7 @@ async function writeConfiguration(harness, identity) {
     const config = await readJsonObject(path);
     config.mcpServers = {
       ...(config.mcpServers ?? {}),
-      "herdr-orchestrator": { command: "node", args: [bridge] },
+      "herdr-orchestrator": { command: "node", args: [bridge], env: identity },
     };
     await writeJsonConfig(path, config);
     return;

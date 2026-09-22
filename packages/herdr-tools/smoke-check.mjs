@@ -321,7 +321,7 @@ extension.default({
                 agent: "pi",
                 source: "herdr:pi",
                 kind: "path",
-                value: "/sessions/root.jsonl",
+                value: join(testCwd, "root.jsonl"),
               },
               pane_id: rootPaneId,
               workspace_id: rootWorkspaceId,
@@ -387,11 +387,15 @@ extension.default({
     throw new Error(`Unexpected Herdr call: ${args.join(" ")}`);
   },
 });
-assert.equal(tools.size, 16, "extension registered its workflow tools");
+assert.equal(tools.size, 18, "extension registered its workflow tools");
 assert.ok(tools.has("herdr_recover_root"), "extension registers audited stale-root recovery");
 assert.ok(
   tools.has("herdr_bootstrap_root"),
   "extension registers manual root bootstrap",
+);
+assert.ok(
+  tools.has("herdr_reconcile_root"),
+  "extension registers safe root identity reconciliation",
 );
 assert.ok(
   tools.has("herdr_question_answer"),
@@ -416,6 +420,7 @@ assert.ok(
 assert.ok(commands.has("herdr-resume"), "extension registered /herdr-resume");
 
 const testCwd = await mkdtemp(join(tmpdir(), "herdr-orchestrator-smoke-"));
+await writeFile(join(testCwd, "root.jsonl"), JSON.stringify({ type: "session", id: "01a0b04d-0bef-7207-b486-d51d62f0e3dc", cwd: testCwd }) + "\n");
 const previousHerdrEnv = process.env.HERDR_ENV;
 const previousRootEnv = process.env.HERDR_ORCHESTRATOR_ROOT;
 const previousPaneEnv = process.env.HERDR_PANE_ID;
@@ -432,7 +437,7 @@ let abortedRuns = 0;
 const notifications = [];
 const ctx = {
   cwd: testCwd,
-  sessionManager: { getSessionFile: () => "/sessions/root.jsonl" },
+  sessionManager: { getSessionId: () => "01a0b04d-0bef-7207-b486-d51d62f0e3dc", getSessionFile: () => join(testCwd, "root.jsonl") },
   isIdle: () => rootIdle,
   abort: () => {
     abortedRuns += 1;
@@ -466,7 +471,7 @@ try {
   await chmod(controllerConfigDir, 0o755);
   const legacyManifestPath = join(
     testCwd,
-    ".pi",
+    ".baa-ton",
     "herdr-orchestrator",
     "manifest.json",
   );
@@ -703,7 +708,7 @@ try {
 
   const manifestPath = join(
     testCwd,
-    ".pi",
+    ".baa-ton",
     "herdr-orchestrator",
     "manifest.json",
   );

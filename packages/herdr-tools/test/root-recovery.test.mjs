@@ -13,8 +13,8 @@ async function fixture(t) {
   const dir = await mkdtemp(join(tmpdir(), 'baa-root-recovery-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const cwd = join(dir, 'project'), configDir = join(dir, 'config');
-  const manifestPath = join(cwd, '.pi/herdr-orchestrator/manifest.json'), configPath = join(configDir, 'config.json');
-  await mkdir(join(cwd, '.pi/herdr-orchestrator'), { recursive: true });
+  const manifestPath = join(cwd, '.baa-ton/herdr-orchestrator/manifest.json'), configPath = join(configDir, 'config.json');
+  await mkdir(join(cwd, '.baa-ton/herdr-orchestrator'), { recursive: true });
   await mkdir(configDir, { mode: 0o700 });
   const old = root('w-old:p1', 'w-old'), current = root('w-new:p1', 'w-new');
   const route = { workflow_id: 'herdr-done', manifest_path: manifestPath, lanes: [{ lane_id: 'lane-1', target: 'w-old:p2', target_kind: 'pane_id', pane_id: 'w-old:p2', workspace_id: 'w-old' }] };
@@ -36,7 +36,7 @@ async function fixture(t) {
   const before = { config: JSON.stringify(config), manifest: JSON.stringify(manifest) };
   await writeFile(configPath, before.config, { mode: 0o600 });
   await writeFile(manifestPath, before.manifest, { mode: 0o600 });
-  return { cwd, configDir, configPath, manifestPath, before, config, manifest, oldRootId: 'old-root', root: current, session, liveWorkspaceIds: ['w-new', 'w-other'], auditDir: join(cwd, '.pi/herdr-orchestrator/root-recovery') };
+  return { cwd, configDir, configPath, manifestPath, before, config, manifest, oldRootId: 'old-root', root: current, session, liveWorkspaceIds: ['w-new', 'w-other'], auditDir: join(cwd, '.baa-ton/herdr-orchestrator/root-recovery') };
 }
 
 test('migration preserves other roots, workflow provenance, receipts, queues and unknown metadata', async t => {

@@ -18,7 +18,7 @@ test("registered children can send distinct and deduplicated messages after comp
   const directory = await mkdtemp(join(tmpdir(), "baa-message-"));
   const configDir = join(directory, "config");
   const parent = join(directory, "parent");
-  const manifestPath = join(parent, ".pi", "herdr-orchestrator", "manifest.json");
+  const manifestPath = join(parent, ".baa-ton", "herdr-orchestrator", "manifest.json");
   const rootPane = "w-message:p1";
   const childPane = "w-message:p2";
   const workflowId = "workflow-message";
@@ -38,7 +38,7 @@ test("registered children can send distinct and deduplicated messages after comp
     workspace_id: "w-message",
   };
   const timestamp = "2026-09-16T00:00:00.000Z";
-  await mkdir(join(parent, ".pi", "herdr-orchestrator"), { recursive: true, mode: 0o700 });
+  await mkdir(join(parent, ".baa-ton", "herdr-orchestrator"), { recursive: true, mode: 0o700 });
   await mkdir(configDir, { recursive: true, mode: 0o700 });
   await writeFile(
     manifestPath,

@@ -7,8 +7,14 @@
  * process is not a dispatcher or background worker.
  */
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  resolve,
+} from "node:path";
 import {
   lstat,
   mkdir,
@@ -17,6 +23,7 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { Value } from "typebox/value";
@@ -34,6 +41,19 @@ import {
   storePath,
   updateMessage,
 } from "./inbox/index.mjs";
+import {
+  applyHerdrIdentity,
+  clearAppliedHerdrIdentity,
+  resolveHerdrIdentity,
+} from "./live-identity.mjs";
+import {
+  CONTROLLER_PLUGIN_ID,
+  liveHerdrAgentList,
+  liveHerdrConfigDirectory,
+  liveHerdrPaneProcessInfo,
+  spawnHerdrProcess,
+} from "./live-herdr.mjs";
+import { liveProcessParentPid } from "./live-process.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -48,7 +68,6 @@ const extension = await jiti.import(join(root, "index.ts"));
 // preflight; keeping this bridge-start registry snapshot out of preflight is
 // important because a stale catalog must never authorize a launch. The package
 // exports map does not expose internals, so resolve them by absolute file path.
-const { existsSync } = await import("node:fs");
 let packageRoot = null;
 for (let dir = root; dir !== dirname(dir); dir = dirname(dir)) {
   const candidate = join(
@@ -66,7 +85,6 @@ if (!packageRoot)
   throw new Error(
     "pi-coding-agent package not found for the MCP bridge model registry.",
   );
-const { pathToFileURL } = await import("node:url");
 const importDist = (name) =>
   import(pathToFileURL(join(packageRoot, "dist", name)).href);
 const { ModelRuntime } = await importDist("core/model-runtime.js");
@@ -94,11 +112,19 @@ extension.default({
   registerCommand() {},
   async exec(command, args, options = {}) {
     const result = await new Promise((resolveResult) => {
-      const child = require("node:child_process").spawn(command, args, {
-        cwd: process.cwd(),
-        env: process.env,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      const child =
+        command === "herdr"
+          ? spawnHerdrProcess(command, args, {
+              cwd: process.cwd(),
+              env: process.env,
+              spawnProcess: require("node:child_process").spawn,
+              stdio: ["ignore", "pipe", "pipe"],
+            })
+          : require("node:child_process").spawn(command, args, {
+              cwd: process.cwd(),
+              env: process.env,
+              stdio: ["ignore", "pipe", "pipe"],
+            });
       let stdout = "";
       let stderr = "";
       let settled = false;
@@ -135,6 +161,37 @@ extension.default({
   sendMessage() {},
 });
 
+async function refreshCurrentHerdrIdentity() {
+  const configuredDirectory = process.env.HERDR_PLUGIN_CONFIG_DIR;
+  const configuredConfig =
+    configuredDirectory && isAbsolute(configuredDirectory)
+      ? join(resolve(configuredDirectory), "config.json")
+      : undefined;
+  if (!configuredConfig || !existsSync(configuredConfig)) {
+    try {
+      const directory = await liveHerdrConfigDirectory(CONTROLLER_PLUGIN_ID);
+      if (isAbsolute(directory))
+        process.env.HERDR_PLUGIN_CONFIG_DIR = resolve(directory);
+    } catch {
+      // Identity resolution and read-only diagnostics retain their existing
+      // fallback behavior if a live config-dir query is unavailable.
+    }
+  }
+  const identity = await resolveHerdrIdentity({
+    env: process.env,
+    listAgents: liveHerdrAgentList,
+    listPaneProcesses: ({ paneId }) => liveHerdrPaneProcessInfo(paneId),
+    currentProcessPids: [process.pid, process.ppid],
+    currentProcessPid: process.pid,
+    getParentPid: liveProcessParentPid,
+    maxProcessAncestorDepth: 8,
+    currentCwd: process.cwd(),
+    allowStaticFallback: staticRootFallbackAllowed,
+  });
+  applyHerdrIdentity(process.env, identity);
+  return identity;
+}
+
 const permissionToolName =
   "mcp__herdr-orchestrator__herdr_permission_prompt";
 
@@ -168,6 +225,7 @@ const ROOT_EXECUTOR_TOOLS = new Set([
   "herdr_question_answer",
   "herdr_operator_close",
   "herdr_plan",
+  "herdr_reconcile_root",
 ]);
 
 function isRecord(value) {
@@ -181,16 +239,29 @@ function timestamp() {
 function configDirectory() {
   const directory =
     process.env.HERDR_PLUGIN_CONFIG_DIR ?? process.env.HERDR_PLUGIN_STATE_DIR;
-  if (directory) return isAbsolute(directory) ? resolve(directory) : undefined;
+  if (directory && isAbsolute(directory)) {
+    const configured = resolve(directory);
+    if (existsSync(join(configured, "config.json"))) return configured;
+  }
   // Match index.ts's rootConfigPath fallback so Claude/OpenCode callers that
-  // inherit only the pane identity still resolve the controller route.
-  return join(
-    homedir(),
-    ".config",
-    "herdr",
-    "plugins",
-    "herdr-orchestrator-controller",
-  );
+  // inherit only the pane identity still resolve the controller route. On
+  // Windows Herdr stores plugin config under AppData rather than .config.
+  return process.platform === "win32"
+    ? join(
+        process.env.APPDATA || join(homedir(), "AppData", "Roaming"),
+        "herdr",
+        "plugins",
+        "config",
+        CONTROLLER_PLUGIN_ID,
+      )
+    : join(
+        homedir(),
+        ".config",
+        "herdr",
+        "plugins",
+        "config",
+        CONTROLLER_PLUGIN_ID,
+      );
 }
 
 async function readControllerConfig() {
@@ -202,6 +273,30 @@ async function readControllerConfig() {
     if (error?.code === "ENOENT") return undefined;
     throw error;
   }
+}
+
+function agentAtIdentity(agent, identity) {
+  const kind = agent?.agent ?? agent?.agent_session?.agent;
+  return (
+    kind === "claude" &&
+    agent?.pane_id === identity.paneId &&
+    agent?.workspace_id === identity.workspaceId
+  );
+}
+
+async function staticRootFallbackAllowed({ fallback, agents }) {
+  if (!fallback.paneId || !fallback.workspaceId) return false;
+  const config = await readControllerConfig();
+  const roots =
+    config?.version === 1
+      ? [config.root]
+      : config?.orchestrators?.map((orchestrator) => orchestrator.root) ?? [];
+  const registered = roots.some(
+    (root) =>
+      root?.pane_id === fallback.paneId &&
+      root?.workspace_id === fallback.workspaceId,
+  );
+  return registered && agents.some((agent) => agentAtIdentity(agent, fallback));
 }
 
 function endpointFromEnvironment() {
@@ -274,7 +369,7 @@ async function currentRoute() {
 async function acquireManifestLock(manifestPath) {
   const lockPath = join(
     dirname(manifestPath),
-    `.${manifestPath.split("/").at(-1)}.herdr-orchestrator.lock`,
+    `.${basename(manifestPath)}.herdr-orchestrator.lock`,
   );
   const deadline = Date.now() + 2_000;
   while (true) {
@@ -413,7 +508,11 @@ async function persistBridgeMessage(name, args, requestId) {
   const path = bridgeStorePath(route);
   if (!route || !endpoints || !path) return undefined;
   const logicalKey = `${kind}:${route.workflowId ?? "root"}:${route.laneId ?? route.root.pane_id}:${name}:${digest(args)}`;
-  const occurrenceId = `${name}:${String(requestId)}`;
+  // JSON-RPC request IDs are only unique enough for an in-flight request. A
+  // harness may reuse one across turns, so the durable occurrence must also
+  // include the payload-bound logical key; otherwise a fresh plan can resolve
+  // to an old, already-resolved message and regress it to received.
+  const occurrenceId = `${name}:${String(requestId)}:${digest(logicalKey)}`;
   const stored = await putMessage(path, {
     envelope: makeEnvelope({
       logicalKey,
@@ -424,9 +523,10 @@ async function persistBridgeMessage(name, args, requestId) {
       payload: args,
     }),
   });
-  await markState(path, stored.message.occurrence_id, "received", {
-    transport: "mcp",
-  });
+  if (stored.created)
+    await markState(path, stored.message.occurrence_id, "received", {
+      transport: "mcp",
+    });
   await enqueueWakeHint(path, {
     recipient: endpoints.to,
     occurrenceId: stored.message.occurrence_id,
@@ -570,7 +670,14 @@ const ctx = {
  * SessionStart hook merges session identity into the same file; both merge
  * atomically, so write order does not matter. */
 if (process.env.BAA_STARTUP_INTENT && process.env.HERDR_ENV === "1") {
-  const { mergeAttestation } = await import(join(root, "attest-merge.mjs"));
+  // node:module's native ESM loader rejects a raw Windows path ("C:\...") as
+  // an import specifier -- it must be a file:// URL. jiti.import() below
+  // tolerates raw paths (its own loader), but this native dynamic import
+  // does not, and previously crashed every dispatched lane's MCP server at
+  // startup on Windows before it could complete its protocol handshake.
+  const { mergeAttestation } = await import(
+    pathToFileURL(join(root, "attest-merge.mjs")).href
+  );
   const { mapPiToolNamesToProtocolOperations } = await jiti.import(
     join(root, "pi-launch-adapter.ts"),
   );
@@ -673,16 +780,28 @@ async function callTool(id, params) {
       `Invalid arguments for ${params.name}: ${issues || "schema validation failed"}`,
     );
   }
+  try {
+    // Claude's project-scoped MCP registration may contain a stale pane
+    // snapshot. Refresh the process environment from Claude's live session
+    // id before any route, lifecycle, inbox, or extension root check runs.
+    await refreshCurrentHerdrIdentity();
+  } catch (error) {
+    return toolError(
+      `Unable to resolve the current Herdr identity: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   // The extension's root checks intentionally use the live Herdr environment.
   // The bridge additionally resolves the workspace-qualified route so a
   // caller that merely reuses a pane ID from another workspace cannot act as
   // the parent through MCP.
   if (ROOT_EXECUTOR_TOOLS.has(params.name)) {
     const route = await currentRoute();
-    if (route?.role !== "root")
+    if (route?.role !== "root") {
+      clearAppliedHerdrIdentity();
       return toolError(
         "Only the verified controller-mapped root may perform this operation.",
       );
+    }
   }
 
   const controller = new AbortController();
@@ -765,6 +884,7 @@ async function callTool(id, params) {
         );
       }
     }
+    clearAppliedHerdrIdentity();
   }
 }
 

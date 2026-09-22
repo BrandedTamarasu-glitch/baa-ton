@@ -189,6 +189,16 @@ function isHerdrSocketPath(path) {
   );
 }
 
+/** Herdr's Windows socket environment value names a marker file. The server
+ * exposes the same value as a named pipe, so raw Node clients must enter the
+ * `\\\\.\\pipe\\` namespace instead of opening the marker file directly. */
+export function herdrSocketEndpoint(socketPath, platform = process.platform) {
+  if (platform !== "win32") return socketPath;
+  if (socketPath.toLowerCase().startsWith(WINDOWS_NAMED_PIPE_PREFIX))
+    return socketPath;
+  return `${WINDOWS_NAMED_PIPE_PREFIX}${socketPath}`;
+}
+
 async function readRegularFile(path, label) {
   let details;
   try {
@@ -1432,13 +1442,14 @@ export class JsonLineHerdrClient {
       "HERDR_SOCKET_PATH must be an absolute POSIX socket path or Windows named pipe.",
     );
     this.socketPath = socketPath;
+    this.socketEndpoint = herdrSocketEndpoint(socketPath);
     this.timeoutMs = timeoutMs;
   }
 
   request(method, params) {
     const id = randomUUID();
     return new Promise((resolveRequest, rejectRequest) => {
-      const socket = net.createConnection({ path: this.socketPath });
+      const socket = net.createConnection({ path: this.socketEndpoint });
       let settled = false;
       let sent = false;
       let buffer = "";

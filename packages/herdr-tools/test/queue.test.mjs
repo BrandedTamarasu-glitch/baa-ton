@@ -13,7 +13,7 @@ async function fixture({ queue = [], workflows = [] } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "baa-queue-"));
   const cwd = join(directory, "task");
   const configDir = join(directory, "config");
-  const manifestDir = join(cwd, ".pi", "herdr-orchestrator");
+  const manifestDir = join(cwd, ".baa-ton", "herdr-orchestrator");
   const manifestPath = join(manifestDir, "manifest.json");
   const root = {
     target: "w1:p1",
@@ -54,6 +54,7 @@ async function fixture({ queue = [], workflows = [] } = {}) {
     HERDR_WORKSPACE_ID: root.workspace_id,
     HERDR_PLUGIN_CONFIG_DIR: configDir,
   });
+  await writeFile(join(cwd, "root-session.jsonl"), JSON.stringify({ type: "session", id: "01a0b04d-0bef-7207-b486-d51d62f0e3dc", cwd }) + "\n");
   const tools = new Map();
   extension({
     on() {},
@@ -71,7 +72,7 @@ async function fixture({ queue = [], workflows = [] } = {}) {
               name: "root",
               pane_id: args[2],
               workspace_id: "w1",
-              agent_session: { kind: "path", value: "/tmp/root-session.jsonl" },
+              agent_session: { kind: "path", value: join(cwd, "root-session.jsonl") },
             },
           } }),
         };
@@ -83,7 +84,7 @@ async function fixture({ queue = [], workflows = [] } = {}) {
     manifestPath,
     configDir,
     tools,
-    ctx: { cwd, hasUI: false, mode: "json" },
+    ctx: { cwd, hasUI: false, mode: "json", sessionManager: { getSessionId: () => "01a0b04d-0bef-7207-b486-d51d62f0e3dc", getSessionFile: () => join(cwd, "root-session.jsonl") } },
     activate() {
       Object.assign(process.env, {
         HERDR_ENV: "1",

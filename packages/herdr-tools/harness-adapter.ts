@@ -143,6 +143,10 @@ export const REQUIRED_ADAPTER_CAPABILITIES = [
  * adapters are unaffected; versioned with the contract. */
 export type LaunchContext = {
   startupIntentPath?: string;
+  /** Extra MCP servers (raw --mcp-config entries) a lane needs beyond the
+   * harness's baseline. Adapters that scope their MCP config (e.g. Claude's
+   * --strict-mcp-config) must merge these in; others may ignore the field. */
+  extraMcpServers?: Record<string, unknown>;
 };
 
 export type RequiredAdapterCapability =

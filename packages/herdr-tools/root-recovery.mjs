@@ -16,7 +16,7 @@ export function rootRecoveryPlan({ config, manifest, cwd, oldRootId, root, sessi
   if (matches.length !== 1) throw new Error('Select exactly one existing root by its recorded ID');
   const old = matches[0];
   if (manifest.parentGoals?.version || Array.isArray(manifest.parentGoals?.roots)) throw new Error('Legacy scoped goal schema requires separate normalization before recovery');
-  if (resolve(old.program.id) !== resolve(cwd) || resolve(old.program.parent_manifest_path ?? '') !== join(resolve(cwd), '.pi/herdr-orchestrator/manifest.json'))
+  if (resolve(old.program.id) !== resolve(cwd) || resolve(old.program.parent_manifest_path ?? '') !== join(resolve(cwd), '.baa-ton/herdr-orchestrator/manifest.json'))
     throw new Error('Selected root does not own this exact project manifest');
   if (!Array.isArray(liveWorkspaceIds) || !liveWorkspaceIds.includes(root.workspace_id) || liveWorkspaceIds.includes(old.root.workspace_id))
     throw new Error('Old workspace must be absent and current workspace must be live');
@@ -28,7 +28,7 @@ export function rootRecoveryPlan({ config, manifest, cwd, oldRootId, root, sessi
     throw new Error('Current native session identity is required');
   const routed = new Set(old.workflows.map(flow => flow.workflow_id));
   for (const route of old.workflows) {
-    if (resolve(route.manifest_path) !== join(resolve(cwd), '.pi/herdr-orchestrator/manifest.json')) throw new Error('Cross-manifest routes require separate recovery');
+    if (resolve(route.manifest_path) !== join(resolve(cwd), '.baa-ton/herdr-orchestrator/manifest.json')) throw new Error('Cross-manifest routes require separate recovery');
     if (manifest.workflows.filter(flow => flow.id === route.workflow_id).length !== 1) throw new Error('Routed workflow is missing or ambiguous');
   }
   const owned = manifest.workflows.filter(flow => routed.has(flow.id) ||
