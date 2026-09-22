@@ -85,3 +85,26 @@ npm test
 ```
 
 Tests use a temporary mocked JSON-line socket and cover strict configuration and payload validation, concurrent event serialization, event deduplication, root identity checks, parent-goal scheduling, concurrent one-shot delivery, legacy/interrupted-send suppression, authoritative root-run gating, unavailable-root recovery, generic multi-harness events, and optional paused-goal classification. They do not contact a live Herdr server or alter a workspace.
+
+### Receipt delivery diagnostics
+
+A supervisor tick isolates manifest acquisition, read, validation, and processing
+errors per mapped manifest. A missing historical checkout is reported and skipped;
+other valid mappings still drain their pending receipts. Invalid configuration
+continues to fail the whole tick. No historical registration is removed or repaired.
+
+Tick results include `diagnostics` with manifest and orchestrator identifiers.
+Eligible pending receipts also report receipt/workflow/lane identifiers and the
+observed readiness veto (root busy, unavailable, session mismatch, launch pending,
+non-interactive, or active root turn), or delivery outcome. These observations do
+not authorize replay of `sending`, `uncertain`, or `delivered` receipts.
+
+The running supervisor emits diagnostics to stderr and retains its most recent
+100 observations in `supervisor-diagnostics.json` in the config directory, with
+PID and last successful tick timestamp. This bounded file is diagnostic only;
+it is never read as delivery authority and is replaced by the next process's
+observations. It contains no completion summary or transcript. A stale timestamp
+means no recent snapshot was established; it does not prove any receipt outcome.
+This instruments supervisor retries, not the child's initial completion attempt.
+The change needs a controlled supervisor process replacement to take effect;
+Pi reload alone does not replace that process.

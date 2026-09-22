@@ -2021,10 +2021,9 @@ test("malformed root-turn and acknowledgement fields fail strict manifest valida
     const api = recoveryApi();
     try {
       await patchSupervisor(fixture, patch);
-      await assert.rejects(
-        recoveryTick(fixture, api, 0),
-        /rootTurn|acknowledgedAt/,
-      );
+      const result = await recoveryTick(fixture, api, 0);
+      assert.equal(result.results[0].status, "manifest-error");
+      assert.match(result.results[0].reason, /rootTurn|acknowledgedAt/);
       assert.equal(api.prompts, 0);
     } finally {
       await fixture.cleanup();
@@ -2781,6 +2780,45 @@ async function receiptFixture(delivery = "pending", parentGoal) {
   return fixture;
 }
 
+test("supervisor isolates missing and malformed manifests before a valid receipt", async () => {
+  for (const failure of ["missing-directory", "missing-file", "malformed", "unowned"]) {
+    const fixture = await receiptFixture();
+    let prompts = 0;
+    try {
+      const configPath = join(fixture.stateDir, "config.json");
+      const config = JSON.parse(await readFile(configPath, "utf8"));
+      const badPath = join(fixture.directory, "historical", "manifest.json");
+      if (failure !== "missing-directory") await mkdir(dirname(badPath));
+      if (failure === "malformed") await writeFile(badPath, "{");
+      if (failure === "unowned") await writeFile(badPath, JSON.stringify({ version: 2, workflows: [] }));
+      const original = await readFile(fixture.manifestPath, "utf8");
+      config.workflows.unshift({ ...config.workflows[0], workflow_id: "herdr-historical", manifest_path: badPath,
+        lanes: [{ ...CHILD, lane_id: "historical", pane_id: "w-child:p2", target: "historical-child" }] });
+      await writeFile(configPath, JSON.stringify(config));
+      const tick = () => runSupervisorTick({ stateDir: fixture.stateDir, herdr: { async request(method) {
+        if (method === "pane.report_metadata") return {};
+        if (method === "agent.get") {
+          const info = rootAgentInfo().result;
+          info.agent.agent_session = { kind: "path", value: "/sessions/owning-root.jsonl" };
+          return info;
+        }
+        if (method === "agent.prompt") { prompts++; return {}; }
+        throw new Error(`Unexpected method ${method}`);
+      } } });
+      const outcome = await tick();
+      assert.equal(prompts, 1, failure);
+      assert.equal(outcome.results[0].status, "manifest-error");
+      assert.equal(outcome.results[0].manifestPath, badPath);
+      assert.ok(outcome.diagnostics.some(item => item.manifestPath === badPath && item.errorCode));
+      const expected = JSON.parse(original);
+      expected.workflows[0].lanes[0].completionReceipt.delivery = "delivered";
+      assert.deepEqual(await fixture.manifest(), expected);
+      await tick();
+      assert.equal(prompts, 1, "a failed earlier manifest must not cause receipt replay");
+    } finally { await fixture.cleanup(); }
+  }
+});
+
 test("completed receipt retries after a busy root without another hook and is delivered once across concurrent ticks", async () => {
   for (const withGoal of [false, true]) {
     const fixture = await receiptFixture("pending", withGoal ? { ...dueParentGoal(), status: "review-requested" } : undefined);
@@ -2800,10 +2838,14 @@ test("completed receipt retries after a busy root without another hook and is de
     } };
     const tick = () => runSupervisorTick({ stateDir: fixture.stateDir, herdr: api });
     try {
-      await tick(); assert.equal(prompts, 0);
+      const busy = await tick(); assert.equal(prompts, 0);
+      assert.equal(busy.diagnostics[0].reason, "root-busy");
+      assert.equal(busy.diagnostics[0].receiptId, "incarnation-receipt");
+      assert.equal(busy.diagnostics[0].rootStatus, "working");
       assert.equal((await fixture.manifest()).workflows[0].lanes[0].completionReceipt.delivery, "pending");
       status = "idle"; session = "/sessions/replacement-root.jsonl";
-      await tick(); assert.equal(prompts, 0, "same pane with foreign session cannot consume receipt");
+      const foreign = await tick(); assert.equal(prompts, 0, "same pane with foreign session cannot consume receipt");
+      assert.equal(foreign.diagnostics[0].reason, "root-session-mismatch");
       session = "/sessions/owning-root.jsonl";
       const outcomes = await Promise.all([tick(), tick()]);
       assert.equal(prompts, 1);
@@ -2815,6 +2857,34 @@ test("completed receipt retries after a busy root without another hook and is de
       await tick(); assert.equal(prompts, 1);
     } finally { await fixture.cleanup(); }
   }
+});
+
+test("supervisor persists bounded receipt diagnostics when stderr is not captured", async () => {
+  const fixture = await receiptFixture();
+  let observed;
+  const started = new Promise(resolve => { observed = resolve; });
+  let loop;
+  try {
+    loop = await runSupervisorLoop({ stateDir: fixture.stateDir, herdr: { async request(method) {
+      if (method === "pane.report_metadata") return {};
+      if (method === "agent.get") {
+        observed();
+        const info = rootAgentInfo().result;
+        info.agent.agent_status = "working";
+        return info;
+      }
+      throw new Error(`Unexpected method ${method}`);
+    } } });
+    await started;
+    await loop.stop();
+    const snapshot = JSON.parse(await readFile(join(fixture.stateDir, "supervisor-diagnostics.json"), "utf8"));
+    assert.equal(snapshot.pid, process.pid);
+    assert.ok(Number.isFinite(Date.parse(snapshot.observedAt)));
+    assert.ok(snapshot.diagnostics.length <= 100);
+    assert.equal(snapshot.diagnostics[0].receiptId, "incarnation-receipt");
+    assert.equal(snapshot.diagnostics[0].reason, "root-busy");
+    assert.equal((await fixture.manifest()).workflows[0].lanes[0].completionReceipt.delivery, "pending");
+  } finally { await loop?.stop(); await fixture.cleanup(); }
 });
 
 test("receipt delivery leaves interrupted, ambiguous, and already delivered states untouched", async () => {

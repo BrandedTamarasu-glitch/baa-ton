@@ -1374,16 +1374,19 @@ function ensureLedger(workflow) {
   return ledger;
 }
 
-async function atomicWriteJson(path, value) {
-  const original = await lstat(path);
-  assert(original.isFile(), `Manifest must be a regular file: ${path}`);
+async function atomicWriteJson(path, value, { allowCreate = false } = {}) {
+  const original = await lstat(path).catch(error => {
+    if (allowCreate && error.code === "ENOENT") return null;
+    throw error;
+  });
+  assert(original === null || original.isFile(), `Manifest must be a regular file: ${path}`);
   const temporary = join(
     dirname(path),
     `.${basename(path)}.event-controller-${process.pid}-${randomUUID()}.tmp`,
   );
   try {
     await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-      mode: original.mode & 0o777,
+      mode: original ? original.mode & 0o777 : 0o600,
     });
     await rename(temporary, path);
   } catch (error) {
@@ -2501,14 +2504,17 @@ export async function runSupervisorTick({
   const api = herdr ?? new JsonLineHerdrClient();
   const results = [];
   const pendingWakes = [];
+  const diagnostics = [];
+  const diagnose = details => diagnostics.push({ timestamp, ...details });
   const seenManifests = new Set();
   for (const entry of configuredParentManifests(config)) {
     const { orchestrator, manifestPath, workflows } = entry;
     const manifestKey = `${orchestrator.id}:${manifestPath}`;
     if (seenManifests.has(manifestKey)) continue;
     seenManifests.add(manifestKey);
-    const release = await acquireManifestLock(manifestPath);
+    let release;
     try {
+      release = await acquireManifestLock(manifestPath);
       const manifest = parseJson(
         await readRegularFile(manifestPath, "Parent manifest"),
         "Parent manifest",
@@ -2545,15 +2551,26 @@ export async function runSupervisorTick({
               typeof receipt.summary !== "string" || !receipt.summary.trim()) continue;
           // `sending` may belong to a live herdr_complete call; neither it nor
           // ambiguous/delivered outcomes are automatically replayed.
+          const receiptContext = { manifestPath, orchestratorId: orchestrator.id,
+            workflowId: stored.id, laneId: lane.id, receiptId: receipt.id, kind: "completion-receipt" };
           let agent;
           try {
             agent = rootAgent(await api.request("agent.get", { target: root.target }), root);
-          } catch { continue; } // A read failure cannot consume a pending receipt.
-          if (!agent || !["idle", "done"].includes(agent.agent_status) ||
-              agent.interactive_ready === false || agent.launch_pending ||
-              agent.agent_session?.value !== binding.rootSessionPath ||
-              !["path", "id"].includes(agent.agent_session?.kind) ||
-              goal?.supervisor?.rootTurn?.state === "active") continue;
+          } catch (error) {
+            diagnose({ ...receiptContext, status: "pending", reason: "root-lookup-failed", errorCode: error?.code ?? "unknown" });
+            continue; // A read failure cannot consume a pending receipt.
+          }
+          const reason = !agent ? "root-unavailable-or-mismatched"
+            : !["idle", "done"].includes(agent.agent_status) ? "root-busy"
+            : agent.interactive_ready === false ? "root-not-interactive"
+            : agent.launch_pending ? "root-launch-pending"
+            : agent.agent_session?.value !== binding.rootSessionPath || !["path", "id"].includes(agent.agent_session?.kind) ? "root-session-mismatch"
+            : goal?.supervisor?.rootTurn?.state === "active" ? "root-turn-active" : null;
+          if (reason) {
+            diagnose({ ...receiptContext, status: "pending", reason, rootStatus: agent?.agent_status,
+              rootTurnState: goal?.supervisor?.rootTurn?.state });
+            continue;
+          }
           receipt.delivery = "sending";
           await atomicWriteJson(manifestPath, manifest);
           try {
@@ -2570,6 +2587,7 @@ export async function runSupervisorTick({
               ? "pending" : "uncertain";
           }
           await atomicWriteJson(manifestPath, manifest);
+          diagnose({ ...receiptContext, status: receipt.delivery });
           pendingWakes.push({ manifestPath, workflowId: stored.id, laneId: lane.id,
             kind: "completion-receipt", status: receipt.delivery });
         }
@@ -2933,8 +2951,21 @@ export async function runSupervisorTick({
         { attempts: 1, reason: outcome.reason },
       );
       results.push({ manifestPath, status: outcome.status });
+    } catch (error) {
+      const detail = { manifestPath, orchestratorId: orchestrator.id, status: "manifest-error",
+        errorCode: error?.code ?? "unknown", reason: error instanceof Error ? error.message : String(error) };
+      results.push(detail);
+      diagnose(detail);
     } finally {
-      await release();
+      // A missing/unreadable historical manifest must not starve other roots.
+      // Retain interrupted sending claims; never repair or replay them here.
+      if (release) {
+        try { await release(); }
+        catch (error) {
+          diagnose({ manifestPath, orchestratorId: orchestrator.id, status: "lock-release-error",
+            errorCode: error?.code ?? "unknown", reason: error instanceof Error ? error.message : String(error) });
+        }
+      }
       // Publish both sides of the mapping; this is best effort, so a missing
       // pane or older Herdr never blocks supervision.
       await publishParticipantSidebar({
@@ -2952,7 +2983,7 @@ export async function runSupervisorTick({
           });
     }
   }
-  return { accepted: true, results, pendingWakes };
+  return { accepted: true, results, pendingWakes, diagnostics };
 }
 
 function newRecord(event, mapping, classification, identity) {
@@ -3387,6 +3418,7 @@ export async function runSupervisorLoop({
   let ticking = false;
   let timer;
   let inFlightTick;
+  const recentDiagnostics = [];
   const stop = async () => {
     if (stopping) return;
     stopping = true;
@@ -3404,11 +3436,20 @@ export async function runSupervisorLoop({
     ticking = true;
     const current = (async () => {
       try {
-        await runSupervisorTick({
+        const outcome = await runSupervisorTick({
           stateDir: resolvedStateDir,
           configDir: resolvedConfigDir,
           herdr,
         });
+        recentDiagnostics.push(...outcome.diagnostics);
+        recentDiagnostics.splice(0, Math.max(0, recentDiagnostics.length - 100));
+        // Bounded observation only: not a receipt ledger or delivery authority.
+        // Preserve visibility when the supervisor's stderr is an uncaptured pipe.
+        await atomicWriteJson(join(resolvedConfigDir, "supervisor-diagnostics.json"), {
+          pid: process.pid, observedAt: now(), diagnostics: recentDiagnostics,
+        }, { allowCreate: true });
+        for (const diagnostic of outcome.diagnostics)
+          process.stderr.write(`herdr-orchestrator-controller supervisor: ${JSON.stringify(diagnostic)}\n`);
       } catch (error) {
         process.stderr.write(
           `herdr-orchestrator-controller supervisor: ${error instanceof Error ? error.message : String(error)}\n`,
