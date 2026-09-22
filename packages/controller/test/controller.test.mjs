@@ -8,6 +8,7 @@ import test from "node:test";
 import {
   ControllerError,
   JsonLineHerdrClient,
+  herdrSocketEndpoint,
   handleHook,
   hookResponse,
   runSupervisorLoop,
@@ -604,7 +605,19 @@ test("socket validation accepts POSIX sockets and Windows named pipes", () => {
   const windowsPipe = "\\\\.\\pipe\\herdr-controller";
   const windows = new JsonLineHerdrClient(windowsPipe);
   assert.equal(posix.socketPath, "/tmp/herdr-controller.sock");
+  assert.equal(
+    herdrSocketEndpoint("/tmp/herdr-controller.sock", "linux"),
+    "/tmp/herdr-controller.sock",
+  );
   assert.equal(windows.socketPath, windowsPipe);
+  assert.equal(windows.socketEndpoint, windowsPipe);
+  assert.equal(
+    herdrSocketEndpoint(
+      "C:\\Users\\zchri\\AppData\\Roaming\\herdr\\herdr.sock",
+      "win32",
+    ),
+    "\\\\.\\pipe\\C:\\Users\\zchri\\AppData\\Roaming\\herdr\\herdr.sock",
+  );
   assert.throws(
     () => new JsonLineHerdrClient("relative.sock"),
     /absolute POSIX socket path or Windows named pipe/,

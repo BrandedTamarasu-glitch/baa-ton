@@ -28,7 +28,7 @@ async function fixture({ dirty = false, failTab = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "baa-cleanup-sweep-"));
   const cwd = join(directory, "checkout");
   const worktree = join(directory, "orphan-worktree");
-  const manifestPath = join(cwd, ".pi", "herdr-orchestrator", "manifest.json");
+  const manifestPath = join(cwd, ".baa-ton", "herdr-orchestrator", "manifest.json");
   const configDir = join(directory, "config");
   await mkdir(cwd, { recursive: true });
   await git(cwd, "init", "-b", "main");
@@ -165,7 +165,7 @@ async function fixture({ dirty = false, failTab = false } = {}) {
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
   };
-  await mkdir(join(cwd, ".pi", "herdr-orchestrator"), { recursive: true });
+  await mkdir(join(cwd, ".baa-ton", "herdr-orchestrator"), { recursive: true });
   await mkdir(configDir, { recursive: true });
   await writeFile(
     manifestPath,
@@ -344,7 +344,7 @@ test("headless cleanup reports the user-confirmation handoff and never mutates",
         undefined,
         headlessContext(f.cwd),
       ),
-      /Headless MCP\/Codex callers cannot provide that confirmation.*ask for explicit approval/i,
+      /requires either native TUI confirmation or confirm=true after the user has explicitly approved this exact dry-run inventory/i,
     );
     assert.equal(
       f.calls.some((args) => args[0] === "tab" && args[1] === "close"),

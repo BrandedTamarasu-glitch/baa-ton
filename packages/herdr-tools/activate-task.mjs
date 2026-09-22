@@ -158,13 +158,13 @@ export async function activateTask({
           workspace_id: pane.workspace_id,
           parent_manifest_path: join(
             cwd,
-            ".pi/herdr-orchestrator/manifest.json",
+            ".baa-ton/herdr-orchestrator/manifest.json",
           ),
         },
         workflows: [],
       });
     validateConfig(config);
-    const directory = join(cwd, ".pi/herdr-orchestrator");
+    const directory = join(cwd, ".baa-ton/herdr-orchestrator");
     await mkdir(directory, { recursive: true, mode: 0o700 });
     try {
       await writeFile(

@@ -21,7 +21,7 @@ async function fixture(options = {}) {
   const directory = await mkdtemp(join(tmpdir(), "baa-lane-retire-"));
   const cwd = join(directory, "checkout");
   const configDir = join(directory, "config");
-  const manifestDir = join(cwd, ".pi", "herdr-orchestrator");
+  const manifestDir = join(cwd, ".baa-ton", "herdr-orchestrator");
   const manifestPath = join(manifestDir, "manifest.json");
   const workflowId = options.workflowId ?? "workflow-lane-retire";
   const tabIds = options.tabIds ?? ["task-tab-1", "task-tab-2"];
@@ -184,6 +184,17 @@ function registeredTools(data) {
               })),
               workspace_id: workspaceId,
             },
+          }),
+        };
+      }
+      if (args[0] === "tab" && args[1] === "get") {
+        const tabId = args[2];
+        if (!data.liveTabs.has(tabId)) throw new Error(`no such tab: ${tabId}`);
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: { tab_id: tabId, workspace_id: data.tabWorkspace },
           }),
         };
       }
@@ -380,6 +391,30 @@ test("lane retirement records partial close failures durably for retry", async (
     assert.deepEqual(stored.workflows[0].laneRetirement.failedTabIds, ["task-tab-2"]);
     assert.deepEqual(stored.workflows[0].laneRetirement.pendingTabIds, ["task-tab-2"]);
     assert.equal(stored.workflows[0].outcome, "unknown");
+  } finally {
+    await cleanup(data, restore);
+  }
+});
+
+test("lane retirement accepts a lane tab already closed outside herdr_close", async () => {
+  const data = await fixture({ liveTabs: [] });
+  const restore = setupEnvironment(data);
+  try {
+    const tools = registeredTools(data);
+    const result = await close(data, tools);
+    assert.equal(result.details.laneRetired, true);
+    assert.deepEqual(result.details.closedTabIds, data.tabIds);
+    assert.deepEqual(result.details.remainingTabIds, []);
+    assert.equal(
+      data.calls.some((args) => args[0] === "tab" && args[1] === "close"),
+      false,
+      "an already-closed tab must never be re-closed",
+    );
+    assert.equal(result.details.workflow.laneRetirement.status, "retired");
+    const alreadyClosedEvidence = result.details.workflow.evidence.filter(
+      (entry) => entry.kind === "lane-retirement-tab-already-closed",
+    );
+    assert.equal(alreadyClosedEvidence.length, data.tabIds.length);
   } finally {
     await cleanup(data, restore);
   }

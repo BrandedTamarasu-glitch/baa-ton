@@ -13,27 +13,38 @@ const here = dirname(fileURLToPath(import.meta.url));
 const serverPath = join(here, "..", "mcp-server.mjs");
 
 async function withMcpServer(env, run, { cwd = here } = {}) {
+  const childEnv = {
+    ...process.env,
+    // A lane shell exports its startup intent for the harness bridge. The
+    // test bridge must never merge into that live intent while test files
+    // execute concurrently; fixtures below provide their own config when
+    // they need one.
+    BAA_STARTUP_INTENT: undefined,
+    CLAUDE_CODE_SESSION_ID: undefined,
+    HERDR_PLUGIN_CONFIG_DIR: undefined,
+    HERDR_PLUGIN_STATE_DIR: undefined,
+    HERDR_PANE_ID: "w-test:p1",
+    HERDR_WORKSPACE_ID: "w-test",
+    ...env,
+  };
+  // Windows environment keys are case-insensitive, but Node inherits the
+  // spelling `Path`. Supplying a test-only `PATH` alongside it can leave the
+  // inherited search path active, causing the real Herdr binary to win over
+  // the fixture at the front of the intended path.
+  if (process.platform === "win32" && (env.PATH ?? env.Path)) {
+    childEnv.Path = env.PATH ?? env.Path;
+    delete childEnv.PATH;
+  }
   const child = spawn(process.execPath, [serverPath], {
     cwd,
     // Pin a neutral Herdr identity so behavior is identical whether the
     // suite runs from a lane pane or from the registered root pane; callers
     // may still override via `env`.
-    env: {
-      ...process.env,
-      // A lane shell exports its startup intent for the harness bridge. The
-      // test bridge must never merge into that live intent while test files
-      // execute concurrently; fixtures below provide their own config when
-      // they need one.
-      BAA_STARTUP_INTENT: undefined,
-      CLAUDE_CODE_SESSION_ID: undefined,
-      HERDR_PLUGIN_CONFIG_DIR: undefined,
-      HERDR_PLUGIN_STATE_DIR: undefined,
-      HERDR_PANE_ID: "w-test:p1",
-      HERDR_WORKSPACE_ID: "w-test",
-      ...env,
-    },
+    env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
   });
+  if (env.TEST_MCP_PID_FILE)
+    await writeFile(env.TEST_MCP_PID_FILE, String(child.pid));
   let stderr = "";
   child.stderr.on("data", (chunk) => (stderr += chunk));
   const lines = createInterface({ input: child.stdout });
@@ -44,17 +55,17 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
     pending.get(message.id)?.(message);
     pending.delete(message.id);
   });
-  const rpc = (method, params = {}) =>
+  const rpcWithId = (id, method, params = {}) =>
     new Promise((resolve) => {
-      const id = ++nextId;
       pending.set(id, resolve);
       child.stdin.write(
         `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`,
       );
     });
+  const rpc = (method, params = {}) => rpcWithId(++nextId, method, params);
   const timeout = setTimeout(() => child.kill(), 15000);
   try {
-    return await run(rpc);
+    return await run(rpc, rpcWithId);
   } finally {
     clearTimeout(timeout);
     child.stdin.end();
@@ -69,17 +80,24 @@ async function rootBridgeFixture() {
   const stateDir = join(directory, "config");
   const cwd = join(directory, "workspace");
   const binDir = join(directory, "bin");
+  const mcpPidFile = join(directory, "mcp.pid");
   const herdr = join(
     binDir,
     process.platform === "win32" ? "herdr.cmd" : "herdr",
   );
-  const herdrScript = join(binDir, "herdr.mjs");
+  // The Windows wrapper invokes this fixture with Node directly. Keep the
+  // CommonJS source in a .cjs file there; Node treats .mjs as ESM and would
+  // reject the fixture's require("node:fs") before Herdr can answer.
+  const herdrScript = join(
+    binDir,
+    process.platform === "win32" ? "herdr.cjs" : "herdr.mjs",
+  );
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
   await mkdir(cwd, { recursive: true });
   await mkdir(binDir, { recursive: true, mode: 0o700 });
   // This read-only native stub proves the bridge uses the live pane identity
   // while keeping the test independent of a focused Herdr client.
-  const script = `const { appendFileSync } = require("node:fs");
+  const script = `const { appendFileSync, readFileSync } = require("node:fs");
 const args = process.argv.slice(2);
 const result = (value) => process.stdout.write(JSON.stringify({ result: value }) + "\\n");
 if (args[0] === "plugin" && args[1] === "config-dir") {
@@ -94,6 +112,7 @@ if (args[0] === "plugin" && args[1] === "config-dir") {
           agent: "claude",
           pane_id: process.env.TEST_LIVE_PANE,
           workspace_id: process.env.TEST_LIVE_WORKSPACE,
+          cwd: process.env.TEST_LIVE_CWD,
           agent_session: {
             agent: "claude",
             kind: "id",
@@ -118,6 +137,18 @@ if (args[0] === "plugin" && args[1] === "config-dir") {
       agent_status: "idle",
     },
   });
+} else if (args[0] === "pane" && args[1] === "process-info") {
+  const pane = args[3];
+  const matches = pane === process.env.TEST_PROCESS_MATCH_PANE;
+  const matchedPid = process.env.TEST_MCP_PID_FILE
+    ? Number(readFileSync(process.env.TEST_MCP_PID_FILE, "utf8"))
+    : process.ppid;
+  result({
+    type: "pane_process_info",
+    process_info: {
+      foreground_processes: matches ? [{ pid: matchedPid }] : [],
+    },
+  });
 } else if (args[0] === "pane" && args[1] === "get") {
   result({
     type: "pane_info",
@@ -136,7 +167,10 @@ if (args[0] === "plugin" && args[1] === "config-dir") {
 `;
   if (process.platform === "win32") {
     await writeFile(herdrScript, script);
-    await writeFile(herdr, `@echo off\r\nnode "%~dp0herdr.mjs" %*\r\n`);
+    await writeFile(
+      herdr,
+      `@echo off\r\nnode "%~dp0herdr.cjs" %*\r\nexit /b %errorlevel%\r\n`,
+    );
   } else {
     await writeFile(herdr, `#!/usr/bin/env node\n${script}`, { mode: 0o755 });
   }
@@ -145,6 +179,7 @@ if (args[0] === "plugin" && args[1] === "config-dir") {
     stateDir,
     cwd,
     binDir,
+    mcpPidFile,
     root: {
       target: "w-root:root",
       target_kind: "pane_id",
@@ -163,6 +198,7 @@ test("Windows live identity lookup uses an unqualified Herdr command for native 
   let invocation;
   const result = await liveHerdrAgentList({
     platform: "win32",
+    env: { PATH: "", Path: "" },
     spawnProcess: (command, args, options) => {
       invocation = { command, args, options };
       queueMicrotask(() => {
@@ -177,7 +213,7 @@ test("Windows live identity lookup uses an unqualified Herdr command for native 
   assert.equal(invocation.command, HERDR_COMMAND);
   assert.equal(invocation.command, "herdr");
   assert.deepEqual(invocation.args, ["agent", "list"]);
-  assert.equal(invocation.options.shell, true);
+  assert.notEqual(invocation.options.shell, true);
   assert.equal(invocation.command.endsWith(".cmd"), false);
 });
 
@@ -235,7 +271,9 @@ test("mapped root bridge exposes root-role parity and returns non-Pi root ground
     HERDR_ENV: "1",
     HERDR_PANE_ID: fixture.root.pane_id,
     HERDR_WORKSPACE_ID: fixture.root.workspace_id,
-    HERDR_PLUGIN_CONFIG_DIR: fixture.stateDir,
+    // The MCP registration may freeze a config directory from a different
+    // machine. The bridge must refresh this from Herdr before routing.
+    HERDR_PLUGIN_CONFIG_DIR: join(fixture.directory, "frozen-config"),
     TEST_CONFIG_DIR: fixture.stateDir,
     TEST_ROOT_WORKSPACE: fixture.root.workspace_id,
     PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
@@ -247,6 +285,7 @@ test("mapped root bridge exposes root-role parity and returns non-Pi root ground
       const names = new Set(listed.result.tools.map((tool) => tool.name));
       for (const name of [
         "herdr_bootstrap_root",
+        "herdr_reconcile_root",
         "herdr_goal",
         "herdr_plan",
         "herdr_dispatch",
@@ -298,7 +337,7 @@ test("mapped root bridge exposes root-role parity and returns non-Pi root ground
 
     const configPath = join(fixture.stateDir, "config.json");
     const config = JSON.parse(await readFile(configPath, "utf8"));
-    const manifestPath = join(fixture.cwd, ".pi", "herdr-orchestrator", "manifest.json");
+    const manifestPath = join(fixture.cwd, ".baa-ton", "herdr-orchestrator", "manifest.json");
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
     const lane = manifest.workflows[0].lanes[0];
     config.orchestrators[0].workflows.push({
@@ -315,6 +354,20 @@ test("mapped root bridge exposes root-role parity and returns non-Pi root ground
     await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
 
     await withMcpServer({ ...env, HERDR_PANE_ID: "w-root:child" }, async (rpc) => {
+      const doctor = await rpc("tools/call", {
+        name: "herdr_doctor",
+        arguments: {},
+      });
+      assert.equal(doctor.result.isError, undefined);
+      const routing = doctor.result.structuredContent.checks.find(
+        (check) => check.id === "plugin-enablement-and-routing",
+      );
+      assert.match(routing.detail, /This pane is not a registered root/);
+      assert.match(
+        routing.detail,
+        /resolved pane_id=w-root:child, workspace_id=w-root/,
+      );
+
       const childGoal = await rpc("tools/call", {
         name: "herdr_goal",
         arguments: { action: "status" },
@@ -322,6 +375,71 @@ test("mapped root bridge exposes root-role parity and returns non-Pi root ground
       assert.equal(childGoal.result.isError, true);
       assert.match(childGoal.result.content[0].text, /verified controller-mapped root/);
     }, { cwd: fixture.cwd });
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("MCP message occurrences remain distinct when a harness reuses a request id", async () => {
+  const fixture = await rootBridgeFixture();
+  const env = {
+    HERDR_ENV: "1",
+    HERDR_PANE_ID: fixture.root.pane_id,
+    HERDR_WORKSPACE_ID: fixture.root.workspace_id,
+    HERDR_PLUGIN_CONFIG_DIR: fixture.stateDir,
+    TEST_CONFIG_DIR: fixture.stateDir,
+    TEST_ROOT_WORKSPACE: fixture.root.workspace_id,
+    PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
+  };
+  try {
+    await withMcpServer(env, async (rpc, rpcWithId) => {
+      const bootstrap = await rpc("tools/call", {
+        name: "herdr_bootstrap_root",
+        arguments: {},
+      });
+      assert.equal(bootstrap.result.isError, undefined);
+
+      const first = await rpc("tools/call", {
+        name: "herdr_plan",
+        arguments: {
+          objective: "Plan the first unrelated workflow",
+          lanes: ["first lane"],
+        },
+      });
+      assert.equal(first.result.isError, undefined);
+
+      const second = await rpcWithId(2, "tools/call", {
+        name: "herdr_plan",
+        arguments: {
+          objective: "Plan the second unrelated workflow",
+          lanes: ["second lane"],
+        },
+      });
+      assert.equal(second.result.isError, undefined);
+      assert.notEqual(
+        first.result.structuredContent.workflow.id,
+        second.result.structuredContent.workflow.id,
+      );
+    }, { cwd: fixture.cwd });
+
+    const manifest = JSON.parse(
+      await readFile(
+        join(fixture.cwd, ".baa-ton", "herdr-orchestrator", "manifest.json"),
+        "utf8",
+      ),
+    );
+    assert.equal(manifest.workflows.length, 2);
+    const inbox = JSON.parse(
+      await readFile(join(fixture.stateDir, "inbox.json"), "utf8"),
+    );
+    const lifecycleMessages = inbox.messages.filter(
+      (message) => message.envelope.message.type === "lifecycle",
+    );
+    assert.equal(lifecycleMessages.length, 2);
+    assert.notEqual(
+      lifecycleMessages[0].occurrence_id,
+      lifecycleMessages[1].occurrence_id,
+    );
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });
   }
@@ -335,7 +453,7 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
     // live Claude pane below actually occupies this pane or workspace.
     HERDR_PANE_ID: "w-frozen:original",
     HERDR_WORKSPACE_ID: "w-frozen",
-    HERDR_PLUGIN_CONFIG_DIR: fixture.stateDir,
+    HERDR_PLUGIN_CONFIG_DIR: join(fixture.directory, "frozen-config"),
     TEST_CONFIG_DIR: fixture.stateDir,
     PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
   };
@@ -385,6 +503,10 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
         (check) => check.id === "plugin-enablement-and-routing",
       );
       assert.match(routing.detail, /This pane is a registered root/);
+      assert.match(
+        routing.detail,
+        /resolved pane_id=w-live-c:third, workspace_id=w-live-c/,
+      );
 
       const plan = await rpc("tools/call", {
         name: "herdr_plan",
@@ -412,6 +534,135 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
         { paneId: "w-live-b:second", workspaceId: "w-live-b" },
         { paneId: "w-live-c:third", workspaceId: "w-live-c" },
       ],
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("MCP pane process correlation survives a regenerated Claude session id", async () => {
+  const fixture = await rootBridgeFixture();
+  try {
+    await withMcpServer(
+      {
+        HERDR_ENV: "1",
+        // Simulate a frozen project registration and a fresh MCP-only value
+        // that is not present in Herdr's stable agent_session record.
+        HERDR_PANE_ID: "w-frozen:original",
+        HERDR_WORKSPACE_ID: "w-frozen",
+        HERDR_PLUGIN_CONFIG_DIR: fixture.stateDir,
+        TEST_CONFIG_DIR: fixture.stateDir,
+        TEST_CLAUDE_SESSION_ID: "stable-herdr-session-id",
+        CLAUDE_CODE_SESSION_ID: "mcp-process-generated-id",
+        TEST_LIVE_PANE: "w-process:current",
+        TEST_LIVE_WORKSPACE: "w-process",
+        TEST_LIVE_CWD: "C:\\cic",
+        TEST_PROCESS_MATCH_PANE: "w-process:current",
+        TEST_MCP_PID_FILE: fixture.mcpPidFile,
+        TEST_ROOT_WORKSPACE: "w-process",
+        PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
+      },
+      async (rpc) => {
+        const bootstrap = await rpc("tools/call", {
+          name: "herdr_bootstrap_root",
+          arguments: { add: true },
+        });
+        assert.equal(bootstrap.result.isError, undefined);
+        assert.equal(
+          bootstrap.result.structuredContent.root.pane_id,
+          "w-process:current",
+        );
+        assert.equal(
+          bootstrap.result.structuredContent.root.workspace_id,
+          "w-process",
+        );
+      },
+      { cwd: fixture.cwd },
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("MCP falls back to a registered static root when process and session hints do not match", async () => {
+  const fixture = await rootBridgeFixture();
+  const baseEnv = {
+    HERDR_ENV: "1",
+    HERDR_PANE_ID: fixture.root.pane_id,
+    HERDR_WORKSPACE_ID: fixture.root.workspace_id,
+    HERDR_PLUGIN_CONFIG_DIR: fixture.stateDir,
+    TEST_CONFIG_DIR: fixture.stateDir,
+    TEST_ROOT_WORKSPACE: fixture.root.workspace_id,
+    PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
+  };
+  try {
+    await withMcpServer(baseEnv, async (rpc) => {
+      const bootstrap = await rpc("tools/call", {
+        name: "herdr_bootstrap_root",
+        arguments: { add: true },
+      });
+      assert.equal(bootstrap.result.isError, undefined);
+    }, { cwd: fixture.cwd });
+
+    await withMcpServer(
+      {
+        ...baseEnv,
+        CLAUDE_CODE_SESSION_ID: "mcp-process-generated-id",
+        TEST_CLAUDE_SESSION_ID: "stable-herdr-session-id",
+        TEST_LIVE_PANE: fixture.root.pane_id,
+        TEST_LIVE_WORKSPACE: fixture.root.workspace_id,
+      },
+      async (rpc) => {
+        const doctor = await rpc("tools/call", {
+          name: "herdr_doctor",
+          arguments: {},
+        });
+        assert.equal(doctor.result.isError, undefined);
+        const routing = doctor.result.structuredContent.checks.find(
+          (check) => check.id === "plugin-enablement-and-routing",
+        );
+        assert.match(routing.detail, /This pane is a registered root/);
+        assert.match(
+          routing.detail,
+          new RegExp(
+            `resolved pane_id=${fixture.root.pane_id}, workspace_id=${fixture.root.workspace_id}`,
+          ),
+        );
+      },
+      { cwd: fixture.cwd },
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("MCP identity failures include the live server PID diagnostics", async () => {
+  const fixture = await rootBridgeFixture();
+  try {
+    await withMcpServer(
+      {
+        HERDR_ENV: "1",
+        HERDR_PANE_ID: "w-frozen:original",
+        HERDR_WORKSPACE_ID: "w-frozen",
+        HERDR_PLUGIN_CONFIG_DIR: fixture.stateDir,
+        TEST_CONFIG_DIR: fixture.stateDir,
+        CLAUDE_CODE_SESSION_ID: "mcp-process-generated-id",
+        PATH: [fixture.binDir, process.env.PATH].filter(Boolean).join(delimiter),
+      },
+      async (rpc) => {
+        const doctor = await rpc("tools/call", {
+          name: "herdr_doctor",
+          arguments: {},
+        });
+        assert.equal(doctor.result.isError, true);
+        const message = doctor.result.content[0].text;
+        assert.match(message, /mcp_pid=\d+, mcp_ppid=\d+/);
+        assert.match(message, /lookup_pids=\d+,\d+/);
+        assert.match(message, /claude_candidates=0/);
+        assert.match(message, /pid_matches=0/);
+        assert.match(message, /session_matches=0/);
+      },
+      { cwd: fixture.cwd },
     );
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });
@@ -466,7 +717,7 @@ test("MCP calls run registered lifecycle handlers and settle the bridge root tur
   const directory = await mkdtemp(join(tmpdir(), "baa-mcp-lifecycle-"));
   const stateDir = join(directory, "config");
   const cwd = join(directory, "workspace");
-  const manifestPath = join(cwd, ".pi", "herdr-orchestrator", "manifest.json");
+  const manifestPath = join(cwd, ".baa-ton", "herdr-orchestrator", "manifest.json");
   const root = {
     target: "herdr-root",
     target_kind: "name",
@@ -566,7 +817,7 @@ test("MCP permission broker dedupes a request and releases a parent answer once"
   const directory = await mkdtemp(join(tmpdir(), "baa-mcp-permission-"));
   const stateDir = join(directory, "config");
   const cwd = join(directory, "workspace");
-  const manifestPath = join(cwd, ".pi", "herdr-orchestrator", "manifest.json");
+  const manifestPath = join(cwd, ".baa-ton", "herdr-orchestrator", "manifest.json");
   const root = {
     target: "herdr-root",
     target_kind: "name",

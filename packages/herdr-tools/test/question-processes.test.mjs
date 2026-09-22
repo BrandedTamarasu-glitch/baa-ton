@@ -13,7 +13,7 @@ test("process-separated root pause and concurrent cross-checkout questions prese
   const dir = await mkdtemp(join(tmpdir(), "baa-question-process-"));
   const parent = join(dir, "parent"),
     child = join(dir, "child");
-  const store = join(parent, ".pi/herdr-orchestrator/manifest.json");
+  const store = join(parent, ".baa-ton/herdr-orchestrator/manifest.json");
   const run = (mode, pane, cwd) =>
     new Promise((resolve, reject) => {
       const proc = spawn(process.execPath, [worker, mode], {
@@ -120,7 +120,7 @@ test("process-separated root pause and concurrent cross-checkout questions prese
       "retry in another process reuses the logical question",
     );
     await assert.rejects(
-      readFile(join(child, ".pi/herdr-orchestrator/manifest.json")),
+      readFile(join(child, ".baa-ton/herdr-orchestrator/manifest.json")),
       { code: "ENOENT" },
     );
   } finally {

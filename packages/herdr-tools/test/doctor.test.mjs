@@ -25,8 +25,8 @@ test("herdr_doctor reports a healthy installation and never mutates the manifest
     ),
   );
   try {
-    const manifestPath = join(cwd, ".pi", "herdr-orchestrator", "manifest.json");
-    await mkdir(join(cwd, ".pi", "herdr-orchestrator"), { recursive: true });
+    const manifestPath = join(cwd, ".baa-ton", "herdr-orchestrator", "manifest.json");
+    await mkdir(join(cwd, ".baa-ton", "herdr-orchestrator"), { recursive: true });
     const manifest = { version: 2, workflows: [] };
     await writeFile(manifestPath, JSON.stringify(manifest));
     const before = await readFile(manifestPath, "utf8");
@@ -71,6 +71,7 @@ test("herdr_doctor reports a healthy installation and never mutates the manifest
       "manifest-store",
       "native-herdr-connectivity",
       "plugin-enablement-and-routing",
+      "root-identity",
     ]);
     assert.equal(report.details.ok, true);
     for (const entry of report.details.checks)
@@ -90,6 +91,90 @@ test("herdr_doctor reports a healthy installation and never mutates the manifest
   }
 });
 
+test("doctor refreshes a stale config-dir snapshot before synchronous root routing checks", async () => {
+  const { directory, cwd, configDir } = await fixture();
+  const frozenConfigDir = join(directory, "frozen-config");
+  const saved = Object.fromEntries(
+    ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_WORKSPACE_ID", "HERDR_PLUGIN_CONFIG_DIR"].map(
+      (key) => [key, process.env[key]],
+    ),
+  );
+  try {
+    const manifestDir = join(cwd, ".baa-ton", "herdr-orchestrator");
+    await mkdir(manifestDir, { recursive: true });
+    const manifestPath = join(manifestDir, "manifest.json");
+    await writeFile(manifestPath, JSON.stringify({ version: 2, workflows: [] }));
+    await writeFile(
+      join(configDir, "config.json"),
+      JSON.stringify({
+        version: 2,
+        owner: "herdr-orchestrator",
+        orchestrators: [
+          {
+            id: "root-a",
+            root: {
+              target: "w1:p1",
+              target_kind: "pane_id",
+              pane_id: "w1:p1",
+              workspace_id: "w1",
+              agent_kind: "pi",
+            },
+            program: {
+              id: cwd,
+              workspace_id: "w1",
+              parent_manifest_path: manifestPath,
+            },
+            workflows: [],
+          },
+        ],
+      }),
+    );
+    Object.assign(process.env, {
+      HERDR_ENV: "1",
+      HERDR_PANE_ID: "w1:p1",
+      HERDR_WORKSPACE_ID: "w1",
+      HERDR_PLUGIN_CONFIG_DIR: frozenConfigDir,
+    });
+    const tools = new Map();
+    extension({
+      on() {},
+      registerTool(descriptor) {
+        tools.set(descriptor.name, descriptor);
+      },
+      registerCommand() {},
+      async exec(_command, args) {
+        if (args[0] === "plugin" && args[1] === "config-dir")
+          return { code: 0, stderr: "", stdout: configDir };
+        throw new Error(`unexpected herdr ${args.join(" ")}`);
+      },
+    });
+    const report = await tools
+      .get("herdr_doctor")
+      .execute("doctor", {}, undefined, undefined, {
+        cwd,
+        hasUI: false,
+        mode: "json",
+        modelRegistry: {
+          find: () => ({ reasoning: true, thinkingLevelMap: {} }),
+          hasConfiguredAuth: () => true,
+          isUsingOAuth: () => true,
+        },
+      });
+    const routing = report.details.checks.find(
+      (entry) => entry.id === "plugin-enablement-and-routing",
+    );
+    assert.equal(routing.status, "ok");
+    assert.match(routing.detail, /This pane is a registered root/);
+    assert.equal(process.env.HERDR_PLUGIN_CONFIG_DIR, configDir);
+  } finally {
+    for (const [key, value] of Object.entries(saved))
+      value === undefined
+        ? delete process.env[key]
+        : (process.env[key] = value);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("herdr_doctor fails closed when native Herdr connectivity is unavailable", async () => {
   const { directory, cwd, configDir } = await fixture();
   const saved = Object.fromEntries(
@@ -98,7 +183,7 @@ test("herdr_doctor fails closed when native Herdr connectivity is unavailable", 
     ),
   );
   try {
-    const manifestDir = join(cwd, ".pi", "herdr-orchestrator");
+    const manifestDir = join(cwd, ".baa-ton", "herdr-orchestrator");
     await mkdir(manifestDir, { recursive: true });
     // loadManifest() falls back to {version:2, workflows:[]} for any version
     // other than 1 or 2, so a legacy/future version is invisible today.
@@ -157,7 +242,7 @@ test("doctor reads the routed manifest and normalizes identity-bound Pi tool att
   const saved = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
   try {
     Object.assign(process.env, env);
-    const manifestDir = join(cwd, ".pi", "herdr-orchestrator");
+    const manifestDir = join(cwd, ".baa-ton", "herdr-orchestrator");
     await mkdir(manifestDir, { recursive: true });
     const manifestPath = join(manifestDir, "manifest.json");
     const startup = join(manifestDir, "startup.json");
@@ -200,7 +285,7 @@ test("lane-bridge-liveness tolerates gone panes only with durable completion rec
   const saved = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
   try {
     Object.assign(process.env, env);
-    const manifestDir = join(cwd, ".pi", "herdr-orchestrator");
+    const manifestDir = join(cwd, ".baa-ton", "herdr-orchestrator");
     await mkdir(manifestDir, { recursive: true });
     const manifestPath = join(manifestDir, "manifest.json");
     const startup = join(manifestDir, "startup.json");
